@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Set, Tuple, Union
 
 import torch
 import transformers
@@ -75,6 +75,9 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
             )
 
         self.top_k_for_generation = top_k_for_generation
+        self.forbidden_sids: Optional[Set[Tuple[int, ...]]] = None
+        self.filter_mode: str = "global"
+        self.user_forbidden_items: Optional[Dict[int, Set[int]]] = None
 
     def _inject_sep_token_between_sids(
         self,
@@ -303,6 +306,20 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
                     )
                 ).reshape(-1, self.num_embeddings_per_hierarchy)
             candidate_logits[~valid_prefix_mask] = float("-inf")
+
+        # Decode-time filter: mask logits completing a forbidden SID at final hierarchy.
+        if (
+            self.forbidden_sids
+            and generated_ids is not None
+            and hierarchy == self.num_hierarchies - 1
+        ):
+            batch_beams = generated_ids.reshape(-1, hierarchy)
+            for beam_idx in range(batch_beams.size(0)):
+                prefix = batch_beams[beam_idx].tolist()
+                for tok in range(self.num_embeddings_per_hierarchy):
+                    sid = tuple(prefix + [tok])
+                    if sid in self.forbidden_sids:
+                        candidate_logits[beam_idx, tok] = float("-inf")
 
         candidate_logits = torch.nn.functional.softmax(candidate_logits, dim=-1)
         proba, indices = torch.sort(candidate_logits, descending=True)
@@ -580,6 +597,185 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         # the key value names for the prediction output
         self.prediction_key_name = prediction_key_name
         self.prediction_value_name = prediction_value_name
+        self.repair_adapter: Optional[nn.Parameter] = None
+
+    def set_decode_filter(
+        self,
+        *,
+        forbidden_sids: Optional[Set[Tuple[int, ...]]] = None,
+        filter_mode: str = "global",
+        user_forbidden_items: Optional[Dict[int, Set[int]]] = None,
+    ) -> None:
+        self.forbidden_sids = forbidden_sids
+        self.filter_mode = filter_mode
+        self.user_forbidden_items = user_forbidden_items
+
+    def _batch_loss_from_model_step(
+        self,
+        batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
+    ) -> torch.Tensor:
+        _, loss = self.model_step(*batch)
+        return loss
+
+    def _sequence_log_prob(
+        self,
+        model_input: SequentialModelInputData,
+        label_data: SequentialModuleLabelData,
+    ) -> torch.Tensor:
+        """Approximate ``log p(s_i | h_u)`` as sum of hierarchy log-probs."""
+        fut_ids = None
+        for label in label_data.labels:
+            fut_ids = label_data.labels[label].reshape(model_input.mask.size(0), -1)
+        model_output = self.forward(
+            attention_mask_encoder=model_input.mask,
+            future_ids=fut_ids,
+            **{
+                self.feature_to_model_input_map.get(k, k): v
+                for k, v in model_input.transformed_sequences.items()
+            },
+        )
+        model_output = model_output[:, :-1]
+        log_probs = []
+        for hierarchy in range(self.num_hierarchies):
+            logits = self.decoder.decoder_mlp[hierarchy](model_output[:, hierarchy])
+            log_p = torch.nn.functional.log_softmax(logits, dim=-1)
+            target = fut_ids[:, hierarchy].long()
+            log_probs.append(log_p.gather(1, target.unsqueeze(1)).squeeze(1))
+        return torch.stack(log_probs, dim=1).sum(dim=1).mean()
+
+    def _pooled_user_representation(
+        self,
+        model_input: SequentialModelInputData,
+    ) -> torch.Tensor:
+        user_id = model_input.transformed_sequences.get("user_id")
+        input_ids = model_input.transformed_sequences[
+            self.feature_to_model_input_map.get("sequence_data", "input_ids")
+        ]
+        if input_ids is None:
+            input_ids = model_input.transformed_sequences.get("sequence_data")
+        enc_out, enc_mask = self.encoder_forward_pass(
+            attention_mask=model_input.mask,
+            input_ids=input_ids,
+            user_id=user_id,
+        )
+        mask = enc_mask.unsqueeze(-1).float()
+        pooled = (enc_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        return pooled
+
+    def _item_sid_embedding(self, item_sid_rows: torch.Tensor) -> torch.Tensor:
+        """Aggregate encoder SID embeddings for item semantic-id rows."""
+        table = self.get_embedding_table(table_name="encoder")
+        shifted = self._add_repeating_offset_to_rows(
+            input_sids=item_sid_rows,
+            codebook_size=self.num_embeddings_per_hierarchy,
+            num_hierarchies=self.num_hierarchies,
+        )
+        emb = table(shifted)
+        return emb.mean(dim=1)
+
+    def compute_sep_loss(
+        self,
+        retain_batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
+        *,
+        neighbor_item_ids: Set[int],
+        forget_item_ids: Set[int],
+        temperature: float = 0.07,
+    ) -> torch.Tensor:
+        model_input, label_data = retain_batch
+        r_u = self._pooled_user_representation(model_input)
+        r_u = torch.nn.functional.normalize(r_u, dim=-1)
+
+        fut_ids = None
+        for label in label_data.labels:
+            fut_ids = label_data.labels[label].reshape(model_input.mask.size(0), -1)
+        pos_sid = fut_ids
+        z_pos = self._item_sid_embedding(pos_sid)
+        z_pos = torch.nn.functional.normalize(z_pos, dim=-1)
+
+        neg_ids = list(neighbor_item_ids | forget_item_ids)
+        if not neg_ids or self.codebooks is None:
+            return torch.zeros((), device=r_u.device)
+        neg_sids = self.codebooks[torch.tensor(neg_ids, device=r_u.device)]
+        z_neg = self._item_sid_embedding(neg_sids)
+        z_neg = torch.nn.functional.normalize(z_neg, dim=-1)
+
+        logits = torch.mm(r_u, z_neg.t()) / float(temperature)
+        pos_sim = (r_u * z_pos).sum(dim=-1, keepdim=True) / float(temperature)
+        all_logits = torch.cat([pos_sim, logits], dim=1)
+        labels = torch.zeros(r_u.size(0), dtype=torch.long, device=r_u.device)
+        return torch.nn.functional.cross_entropy(all_logits, labels)
+
+    def compute_unified_loss(
+        self,
+        *,
+        retain_batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
+        forget_batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
+        lambda_forget: float = 1.0,
+        lambda_sep: float = 0.1,
+        forget_loss_level: str = "token",
+        sep_temperature: float = 0.07,
+        deletion_spec: str = "session",
+        forget_item_ids: Optional[Set[int]] = None,
+        neighbor_item_ids: Optional[Set[int]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        l_retain = self._batch_loss_from_model_step(retain_batch)
+        if str(forget_loss_level).lower() == "sequence":
+            # Minimize log p(s_i|h_u) on forget set.
+            l_forget = self._sequence_log_prob(*forget_batch)
+        else:
+            # CE = -log p; negate so minimizing total suppresses forget targets.
+            l_forget = -self._batch_loss_from_model_step(forget_batch)
+        l_sep = self.compute_sep_loss(
+            retain_batch,
+            neighbor_item_ids=neighbor_item_ids or set(),
+            forget_item_ids=forget_item_ids or set(),
+            temperature=sep_temperature,
+        )
+        total = l_retain + float(lambda_forget) * l_forget + float(lambda_sep) * l_sep
+        return {
+            "total": total,
+            "retain": l_retain,
+            "forget": l_forget,
+            "sep": l_sep,
+        }
+
+    def compute_neighbor_suppression_loss(
+        self,
+        batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
+        neighbor_item_ids: Set[int],
+    ) -> torch.Tensor:
+        if not neighbor_item_ids or self.codebooks is None:
+            return torch.zeros((), device=next(self.parameters()).device)
+        model_input, _ = batch
+        r_u = self._pooled_user_representation(model_input)
+        losses = []
+        for nid in neighbor_item_ids:
+            if nid < 0 or nid >= self.codebooks.size(0):
+                continue
+            sid = self.codebooks[nid].unsqueeze(0)
+            z = self._item_sid_embedding(sid)
+            losses.append(torch.nn.functional.cosine_similarity(r_u, z.expand_as(r_u)))
+        if not losses:
+            return torch.zeros((), device=r_u.device)
+        return torch.stack(losses).mean()
+
+    def compute_neighborhood_mass_loss(
+        self,
+        batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
+        neighbor_item_ids: Optional[Set[int]] = None,
+    ) -> torch.Tensor:
+        if not neighbor_item_ids:
+            return torch.zeros((), device=next(self.parameters()).device)
+        return self.compute_neighbor_suppression_loss(batch, neighbor_item_ids)
+
+    def compute_prefix_repair_loss(
+        self,
+        batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
+        neighbor_item_ids: Optional[Set[int]] = None,
+    ) -> torch.Tensor:
+        return self.compute_neighbor_suppression_loss(
+            batch, neighbor_item_ids or set()
+        )
 
     def encoder_forward_pass(
         self,

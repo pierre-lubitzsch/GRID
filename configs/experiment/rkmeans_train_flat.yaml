@@ -66,12 +66,12 @@ data_loading:
       data_folder: ${paths.data_dir}/items
       should_shuffle_rows: true
       batch_size_per_device: 2048
-      num_workers: 12
+      num_workers: 1
       assign_files_by_size: false
       timeout: 60
       drop_last: false
       pin_memory: true
-      persistent_workers: true
+      persistent_workers: false
       collate_fn:
         _target_: src.data.loading.components.collate_functions.collate_fn_items
         _partial_: true
@@ -92,12 +92,12 @@ data_loading:
       data_folder: ${paths.data_dir}/items
       should_shuffle_rows: false
       batch_size_per_device: 256
-      num_workers: 2
+      num_workers: 1
       assign_files_by_size: true
       timeout: 60
       drop_last: false
       pin_memory: false
-      persistent_workers: true
+      persistent_workers: false
       collate_fn:
         _target_: src.data.loading.components.collate_functions.collate_fn_items
         _partial_: true
@@ -117,12 +117,12 @@ data_loading:
       data_folder: ${paths.data_dir}/items
       should_shuffle_rows: false
       batch_size_per_device: 256
-      num_workers: 2
+      num_workers: 1
       assign_files_by_size: true
       timeout: 60
       drop_last: false
       pin_memory: false
-      persistent_workers: true
+      persistent_workers: false
       collate_fn:
         _target_: src.data.loading.components.collate_functions.collate_fn_items
         _partial_: true
@@ -204,7 +204,7 @@ trainer:
   accumulate_grad_batches: 1
   profiler:
     _target_: lightning.pytorch.profilers.PassThroughProfiler
-  strategy: ddp_find_unused_parameters_true
+  strategy: auto
   sync_batchnorm: true
   num_sanity_val_steps: 0
 paths:

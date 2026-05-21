@@ -1,0 +1,34 @@
+# @package _global_
+
+# Top-level Hydra config for `python -m src.unlearn`. Mirrors `train.yaml`
+# but with no `train`/`test` flags (the entry point orchestrates SCIF
+# directly via `TigerUnlearningModule.run_scif_unlearning`) and ckpt_path
+# required (the pre-trained TIGER weights to unlearn from).
+
+defaults:
+  - _self_
+  - data_loading: null
+  - model: null
+  - callbacks: default
+  - logger: csv
+  - trainer: default
+  - paths: default
+  - extras: default
+  - hydra: default
+  - loss: null
+  - optim: null
+  - eval: null
+  - experiment: null
+
+task_name: "unlearn"
+id: ${now:%Y-%m-%d}/${now:%H-%M-%S}
+tags: ["unlearn"]
+
+# the pre-trained TIGER checkpoint we are unlearning *from*
+ckpt_path: ???
+
+# Global RNG seed (PyTorch / NumPy / Python / retain subset shuffle).
+seed: 2
+
+# Optional label for sweep / logging (also set via UNLEARN_RUN_TAG in SLURM wrappers).
+unlearning_run_tag: null

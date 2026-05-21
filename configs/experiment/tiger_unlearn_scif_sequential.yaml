@@ -1,0 +1,17 @@
+# @package _global_
+
+defaults:
+  - tiger_unlearn_scif_flat
+  - _self_
+
+unlearning:
+  request_batch_size: 8
+  max_requests: null
+  request_user_order: manifest
+  request_seed: ${seed}
+  save_intermediate_checkpoints: false
+  checkpoint_fractions: [0.01, 0.10, 1.0]
+  # Drop per-request scratch TFRecords after each SCIF step (eval uses ckpts only).
+  cleanup_request_dirs: true
+  # Post-unlearn eval is run by run_tiger_unlearn_sequential.sh (not this Python entry).
+  # Defaults: UNLEARN_RUN_POST_EVAL=true, UNLEARN_EVAL_DATA_DIR=src/data/amazon_data/beauty

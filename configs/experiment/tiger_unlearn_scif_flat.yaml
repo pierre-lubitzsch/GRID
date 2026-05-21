@@ -1,17 +1,88 @@
 # @package _global_
+
+# Derived from `configs/experiment/tiger_train_flat.yaml` but plugs into
+# `python -m src.unlearn`. Differences vs the train config:
+#
+# * `model._target_` points at `TigerUnlearningModule` (drop-in subclass of
+#   `SemanticIDEncoderDecoder`) so the ckpt schema stays identical and the
+#   unlearned ckpt loads back into `src.inference experiment=tiger_inference_flat`.
+# * Adds the `unlearning.*` group (algorithm = `scif`, neighborhood-aware
+#   knobs, CG hyper-parameters, target-params policy, ...).
+# * Adds `forget_subdir`/`retain_subdir` pointing at the output of
+#   `src.data.unlearning.split_forget_retain`.
+# * Trainer is single-device (no DDP) -- SCIF needs a single-process autograd
+#   graph for HVPs.
+# * Disables the `model_checkpoint` callback (we save the unlearned ckpt
+#   manually) and the `early_stopping` callback (no fit loop).
+
 data_dir: ???
 semantic_id_path: ???
+ckpt_path: ???
 num_hierarchies: ???
 sequence_length: 120
+seed: 2
 
-task_name: train
+# Forget/retain layout produced by `src.data.unlearning.split_forget_retain`
+forget_subdir: training_forget
+retain_subdir: training_retain
+
+# Algorithm group ----------------------------------------------------------
+unlearning:
+  algorithm: scif
+  deletion_spec: session
+  forget_size: null
+  retain_samples_used_for_update: 16
+  retain_sample_size: null
+  repair_sample_bound: null
+  retain_max_rows: null
+  neighborhood_aware: false
+  neighborhood_method: prefix
+  neighborhood_aware_sample_rate: 1.0
+  neighbor_aware_factor: 8.0
+  sid_prefix_length: 2
+  progressive_sid_prefix: true
+  embedding_path: null
+  embedding_epsilon: null
+  embedding_max_neighbors: 100
+  damping: 0.01
+  cg_max_iter: 200
+  cg_tol: 1.0e-5
+  cg_solution_max_norm: null
+  max_norm: null
+  update_max_norm: 1.0
+  batch_size_per_device: 256
+  target_params: all
+  eval_mode: true
+  rows_per_shard: 4096
+  finetune_steps: 500
+  finetune_lr: 0.001
+  neg_train_steps: 200
+  neg_train_lr: 0.001
+  neg_retain_every: 5
+  filter_mode: global
+  forget_loss_level: token
+  lambda_forget: 1.0
+  lambda_sep: 0.1
+  sep_temperature: 0.07
+  unified_steps: 500
+  unified_lr: 1.0e-4
+  local_repair:
+    enabled: false
+    logit_suppression: false
+    adapter_repair: false
+    prefix_repair: false
+    mass_regularization: false
+    gamma: 1.0
+
+task_name: unlearn
 id: ${now:%Y-%m-%d}/${now:%H-%M-%S}
 tags:
-- amazon-p5-gr-train
-train: true
-test: true
-ckpt_path: null
-seed: 2
+  - amazon-p5-gr-unlearn-scif
+
+# Data loading -------------------------------------------------------------
+# Mirror tiger_train_flat.yaml verbatim so the train dataloader config can
+# serve as a template for the forget/retain finite loaders we build inside
+# `TigerUnlearningModule.run_scif_unlearning`.
 data_loading:
   features_config:
     features:
@@ -73,21 +144,21 @@ data_loading:
         _target_: src.data.loading.components.dataloading.UnboundedSequenceIterable
         _partial_: true
       data_folder: ${paths.data_dir}/training
-      should_shuffle_rows: true
+      should_shuffle_rows: false
       labels:
         sequence_data:
           transform:
             _target_: src.data.loading.components.label_function.NextKTokenMasking
             next_k: ${model.num_hierarchies}
       batch_size_per_device: 32
-      num_workers: 8
-      timeout: 60
+      num_workers: 0
+      timeout: 0
       assign_files_by_size: false
       oov_token: null
       masking_token: -1
       sequence_length: ${sequence_length}
       padding_token: -1
-      drop_last: true
+      drop_last: false
       persistent_workers: false
       collate_fn:
         _target_: src.data.loading.components.collate_functions.collate_with_sid_causal_duplicate
@@ -129,71 +200,13 @@ data_loading:
           - sequence_data
           num_hierarchies: ${model.num_hierarchies}
       assign_all_files_per_worker: true
-  val_dataloader_config:
-    dataloader:
-      _target_: src.data.loading.components.interfaces.SequenceDataloaderConfig
-      dataset_class:
-        _target_: src.data.loading.components.dataloading.UnboundedSequenceIterable
-        _partial_: true
-      data_folder: ${paths.data_dir}/evaluation
-      should_shuffle_rows: false
-      labels:
-        sequence_data:
-          transform:
-            _target_: src.data.loading.components.label_function.NextKTokenMasking
-            next_k: ${model.num_hierarchies}
-      batch_size_per_device: 8
-      num_workers: 8
-      timeout: 60
-      assign_files_by_size: true
-      oov_token: ${data_loading.train_dataloader_config.dataloader.oov_token}
-      masking_token: ${data_loading.train_dataloader_config.dataloader.masking_token}
-      sequence_length: ${data_loading.train_dataloader_config.dataloader.sequence_length}
-      padding_token: ${data_loading.train_dataloader_config.dataloader.padding_token}
-      drop_last: false
-      persistent_workers: false
-      collate_fn:
-        _target_: src.data.loading.components.collate_functions.collate_fn_train
-        _partial_: true
-        sequence_length: ${data_loading.train_dataloader_config.dataloader.sequence_length}
-        padding_token: ${data_loading.train_dataloader_config.dataloader.padding_token}
-      dataset_config: ${data_loading.train_dataloader_config.dataloader.dataset_config}
-      pin_memory: false
-  test_dataloader_config:
-    dataloader:
-      _target_: src.data.loading.components.interfaces.SequenceDataloaderConfig
-      dataset_class:
-        _target_: src.data.loading.components.dataloading.UnboundedSequenceIterable
-        _partial_: true
-      data_folder: ${paths.data_dir}/testing
-      should_shuffle_rows: false
-      labels:
-        sequence_data:
-          transform:
-            _target_: src.data.loading.components.label_function.NextKTokenMasking
-            next_k: ${model.num_hierarchies}
-      batch_size_per_device: 8
-      num_workers: 8
-      timeout: 60
-      assign_files_by_size: true
-      oov_token: ${data_loading.train_dataloader_config.dataloader.oov_token}
-      masking_token: ${data_loading.train_dataloader_config.dataloader.masking_token}
-      sequence_length: ${data_loading.train_dataloader_config.dataloader.sequence_length}
-      padding_token: ${data_loading.train_dataloader_config.dataloader.padding_token}
-      drop_last: false
-      persistent_workers: false
-      collate_fn:
-        _target_: src.data.loading.components.collate_functions.collate_fn_train
-        _partial_: true
-        sequence_length: ${data_loading.train_dataloader_config.dataloader.sequence_length}
-        padding_token: ${data_loading.train_dataloader_config.dataloader.padding_token}
-      dataset_config: ${data_loading.train_dataloader_config.dataloader.dataset_config}
-      pin_memory: false
   datamodule:
     _target_: src.data.loading.datamodules.sequence_datamodule.SequenceDataModule
     train_dataloader_config: ${..train_dataloader_config.dataloader}
-    val_dataloader_config: ${..val_dataloader_config.dataloader}
-    test_dataloader_config: ${..test_dataloader_config.dataloader}
+
+# Model --------------------------------------------------------------------
+# `TigerUnlearningModule` is a subclass of `SemanticIDEncoderDecoder` so
+# every constructor kwarg is identical to `tiger_train_flat.yaml`.
 model:
   huggingface_model:
     _target_: transformers.T5EncoderModel
@@ -206,7 +219,7 @@ model:
       d_ff: 1024
       d_kv: 64
       num_layers: 4
-  _target_: src.models.modules.semantic_id.tiger_generation_model.SemanticIDEncoderDecoder
+  _target_: src.models.modules.semantic_id.tiger_unlearning_module.TigerUnlearningModule
   feature_to_model_input_map:
     sequence_data: input_ids
     user_id: user_id
@@ -239,67 +252,44 @@ model:
   num_user_bins: null
   codebooks: ${data_loading.train_dataloader_config.dataloader.dataset_config.semantic_id_map.sequence_data}
   mlp_layers: 2
+
+# Callbacks: keep a model-summary, drop everything fit-related --------------
+# `defaults: callbacks: default` inherits a model_checkpoint/early_stopping
+# pair that monitor `val/loss` -- there is no validation loop in the unlearn
+# entry point, so disable them via null (instantiate_callbacks skips nulls).
 callbacks:
-  model_checkpoint:
-    _target_: lightning.pytorch.callbacks.ModelCheckpoint
-    dirpath: ${paths.output_dir}/checkpoints
-    filename: checkpoint_{epoch:03d}_{step:06d}
-    monitor: val/recall@5
-    verbose: true
-    save_last: null
-    save_top_k: 1
-    mode: max
-    auto_insert_metric_name: true
-    save_weights_only: false
-    every_n_train_steps: null
-    train_time_interval: null
-    every_n_epochs: null
-    save_on_train_epoch_end: false
-  early_stopping:
-    _target_: lightning.pytorch.callbacks.EarlyStopping
-    monitor: ${callbacks.model_checkpoint.monitor}
-    min_delta: 0.0
-    patience: 10
-    verbose: true
-    mode: ${callbacks.model_checkpoint.mode}
-    strict: true
-    check_finite: true
-    stopping_threshold: null
-    divergence_threshold: null
-    check_on_train_epoch_end: false
+  model_checkpoint: null
+  early_stopping: null
   model_summary:
     _target_: lightning.pytorch.callbacks.RichModelSummary
     max_depth: -1
-  restart_job:
-    _target_: src.utils.restart_job.RestartAndLoadCheckpointCallback
-    metadata_dir: ${paths.metadata_dir}
+
+# Logger ------------------------------------------------------------------
 logger:
   csv:
     _target_: lightning.pytorch.loggers.csv_logs.CSVLogger
     save_dir: ${paths.output_dir}
     name: csv/
     prefix: ''
+
+# Trainer is instantiated by pipeline_launcher but never `fit()`-ed; we use
+# devices=1 + strategy=auto so SCIF runs in a single autograd process.
 trainer:
   _target_: lightning.pytorch.trainer.Trainer
   default_root_dir: ${paths.output_dir}
-  min_steps: 1
-  max_steps: 320000
-  max_epochs: 10
+  max_steps: 1
+  max_epochs: 1
   accelerator: gpu
-  devices: -1
+  devices: 1
   num_nodes: 1
   precision: 32-true
   enable_progress_bar: false
   log_every_n_steps: 100
-  val_check_interval: 1600
-  deterministic: false
-  accumulate_grad_batches: 16
-  profiler:
-    _target_: lightning.pytorch.profilers.PassThroughProfiler
-  strategy: ddp
-  sync_batchnorm: true
+  # Best-effort reproducibility for SCIF (CUDA ops may still vary by driver).
+  deterministic: true
+  strategy: auto
   num_sanity_val_steps: 0
-  min_epochs: 0
+
 paths:
   root_dir: .
   data_dir: ${data_dir}
@@ -308,14 +298,17 @@ paths:
   work_dir: ${hydra:runtime.cwd}
   profile_dir: ${hydra:run.dir}/profile_output
   metadata_dir: ${paths.output_dir}/metadata
+
 extras:
   ignore_warnings: false
   enforce_tags: true
   print_config_warnings: true
   print_config: true
+
 loss:
   loss_function:
     _target_: torch.nn.CrossEntropyLoss
+
 optim:
   optimizer:
     _target_: torch.optim.Adam
@@ -323,6 +316,7 @@ optim:
     lr: 0.001
     weight_decay: 0.0001
   scheduler: null
+
 eval:
   evaluator:
     _target_: src.components.eval_metrics.SIDRetrievalEvaluator
@@ -336,4 +330,3 @@ eval:
       recall:
         _target_: src.components.eval_metrics.Recall
         _partial_: true
-

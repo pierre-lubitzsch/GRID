@@ -145,12 +145,12 @@ data_loading:
       data_folder: ${paths.data_dir}/items
       should_shuffle_rows: false
       batch_size_per_device: 128
-      num_workers: 2
+      num_workers: 1
       assign_files_by_size: true
       timeout: 60
       drop_last: false
       pin_memory: false
-      persistent_workers: true
+      persistent_workers: false
       collate_fn:
         _target_: src.data.loading.components.collate_functions.collate_fn_items
         _partial_: true

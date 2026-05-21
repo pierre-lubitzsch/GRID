@@ -281,16 +281,23 @@ def map_sparse_id_to_embedding(
 ) -> Dict[str, Any]:
     # Map sparse id to pre-computed embedding
 
-    embedding_map: torch.Tensor = dataset_config.embedding_map.get(
-        sparse_id_field, None
-    )
-    # embedding_map is an N x d tensor
-    # where N is the number of unique items in the dataset
-    # and d is the dimension of the embedding
-    if embedding_map is not None:
-        row[embedding_field_to_add] = embedding_map[row[sparse_id_field]].squeeze()
+    embedding_map = dataset_config.embedding_map.get(sparse_id_field, None)
+    # embedding_map is either an N×d tensor (legacy format) or a dict with
+    # "embeddings" (N×d) and "item_ids" (N,) keys (indexed format from
+    # generate_embeddings.sh when item IDs are non-sequential, e.g. rsc15).
+    # In both cases item IDs in the TFRecords must already be sequential
+    # (0..N-1) after convert_rsc15_inter.py remapping.
+    if embedding_map is None:
+        raise ValueError("Embedding map not found")
+    # Support both plain N×d tensor (legacy) and {"embeddings": N×d, "item_ids": N}
+    # dict/OmegaConf-DictConfig (generate_embeddings.sh indexed format).
+    # OmegaConf DictConfig is not a dict subclass, so check for Tensor explicitly.
+    if isinstance(embedding_map, torch.Tensor):
+        emb_tensor: torch.Tensor = embedding_map
     else:
-        raise ValueError(f"Embedding map not found")
+        emb_tensor = embedding_map["embeddings"]
+    item_idx = int(row[sparse_id_field])
+    row[embedding_field_to_add] = emb_tensor[item_idx].squeeze()
     return row
 
 

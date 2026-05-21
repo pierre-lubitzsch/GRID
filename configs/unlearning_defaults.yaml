@@ -1,0 +1,64 @@
+# Shared unlearning defaults — included by experiment configs via defaults list.
+
+unlearning:
+  algorithm: scif  # scif | unified | finetune | neg_train | filter | retrain
+  deletion_spec: session  # session | item
+  forget_size: null
+
+  # Retain / repair budget = retain_sample_size (or repair_sample_bound) * |D_f|
+  retain_samples_used_for_update: 16
+  retain_sample_size: null
+  repair_sample_bound: null  # alias; defaults to retain_samples_used_for_update
+  retain_max_rows: null
+
+  # Neighborhood construction
+  neighborhood_aware: false
+  neighborhood_method: prefix  # prefix | embedding
+  neighborhood_aware_sample_rate: 1.0
+  neighbor_aware_factor: 8.0
+  sid_prefix_length: 2
+  progressive_sid_prefix: true
+  embedding_path: null
+  embedding_epsilon: null
+  embedding_max_neighbors: 100
+
+  # SCIF numerics
+  damping: 0.01
+  cg_max_iter: 200
+  cg_tol: 1.0e-5
+  cg_solution_max_norm: null
+  max_norm: null
+  update_max_norm: 1.0
+  batch_size_per_device: 256
+  target_params: all
+  eval_mode: true
+  rows_per_shard: 4096
+
+  # Fine-tune baseline
+  finetune_steps: 500
+  finetune_lr: 0.001
+
+  # Negative training baseline
+  neg_train_steps: 200
+  neg_train_lr: 0.001
+  neg_retain_every: 5
+
+  # Filter baseline (decode-time masking, no weight update)
+  filter_mode: global  # global | user_dependent
+
+  # Unified objective (Step 3)
+  forget_loss_level: token  # token | sequence
+  lambda_forget: 1.0
+  lambda_sep: 0.1
+  sep_temperature: 0.07
+  unified_steps: 500
+  unified_lr: 1.0e-4
+
+  # Step 4 local repair (optional, default off)
+  local_repair:
+    enabled: false
+    logit_suppression: false
+    adapter_repair: false
+    prefix_repair: false
+    mass_regularization: false
+    gamma: 1.0

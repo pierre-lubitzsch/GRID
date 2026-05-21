@@ -71,7 +71,7 @@ data_loading:
       timeout: 60
       drop_last: false
       pin_memory: true
-      persistent_workers: true
+      persistent_workers: false
       collate_fn:
         _target_: src.data.loading.components.collate_functions.collate_fn_items
         _partial_: true
@@ -97,7 +97,7 @@ data_loading:
       timeout: 60
       drop_last: false
       pin_memory: false
-      persistent_workers: true
+      persistent_workers: false
       collate_fn:
         _target_: src.data.loading.components.collate_functions.collate_fn_items
         _partial_: true
@@ -122,7 +122,7 @@ data_loading:
       timeout: 60
       drop_last: false
       pin_memory: false
-      persistent_workers: true
+      persistent_workers: false
       collate_fn:
         _target_: src.data.loading.components.collate_functions.collate_fn_items
         _partial_: true
