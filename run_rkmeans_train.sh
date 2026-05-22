@@ -3,6 +3,7 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.out
 #SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
 #SBATCH --time=2-00:00:00
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:nvidia_a100_80gb_pcie:1
@@ -41,9 +42,7 @@ echo "[$(date -Is)] Starting rkmeans train on dataset=${DATASET}"
 echo "Using data_dir=${GRID_DATA_DIR}"
 echo "Using embedding_path=${EMBEDDING_PATH}"
 
-# Save checkpoints to the compute node's local disk first — torch.save() can
-# hang on the scratch parallel filesystem when called from a compute node.
-LOCAL_CKPT_DIR="${HOME}/tmp/rkmeans_ckpts_${SLURM_JOB_ID:-$$}"
+LOCAL_CKPT_DIR="${TMPDIR:-/tmp}/rkmeans_ckpts_${SLURM_JOB_ID:-$$}"
 mkdir -p "${LOCAL_CKPT_DIR}"
 
 python -u -m src.train \
@@ -56,15 +55,14 @@ python -u -m src.train \
   "callbacks.model_checkpoint.dirpath=${LOCAL_CKPT_DIR}" \
   "${@:3}"
 
-# Copy checkpoints from local disk to the most recent Hydra run dir on scratch.
 LATEST_RUN_DIR="$(ls -dt "${GRID_DIR}/logs/train/runs"/*/* 2>/dev/null | head -1 || true)"
 if [ -n "${LATEST_RUN_DIR}" ] && ls "${LOCAL_CKPT_DIR}"/*.ckpt &>/dev/null; then
   mkdir -p "${LATEST_RUN_DIR}/checkpoints"
   cp "${LOCAL_CKPT_DIR}"/*.ckpt "${LATEST_RUN_DIR}/checkpoints/"
-  echo "[$(date -Is)] Checkpoint(s) copied to ${LATEST_RUN_DIR}/checkpoints/"
-  ls "${LATEST_RUN_DIR}/checkpoints/"
+  echo "[$(date -Is)] Checkpoint copied to ${LATEST_RUN_DIR}/checkpoints/"
 else
-  echo "[$(date -Is)] WARNING: no checkpoint found in ${LOCAL_CKPT_DIR}"
+  echo "[$(date -Is)] ERROR: no checkpoint found in ${LOCAL_CKPT_DIR}"
+  exit 1
 fi
 
 echo "[$(date -Is)] rkmeans train finished"

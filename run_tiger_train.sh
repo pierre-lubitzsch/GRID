@@ -3,16 +3,11 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.out
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
 #SBATCH --gpus-per-node=1
 #SBATCH --partition=gpu
 #SBATCH --time=2-00:00:00
 
 # Resource notes:
-# * --cpus-per-task=8 matches num_workers=8 in tiger_train_flat.yaml
-#   (train_dataloader_config.dataloader.num_workers); raise both together
-#   if you want more parallelism. Without this, SLURM defaults to 1 CPU
-#   and Lightning warns "Consider setting num_workers to 1...".
 # * --gpus-per-node=1 + --partition=gpu: on this cluster --partition=gpu
 #   alone does NOT allocate a GPU; the job will land on a compute node.
 #   Always request the GPU explicitly. Override at submit time with

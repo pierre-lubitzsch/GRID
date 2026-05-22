@@ -196,7 +196,10 @@ class BaseJobLauncher:
     def prepare_command(self):
         """Prepare the command to execute."""
         original_argv = sys.argv
-        cmd = [sys.executable] + original_argv + ["++should_skip_retry=True"]
+        cmd = [sys.executable] + original_argv + [
+            "++should_skip_retry=True",
+            f"++paths.metadata_dir={self.metadata_dir}",
+        ]
         return cmd
 
     def execute_job(self) -> bool:

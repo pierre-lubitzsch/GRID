@@ -4,7 +4,7 @@
 #SBATCH --error=logs/%j.out
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --partition=cpu
+#SBATCH --partition=compute
 
 set -euo pipefail
 

@@ -542,6 +542,33 @@ def main(
         item_counts, max_user_id, n_clean_users, seq_lengths = _scan_stats_from_inter(
             stats_inter, n_clean_users=n_clean_users
         )
+        # _scan_stats_from_inter returns item_counts keyed by raw item IDs (e.g.
+        # 214844368).  The TFRecords store sequential IDs (0..N-1), so we must
+        # remap before selecting targets/fillers, otherwise item IDs written to
+        # spam shards will be out-of-bounds for the codebook tensor at training.
+        id_map_path = os.path.join(data_dir, "item_id_map.json")
+        if os.path.isfile(id_map_path):
+            with open(id_map_path, encoding="utf-8") as _f:
+                _id_map_data = json.load(_f)
+            raw_to_seq = {
+                raw: seq
+                for seq, raw in enumerate(_id_map_data["seq_to_raw"])
+            }
+            item_counts = Counter(
+                {raw_to_seq[k]: v for k, v in item_counts.items() if k in raw_to_seq}
+            )
+            print(
+                f"[bandwagon] Remapped item_counts from raw IDs to sequential IDs "
+                f"using {id_map_path} ({len(item_counts)} items retained)."
+            )
+        else:
+            print(
+                f"[bandwagon] WARNING: {id_map_path} not found. "
+                "item_counts keys are raw item IDs which will cause an "
+                "out-of-bounds crash at training time. "
+                "Re-generate the dataset with convert_rsc15_inter.py to create "
+                "item_id_map.json, or use the slow path (omit --stats-inter)."
+            )
     else:
         print(f"[bandwagon] Scanning clean training shards under {training_dir} ...")
         (
