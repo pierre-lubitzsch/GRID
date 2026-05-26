@@ -427,3 +427,42 @@ sbatch run_tiger_unlearn.sh "${POISON_CKPT}" "${POISON_DIR}" "${SID}" true
 UNLEARN_CKPT=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt
 sbatch run_tiger_eval_three_way.sh "${UNLEARN_CKPT}" "${CLEAN_CKPT}" "${POISON_CKPT}" "${SID}" src/data/erase_data/rsc15
 ```
+
+## Typical rsc15 run sequence executed job ids
+
+```bash
+# One-time setup
+python -m src.data.erase_data.convert_rsc15_inter --inter src/data/rsc15.inter --out-dir src/data/erase_data/rsc15
+
+# Step 1: LLM embeddings (no SLURM job tracked; run completed 2026-05-21)
+LLM_EMB=logs/inference/runs/2026-05-21/14-23-52/pickle/merged_predictions_tensor.pt
+
+# Step 2: SID codebook
+# 2a: train --- job 8978715
+sbatch run_rkmeans_train.sh rsc15 "${LLM_EMB}"
+RKMEANS_CKPT=logs/train/runs/2026-05-21/21-13-42/checkpoints/checkpoint_000_000030.ckpt
+# 2b: inference — job 8985567
+sbatch run_rkmeans_inference.sh "${RKMEANS_CKPT}" rsc15 "${LLM_EMB}"
+SID=embeddings/rsc15/merged_predictions_tensor.pt
+
+# Step 3: clean training --- job 8989546 (cancelled at 2-day time limit; last ckpt at step 2500)
+# H200 training: job 9013420
+sbatch run_tiger_train.sh rsc15 clean "${SID}"
+CLEAN_CKPT=logs/train/runs/2026-05-22/16-08-24/checkpoints/checkpoint_epoch=000_step=002500.ckpt
+
+# Step 4: poison --- job 8989494
+sbatch run_rsc15_poison.sh rsc15
+POISON_DIR=src/data/erase_data/rsc15_spam_seed2_pct1_n10
+
+# Step 5: poisoned training --- job 9013396
+# H200 training: job 9013421
+sbatch run_tiger_train.sh rsc15 poison "${SID}"
+POISON_CKPT=logs/train/runs/<date>/<time>/checkpoints/checkpoint_epoch=003.ckpt
+
+# Step 6: unlearn (SCIF + neighborhood) --- not yet run
+sbatch run_tiger_unlearn.sh "${POISON_CKPT}" "${POISON_DIR}" "${SID}" true
+
+# Step 7: evaluate --- not yet run
+UNLEARN_CKPT=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt
+sbatch run_tiger_eval_three_way.sh "${UNLEARN_CKPT}" "${CLEAN_CKPT}" "${POISON_CKPT}" "${SID}" src/data/erase_data/rsc15
+```

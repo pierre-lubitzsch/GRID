@@ -4,8 +4,8 @@
 #SBATCH --error=logs/%j.out
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gpus-per-node=1
-#SBATCH --partition=gpu
+#SBATCH --gres=gpu:nvidia_h200:2
+#SBATCH --partition=pgpu
 #SBATCH --time=1-00:00:00
 
 set -euo pipefail

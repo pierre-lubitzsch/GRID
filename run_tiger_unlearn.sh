@@ -4,17 +4,16 @@
 #SBATCH --error=logs/%j.out
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gpus-per-node=1
-#SBATCH --partition=gpu
+#SBATCH --gres=gpu:nvidia_h200:2
+#SBATCH --partition=pgpu
 #SBATCH --time=1-00:00:00
 
 # --cpus-per-task=8: SCIF iterates over forget/retain dataloaders multiple
 # times (one HVP pass per CG iteration), so even with num_workers=0 in
 # tiger_unlearn_scif_flat.yaml we want some parallelism for the
 # materialised retain subset filter (neighborhood_sampler).
-# --gpus-per-node=1 + --partition=gpu: SCIF runs single-device autograd
-# (devices=1, strategy=auto in the experiment config) but still needs a
-# GPU. --partition=gpu alone does NOT allocate one on this cluster.
+# --gres=gpu:nvidia_h200:1 + --partition=pgpu: SCIF runs single-device autograd
+# (devices=1, strategy=auto in the experiment config) on one H200.
 
 set -euo pipefail
 

@@ -3,15 +3,13 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.out
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=1
-#SBATCH --partition=gpu
+#SBATCH --gres=gpu:nvidia_h200:2
+#SBATCH --partition=pgpu
 #SBATCH --time=2-00:00:00
 
 # Resource notes:
-# * --gpus-per-node=1 + --partition=gpu: on this cluster --partition=gpu
-#   alone does NOT allocate a GPU; the job will land on a compute node.
-#   Always request the GPU explicitly. Override at submit time with
-#   `sbatch --gpus-per-node=N ...` for multi-GPU runs.
+# * --gres=gpu:nvidia_h200:2 + --partition=pgpu: requests 2 H200s (s-sc-pgpu[11-16]).
+#   Override at submit time with `sbatch --gres=gpu:nvidia_h200:N ...`.
 
 set -euo pipefail
 
