@@ -26,6 +26,9 @@ set -euo pipefail
 # <dataset> is a short name (beauty, rsc15, ...) resolved via
 # scripts/resolve_unlearn_dataset.sh, or a path containing '/' used as data_dir.
 #
+# Poison dataset selection (env vars, defaults shown):
+#   POISONING_RATIO=0.01  N_TARGET_ITEMS=10  POISON_SEED=2
+#
 # Example (dataset name):
 #   sbatch run_tiger_unlearn_sequential.sh \
 #       logs/train/.../checkpoint_epoch=003.ckpt \
@@ -71,6 +74,10 @@ if [ -z "${CKPT_PATH}" ] || [ -z "${DATASET_OR_DIR}" ]; then
   echo "Known datasets: beauty, sports, toys, rsc15, rsc15_smoke (see scripts/resolve_unlearn_dataset.sh)"
   exit 1
 fi
+
+POISONING_RATIO="${POISONING_RATIO:-0.01}"
+N_TARGET_ITEMS="${N_TARGET_ITEMS:-10}"
+POISON_SEED="${POISON_SEED:-2}"
 
 GRID_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 # shellcheck source=scripts/resolve_unlearn_dataset.sh

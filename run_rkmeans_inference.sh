@@ -4,8 +4,8 @@
 #SBATCH --error=logs/%j.out
 #SBATCH --ntasks=1
 #SBATCH --time=2-00:00:00
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:nvidia_a100_80gb_pcie:1
+#SBATCH --partition=pgpu
+#SBATCH --gres=gpu:nvidia_h200:2
 
 set -euo pipefail
 
@@ -61,7 +61,7 @@ python -u -m src.inference \
 
 echo "[$(date -Is)] rkmeans inference finished, merging pickle shards..."
 
-LATEST_RUN_DIR="$(ls -dt logs/inference/runs/*/* 2>/dev/null | head -n 1)"
+LATEST_RUN_DIR="$(ls -d logs/inference/runs/*/* 2>/dev/null | sort | tail -1)"
 PICKLE_DIR="${LATEST_RUN_DIR}/pickle"
 export PICKLE_DIR
 

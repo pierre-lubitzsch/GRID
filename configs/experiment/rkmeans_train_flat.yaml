@@ -204,7 +204,9 @@ trainer:
   accumulate_grad_batches: 1
   profiler:
     _target_: lightning.pytorch.profilers.PassThroughProfiler
-  strategy: auto
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    find_unused_parameters: true
   sync_batchnorm: true
   num_sanity_val_steps: 0
 paths:

@@ -37,6 +37,51 @@ python -m src.data.erase_data.convert_rsc15_inter \
     --max-sessions 5000
 ```
 
+### Step 0b — Create a random 10% subset for fast end-to-end testing
+
+Produces `src/data/erase_data/test_rsc15_seed_2/` by default. Samples 10% of
+sessions; complete sessions are always kept intact (no partial sequences).
+
+**Option A — from existing GRID dataset (recommended):**
+Reads the already-converted TFRecords. Item IDs are kept identical, so the
+existing SID tensor (`embeddings/rsc15/merged_predictions_tensor.pt`) can be
+reused — no need to re-run Steps 1–2.
+
+```bash
+python -m src.data.erase_data.subsample_rsc15 \
+    --from-grid-dir src/data/erase_data/rsc15
+```
+
+**Option B — from raw inter file:**
+Runs the full conversion. Item IDs are remapped fresh over the subset, so a
+new SID tensor is required (Steps 1–2 must be repeated for the subset).
+
+```bash
+python -m src.data.erase_data.subsample_rsc15 \
+    --inter /home/pilu12/workspace/GRID/src/data/rsc15.inter
+```
+
+Both options use `--seed 2` and `--fraction 0.10` by default. To vary:
+
+```bash
+python -m src.data.erase_data.subsample_rsc15 \
+    --from-grid-dir src/data/erase_data/rsc15 \
+    --seed 42
+# → src/data/erase_data/test_rsc15_seed_42/
+```
+
+When using Option A, downstream steps can reuse the full-dataset SID tensor:
+
+```bash
+SID=embeddings/rsc15/merged_predictions_tensor.pt  # same as full dataset
+
+# Step 3: clean training on subset
+sbatch run_tiger_train.sh test_rsc15_seed_2 clean "${SID}"
+
+# Step 4: poisoning on subset
+sbatch run_rsc15_poison.sh test_rsc15_seed_2
+```
+
 ---
 
 ## Step 1 — Generate flan-T5 item embeddings
@@ -118,23 +163,27 @@ This is the **reference** model for computing relative utility in evaluation.
 Creates the poisoned dataset and the forget/retain split in one script.
 
 ```bash
+# Args: dataset  [poisoning_ratio]  (n_target_items via N_TARGET_ITEMS env var)
 sbatch run_rsc15_poison.sh rsc15
+sbatch run_rsc15_poison.sh rsc15 0.05   # pct5
 ```
 
 Default parameters match ERASE: `seed=2`, `poisoning_ratio=0.01`, `n_target_items=10`, `placement=sprinkled`, `p_two_targets=0.119`.
 
-Override via environment:
+The output directory name is derived automatically from the params:
 
 ```bash
-POISON_SEED=42 POISONING_RATIO=0.02 N_TARGET_ITEMS=5 sbatch run_rsc15_poison.sh rsc15
+N_TARGET_ITEMS=5 sbatch run_rsc15_poison.sh rsc15 0.02
+# → src/data/erase_data/rsc15_spam_seed2_pct2_n5/
 ```
 
 Outputs:
-- `src/data/erase_data/rsc15_spam_seed2_pct1_n10/` — poisoned data
+- `src/data/erase_data/rsc15_spam_seed<S>_pct<P>_n<N>/` — poisoned data
 - `.../forget_manifest.json` — target items + spam user IDs
 - `.../training_forget/` and `.../training_retain/` — forget/retain split
 
 ```bash
+# Default params:
 POISON_DIR=src/data/erase_data/rsc15_spam_seed2_pct1_n10
 ```
 
@@ -143,8 +192,13 @@ POISON_DIR=src/data/erase_data/rsc15_spam_seed2_pct1_n10
 ## Step 5 — Train TIGER on poisoned data
 
 ```bash
+# Args: dataset  clean|poison  semantic_id_path  [poisoning_ratio]  [n_target_items]
 sbatch run_tiger_train.sh rsc15 poison "${SID}"
+sbatch run_tiger_train.sh rsc15 poison "${SID}" 0.05       # pct5, n=10
+sbatch run_tiger_train.sh rsc15 poison "${SID}" 0.05 5     # pct5, n=5
 ```
+
+The script resolves the poisoned dataset directory from the ratio and n_target params (same logic as `run_rsc15_poison.sh`).
 
 ```bash
 POISON_CKPT=logs/train/runs/<date>/<time>/checkpoints/checkpoint_epoch=003.ckpt
@@ -159,9 +213,15 @@ This is the **starting point** for all unlearning algorithms.
 All unlearning algorithms accept the same base inputs: `<ckpt_path>`, `<data_dir>`, `[semantic_id_path]`. Extra Hydra overrides follow at the end.
 
 ```bash
-# Shorthand used throughout this section
+# Shorthand used throughout this section (default params: seed=2, ratio=0.01, n=10)
 POISON_DIR=src/data/erase_data/rsc15_spam_seed2_pct1_n10
 SID=embeddings/rsc15/merged_predictions_tensor.pt
+```
+
+For non-default poison params, pass `POISONING_RATIO` / `N_TARGET_ITEMS` as env vars — the unlearn script resolves the poisoned dataset path automatically:
+
+```bash
+POISONING_RATIO=0.05 N_TARGET_ITEMS=10 sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" ...
 ```
 
 ### 6a — SCIF (default, single-pass)
@@ -274,11 +334,56 @@ Controls what the algorithms treat as "known" and which items are used as neighb
 |---|---|---|
 | `session` (default) | Spam user sessions | All distinct items in forget shards |
 | `item` | Target items `I_f` from manifest | `I_f` only; non-target spam interactions allowed as repair rows |
+| `item_pairs` | Target items `I_f` from manifest | `I_f` only (see §6g) |
 
 ```bash
 # Item mode — attach to any algorithm via Hydra override
 sbatch run_tiger_unlearn.sh "${POISON_CKPT}" "${POISON_DIR}" "${SID}" true \
     unlearning.deletion_spec=item
+```
+
+### 6g — Item unlearning (`deletion_spec=item_pairs`)
+
+Surgically unlearns only the `(prefix → target_item)` training pairs from spam sessions rather than whole sessions.  For each spam session `[i_1,...,i_n]` and every position `j` where `i_j ∈ I_f`, one forget entry `[i_1,...,i_j]` is written.  The training collate expands this to the full-context pair `([i_1,...,i_{j-1}], i_j)` — the signal most responsible for the model predicting `i_j`.
+
+Output: `training_forget_item_pairs/` sibling directory (created on first run, cached for re-use).
+
+Requires `target_items` in `forget_manifest.json` (present in all bandwagon-poisoned datasets).
+
+**Single-shot SCIF, spam sessions only:**
+
+```bash
+sbatch run_tiger_unlearn.sh "${POISON_CKPT}" "${POISON_DIR}" "${SID}" false \
+    unlearning.deletion_spec=item_pairs
+```
+
+**Sequential SCIF, spam sessions only:**
+
+```bash
+# Use request_user_order=sorted because item_pairs entries have synthetic
+# user_ids (0, 1, 2, …) that do not appear in the spam manifest.
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" false 8 1.0 \
+    unlearning.deletion_spec=item_pairs \
+    unlearning.request_user_order=sorted
+```
+
+With neighborhood-aware retain sampling:
+
+```bash
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" true 8 1.0 \
+    unlearning.deletion_spec=item_pairs \
+    unlearning.request_user_order=sorted
+```
+
+**`--unlearn_whole_items`: global target suppression (spam + clean sessions)**
+
+Adds `(prefix → i_f)` pairs from the clean retain set so target items are suppressed regardless of their context, not just in spam-induced predictions.
+
+```bash
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" false 8 1.0 \
+    unlearning.deletion_spec=item_pairs \
+    unlearning.unlearn_whole_items=true \
+    unlearning.request_user_order=sorted
 ```
 
 ### 6f — Step 4 local repair (optional, off by default)
@@ -361,7 +466,7 @@ Produces a CSV table under `logs/eval/collected/<stamp>/` with columns for relat
 | Variable | Default path | Description |
 |---|---|---|
 | `GRID_DATA_DIR` | `src/data/erase_data/rsc15` | Clean dataset |
-| `GRID_POISON_DATA_DIR` | `src/data/erase_data/rsc15_spam_seed2_pct1_n10` | Poisoned dataset |
+| `GRID_POISON_DATA_DIR` | `src/data/erase_data/rsc15_spam_seed<S>_pct<P>_n<N>` | Poisoned dataset — derived from `POISON_SEED`, `POISONING_RATIO`, `N_TARGET_ITEMS` |
 | `GRID_SEMANTIC_ID_PATH` / `SID` | `embeddings/rsc15/merged_predictions_tensor.pt` | RKMeans SID tensor (D×N int) |
 | `LLM_EMB` | `logs/inference/runs/.../pickle/merged_predictions_tensor.pt` | flan-T5 LLM embeddings (N×2048 float, indexed dict) |
 | Train ckpts | `logs/train/runs/<date>/<time>/checkpoints/` | |
@@ -402,26 +507,42 @@ python -m src.data.erase_data.convert_rsc15_inter --inter src/data/rsc15.inter -
 sbatch generate_embeddings.sh rsc15
 LLM_EMB=logs/inference/runs/<date>/<time>/pickle/merged_predictions_tensor.pt
 
+# Test rsc15:
+LLM_EMB_TEST=logs/inference/runs/2026-05-26/15-34-35/pickle/merged_predictions_tensor.pt
+
 # Step 2: SID codebook
 sbatch run_rkmeans_train.sh rsc15 "${LLM_EMB}"
 RKMEANS_CKPT=logs/train/runs/<date>/<time>/checkpoints/last.ckpt
+RKMEANS_CKPT_TEST=logs/train/runs/2026-05-26/16-10-46/checkpoints/checkpoint_000_000030.ckpt
 sbatch run_rkmeans_inference.sh "${RKMEANS_CKPT}" rsc15 "${LLM_EMB}"
 SID=embeddings/rsc15/merged_predictions_tensor.pt
+SID_TEST=embeddings/test_rsc15_seed_2/merged_predictions_tensor.pt
 
 # Step 3: clean training
 sbatch run_tiger_train.sh rsc15 clean "${SID}"
 CLEAN_CKPT=logs/train/runs/<date>/<time>/checkpoints/checkpoint_epoch=003.ckpt
 
-# Step 4: poison
+# Step 4: poison  (add arg 2 for non-default ratio, e.g. 0.05)
 sbatch run_rsc15_poison.sh rsc15
-POISON_DIR=src/data/erase_data/rsc15_spam_seed2_pct1_n10
+POISON_DIR=src/data/erase_data/rsc15_spam_seed2_pct1_n10  # adjust for non-default params
 
-# Step 5: poisoned training
+# Step 5: poisoned training  (add args 4/5 for non-default ratio/n_target)
 sbatch run_tiger_train.sh rsc15 poison "${SID}"
 POISON_CKPT=logs/train/runs/<date>/<time>/checkpoints/checkpoint_epoch=003.ckpt
 
 # Step 6: unlearn (SCIF + neighborhood)
 sbatch run_tiger_unlearn.sh "${POISON_CKPT}" "${POISON_DIR}" "${SID}" true
+
+# Step 6 (alternative): item unlearning — only (prefix → target_item) pairs from spam sessions
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" false 8 1.0 \
+    unlearning.deletion_spec=item_pairs \
+    unlearning.request_user_order=sorted
+
+# Step 6 (alternative): global item suppression — also unlearn target pairs from clean sessions
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" false 8 1.0 \
+    unlearning.deletion_spec=item_pairs \
+    unlearning.unlearn_whole_items=true \
+    unlearning.request_user_order=sorted
 
 # Step 7: evaluate
 UNLEARN_CKPT=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt
@@ -465,4 +586,48 @@ sbatch run_tiger_unlearn.sh "${POISON_CKPT}" "${POISON_DIR}" "${SID}" true
 # Step 7: evaluate --- not yet run
 UNLEARN_CKPT=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt
 sbatch run_tiger_eval_three_way.sh "${UNLEARN_CKPT}" "${CLEAN_CKPT}" "${POISON_CKPT}" "${SID}" src/data/erase_data/rsc15
+```
+
+## Typical test_rsc15_seed_2 run sequence executed job ids
+
+```bash
+# Step 0b: subsample 10% from existing rsc15 GRID dataset
+python -m src.data.erase_data.subsample_rsc15 --from-grid-dir src/data/erase_data/rsc15
+# → src/data/erase_data/test_rsc15_seed_2/
+
+# Step 1: LLM embeddings --- job 9015463
+sbatch generate_embeddings.sh test_rsc15_seed_2
+LLM_EMB_TEST=logs/inference/runs/2026-05-26/15-34-35/pickle/merged_predictions_tensor.pt
+
+# Step 2: SID codebook
+# 2a: train --- job 9017156 (failed: DDP find_unused_parameters, fixed in rkmeans_train_flat.yaml), job 9017715 (success)
+sbatch run_rkmeans_train.sh test_rsc15_seed_2 "${LLM_EMB_TEST}"
+RKMEANS_CKPT_TEST=logs/train/runs/2026-05-26/16-10-46/checkpoints/checkpoint_000_000030.ckpt
+# 2b: inference --- job 9018131
+sbatch run_rkmeans_inference.sh "${RKMEANS_CKPT_TEST}" test_rsc15_seed_2 "${LLM_EMB_TEST}"
+SID_TEST=embeddings/test_rsc15_seed_2/merged_predictions_tensor.pt
+
+# Step 3: clean training --- job 9018466
+sbatch run_tiger_train.sh test_rsc15_seed_2 clean "${SID_TEST}"
+CLEAN_CKPT_TEST=logs/train/runs/2026-05-26/16-22-13/checkpoints/<latest>.ckpt
+
+# Step 4: poison --- job 9019345
+sbatch run_rsc15_poison.sh test_rsc15_seed_2          # default pct1_n10
+# sbatch run_rsc15_poison.sh test_rsc15_seed_2 0.05   # example: pct5
+POISON_DIR_TEST=src/data/erase_data/test_rsc15_seed_2_spam_seed2_pct1_n10  # adjust for non-default params
+
+# Step 5: poisoned training ---
+# pct 0.01, ntarget 10: job 9019894
+# pct 0.05, ntarget 10: job 9023762
+# pct 0.1, ntarget 10: job 9023800
+# Add args 4/5 for non-default ratio/n_target: sbatch run_tiger_train.sh test_rsc15_seed_2 poison "${SID_TEST}" 0.05 10
+sbatch run_tiger_train.sh test_rsc15_seed_2 poison "${SID_TEST}"
+POISON_CKPT_TEST=logs/train/runs/2026-05-26/16-42-29/checkpoints/<latest>.ckpt
+
+# Step 6: unlearn (SCIF + neighborhood) --- not yet run
+sbatch run_tiger_unlearn.sh "${POISON_CKPT_TEST}" "${POISON_DIR_TEST}" "${SID_TEST}" true
+
+# Step 7: evaluate --- not yet run
+UNLEARN_CKPT_TEST=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt
+sbatch run_tiger_eval_three_way.sh "${UNLEARN_CKPT_TEST}" "${CLEAN_CKPT_TEST}" "${POISON_CKPT_TEST}" "${SID_TEST}" src/data/erase_data/test_rsc15_seed_2
 ```

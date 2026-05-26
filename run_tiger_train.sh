@@ -38,6 +38,8 @@ set -euo pipefail
 DATASET="${1:-beauty}"
 ARG2="${2:-}"
 ARG3="${3:-}"
+POISONING_RATIO="${POISONING_RATIO:-${4:-0.01}}"
+N_TARGET_ITEMS="${N_TARGET_ITEMS:-${5:-10}}"
 VARIANT="clean"
 SEMANTIC_ID_PATH=""
 

@@ -6,7 +6,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Set
 
-VALID_DELETION_SPECS = frozenset({"session", "item"})
+VALID_DELETION_SPECS = frozenset({"session", "item", "item_pairs"})
 
 
 def normalize_deletion_spec(spec: Optional[str]) -> str:
@@ -56,10 +56,10 @@ def resolve_neighborhood_centers(
 ) -> Set[int]:
     """Return item ids used as neighborhood centers ``i_f``."""
     spec = normalize_deletion_spec(deletion_spec)
-    if spec == "item":
+    if spec in ("item", "item_pairs"):
         if not target_items:
             raise ValueError(
-                "deletion_spec='item' requires target_items in forget_manifest."
+                f"deletion_spec={spec!r} requires target_items in forget_manifest."
             )
         return set(target_items)
     return set(forget_shard_items)
@@ -73,7 +73,7 @@ def resolve_forbidden_retain_items(
 ) -> Set[int]:
     """Items whose presence in a retain row disqualifies it (except repair pool)."""
     spec = normalize_deletion_spec(deletion_spec)
-    if spec == "item":
+    if spec in ("item", "item_pairs"):
         return set(target_items)
     return set(forget_shard_items)
 

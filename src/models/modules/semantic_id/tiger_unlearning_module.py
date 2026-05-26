@@ -39,7 +39,9 @@ from src.data.unlearning.deletion_spec import (
 )
 from src.data.unlearning.forget_target_filter import (
     default_item_mode_forget_subdir,
+    default_item_pairs_forget_subdir,
     materialize_item_mode_forget_dir,
+    materialize_item_pairs_forget_dir,
 )
 from src.models.modules.semantic_id.tiger_generation_model import (
     SemanticIDEncoderDecoder,
@@ -362,6 +364,27 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 )
             forget_dir = filtered_dir
 
+        if deletion_spec == "item_pairs" and target_items:
+            item_pairs_subdir = default_item_pairs_forget_subdir(forget_subdir)
+            item_pairs_dir = os.path.join(data_dir, item_pairs_subdir)
+            unlearn_whole_items = bool(unlearning_cfg.get("unlearn_whole_items", False))
+            extra_dirs: Optional[List[str]] = [retain_dir] if unlearn_whole_items else None
+            if not _list_shards_safe(item_pairs_dir):
+                log.info(
+                    "[item_pairs] materialising (prefix→target) pairs "
+                    "from %s (unlearn_whole_items=%s)",
+                    forget_dir,
+                    unlearn_whole_items,
+                )
+                materialize_item_pairs_forget_dir(
+                    forget_dir=forget_dir,
+                    out_dir=item_pairs_dir,
+                    target_items=target_items,
+                    extra_source_dirs=extra_dirs,
+                    rows_per_shard=int(unlearning_cfg.get("rows_per_shard", 4096)),
+                )
+            forget_dir = item_pairs_dir
+
         if forget_size_hint is None:
             forget_size_hint = _count_rows_in_tfrecord_dir(forget_dir)
         if forget_size_hint <= 0:
@@ -401,7 +424,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 unlearning_cfg.get("embedding_max_neighbors", 100)
             ),
             deletion_spec=deletion_spec,
-            target_items=target_items if deletion_spec == "item" else None,
+            target_items=target_items if deletion_spec in ("item", "item_pairs") else None,
             num_hierarchies=num_hierarchies,
             rows_per_shard=int(unlearning_cfg.get("rows_per_shard", 4096)),
             seed=int(seed),

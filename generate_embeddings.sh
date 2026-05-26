@@ -48,7 +48,7 @@ python -u -m src.inference \
 
 echo "[$(date -Is)] Inference finished, merging pickle shards..."
 
-LATEST_RUN_DIR="$(ls -dt logs/inference/runs/*/* 2>/dev/null | head -n 1)"
+LATEST_RUN_DIR="$(ls -d logs/inference/runs/*/* 2>/dev/null | sort | tail -1)"
 PICKLE_DIR="${LATEST_RUN_DIR}/pickle"
 export PICKLE_DIR
 

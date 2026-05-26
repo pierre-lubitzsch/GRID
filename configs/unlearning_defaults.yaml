@@ -2,7 +2,13 @@
 
 unlearning:
   algorithm: scif  # scif | unified | finetune | neg_train | filter | retrain
-  deletion_spec: session  # session | item
+  deletion_spec: session  # session | item | item_pairs
+  # item_pairs mode: unlearn only the (prefix → target_item) training pairs
+  # from spam sessions.  Set unlearn_whole_items: true to also unlearn those
+  # pairs from clean retain sessions (suppresses the target item globally).
+  # In sequential mode use request_user_order: sorted (not manifest) because
+  # item_pairs entries have synthetic user_ids that do not appear in the manifest.
+  unlearn_whole_items: false
   forget_size: null
 
   # Retain / repair budget = retain_sample_size (or repair_sample_bound) * |D_f|

@@ -5,8 +5,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --time=2-00:00:00
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:nvidia_a100_80gb_pcie:1
+#SBATCH --partition=pgpu
+#SBATCH --gres=gpu:nvidia_h200:2
 
 set -euo pipefail
 
@@ -55,7 +55,7 @@ python -u -m src.train \
   "callbacks.model_checkpoint.dirpath=${LOCAL_CKPT_DIR}" \
   "${@:3}"
 
-LATEST_RUN_DIR="$(ls -dt "${GRID_DIR}/logs/train/runs"/*/* 2>/dev/null | head -1 || true)"
+LATEST_RUN_DIR="$(ls -d "${GRID_DIR}/logs/train/runs"/*/* 2>/dev/null | sort | tail -1 || true)"
 if [ -n "${LATEST_RUN_DIR}" ] && ls "${LOCAL_CKPT_DIR}"/*.ckpt &>/dev/null; then
   mkdir -p "${LATEST_RUN_DIR}/checkpoints"
   cp "${LOCAL_CKPT_DIR}"/*.ckpt "${LATEST_RUN_DIR}/checkpoints/"
