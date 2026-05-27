@@ -249,16 +249,51 @@ sbatch run_tiger_unlearn.sh "${POISON_CKPT}" "${POISON_DIR}" "${SID}" true \
     unlearning.embedding_max_neighbors=100
 ```
 
-### 6b — SCIF sequential (per-request batches)
+### 6b — Sequential unlearning (per-request batches)
 
 Processes forget requests in batches; runs post-eval automatically.
 
-```bash
-# Args: ckpt dataset semantic_id neighborhood_aware batch_size sample_rate [overrides]
-sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" true 8 1.0
+```
+run_tiger_unlearn_sequential.sh <ckpt> <dataset> [algorithm] [sid] [neighborhood_aware] [batch_size] [sample_rate] [overrides...]
 ```
 
-Mixed neighborhood (half neighborhood, half uniform):
+`[algorithm]` is optional at position 3, auto-detected by name (default: `scif`).
+Can also be set via `UNLEARN_ALGORITHM=<algo>` env var.
+
+#### Algorithm choices
+
+| Algorithm | What it does | Key hyperparams |
+|---|---|---|
+| `scif` (default) | Single-shot Newton update via Conjugate Gradient | `damping`, `cg_max_iter`, `update_max_norm` |
+| `unified` | Combined loss: L_retain + λ·L_forget + λ·L_sep | `lambda_forget`, `lambda_sep`, `unified_steps`, `unified_lr` |
+| `finetune` | Continue training on retain-only data (Adam) | `finetune_steps`, `finetune_lr` |
+| `neg_train` | Gradient ascent on forget + retain CE every N steps | `neg_train_steps`, `neg_train_lr`, `neg_retain_every` |
+| `filter` | Decode-time output masking, no weight update | `filter_mode` (`global` \| `user_dependent`) |
+
+#### One call per algorithm
+
+```bash
+# SCIF (default) — neighborhood-aware retain sampling recommended
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 scif "${SID}" true 8 1.0
+
+# Unified objective
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 unified "${SID}" false 8 1.0 \
+    unlearning.lambda_forget=1.0 unlearning.lambda_sep=0.1 unlearning.unified_steps=500
+
+# Fine-tune on retain data
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 finetune "${SID}" false 8 1.0 \
+    unlearning.finetune_steps=500 unlearning.finetune_lr=1e-3
+
+# Negative training
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 neg_train "${SID}" false 8 1.0 \
+    unlearning.neg_train_steps=200 unlearning.neg_train_lr=1e-3 unlearning.neg_retain_every=5
+
+# Decode-time filter (global)
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 filter "${SID}" false 8 1.0 \
+    unlearning.filter_mode=global
+```
+
+Mixed neighborhood for SCIF (half neighbourhood-aware, half uniform):
 
 ```bash
 sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" true 8 0.5
@@ -266,23 +301,34 @@ sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" true 8 0.
 
 ### 6c — Baseline algorithms
 
-All via `run_tiger_unlearn_baselines.sh <algorithm> <ckpt> <data_dir> [sid] [overrides]`.
+Single-pass via `run_tiger_unlearn_baselines.sh <algorithm> <ckpt> <data_dir> [sid] [overrides]`.
+Sequential (per-request batches) via `run_tiger_unlearn_sequential.sh` with an `[algorithm]` arg — see §6b.
 
 **Fine-tune on retain data:**
 
 ```bash
+# Single-pass
 sbatch run_tiger_unlearn_baselines.sh finetune \
     "${POISON_CKPT}" "${POISON_DIR}" "${SID}" \
+    unlearning.finetune_steps=500 unlearning.finetune_lr=1e-3
+
+# Sequential (per-request batches)
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 finetune "${SID}" false 8 1.0 \
     unlearning.finetune_steps=500 unlearning.finetune_lr=1e-3
 ```
 
 **Negative training:**
 
 ```bash
+# Single-pass
 sbatch run_tiger_unlearn_baselines.sh neg_train \
     "${POISON_CKPT}" "${POISON_DIR}" "${SID}" \
     unlearning.neg_train_steps=200 unlearning.neg_train_lr=1e-3 \
     unlearning.neg_retain_every=5
+
+# Sequential (per-request batches)
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 neg_train "${SID}" false 8 1.0 \
+    unlearning.neg_train_steps=200 unlearning.neg_train_lr=1e-3
 ```
 
 **Decode-time filter (no weight update):**
@@ -309,6 +355,7 @@ sbatch run_tiger_train.sh rsc15 clean "${SID}"
 ### 6d — Unified objective (L_retain + λ L_forget + λ L_sep)
 
 ```bash
+# Single-pass
 sbatch run_tiger_unlearn_baselines.sh unified \
     "${POISON_CKPT}" "${POISON_DIR}" "${SID}" \
     unlearning.forget_loss_level=token \
@@ -316,6 +363,10 @@ sbatch run_tiger_unlearn_baselines.sh unified \
     unlearning.lambda_sep=0.1 \
     unlearning.unified_steps=500 \
     unlearning.unified_lr=1e-4
+
+# Sequential (per-request batches) — uses tiger_unlearn_unified_sequential config
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 unified "${SID}" false 8 1.0 \
+    unlearning.lambda_forget=1.0 unlearning.lambda_sep=0.1 unlearning.unified_steps=500
 ```
 
 Sequence-level forget loss:
@@ -530,16 +581,22 @@ POISON_DIR=src/data/erase_data/rsc15_spam_seed2_pct1_n10  # adjust for non-defau
 sbatch run_tiger_train.sh rsc15 poison "${SID}"
 POISON_CKPT=logs/train/runs/<date>/<time>/checkpoints/checkpoint_epoch=003.ckpt
 
-# Step 6: unlearn (SCIF + neighborhood)
-sbatch run_tiger_unlearn.sh "${POISON_CKPT}" "${POISON_DIR}" "${SID}" true
+# Step 6: unlearn — set variables, then run
+ALGO=scif                # scif | unified | finetune | neg_train | filter
+NEIGHBORHOOD_AWARE=true  # true = neighborhood-aware retain sampling (recommended for scif)
+BATCH_SIZE=8
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 \
+    "${ALGO}" "${SID}" "${NEIGHBORHOOD_AWARE}" "${BATCH_SIZE}" 1.0
 
 # Step 6 (alternative): item unlearning — only (prefix → target_item) pairs from spam sessions
-sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" false 8 1.0 \
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 \
+    "${ALGO}" "${SID}" false "${BATCH_SIZE}" 1.0 \
     unlearning.deletion_spec=item_pairs \
     unlearning.request_user_order=sorted
 
 # Step 6 (alternative): global item suppression — also unlearn target pairs from clean sessions
-sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 "${SID}" false 8 1.0 \
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 \
+    "${ALGO}" "${SID}" false "${BATCH_SIZE}" 1.0 \
     unlearning.deletion_spec=item_pairs \
     unlearning.unlearn_whole_items=true \
     unlearning.request_user_order=sorted
@@ -580,8 +637,12 @@ POISON_DIR=src/data/erase_data/rsc15_spam_seed2_pct1_n10
 sbatch run_tiger_train.sh rsc15 poison "${SID}"
 POISON_CKPT=logs/train/runs/<date>/<time>/checkpoints/checkpoint_epoch=003.ckpt
 
-# Step 6: unlearn (SCIF + neighborhood) --- not yet run
-sbatch run_tiger_unlearn.sh "${POISON_CKPT}" "${POISON_DIR}" "${SID}" true
+# Step 6: unlearn --- not yet run
+ALGO=scif                # scif | unified | finetune | neg_train | filter
+NEIGHBORHOOD_AWARE=true
+BATCH_SIZE=8
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 \
+    "${ALGO}" "${SID}" "${NEIGHBORHOOD_AWARE}" "${BATCH_SIZE}" 1.0
 
 # Step 7: evaluate --- not yet run
 UNLEARN_CKPT=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt
@@ -624,8 +685,14 @@ POISON_DIR_TEST=src/data/erase_data/test_rsc15_seed_2_spam_seed2_pct1_n10  # adj
 sbatch run_tiger_train.sh test_rsc15_seed_2 poison "${SID_TEST}"
 POISON_CKPT_TEST=logs/train/runs/2026-05-26/16-42-29/checkpoints/<latest>.ckpt
 
-# Step 6: unlearn (SCIF + neighborhood) --- not yet run
-sbatch run_tiger_unlearn.sh "${POISON_CKPT_TEST}" "${POISON_DIR_TEST}" "${SID_TEST}" true
+# Step 6: unlearn --- not yet run
+ALGO=scif                # scif | unified | finetune | neg_train | filter
+NEIGHBORHOOD_AWARE=true  # true = neighborhood-aware retain sampling (recommended for scif)
+BATCH_SIZE=8
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT_TEST}" test_rsc15_seed_2 \
+    "${ALGO}" "${SID_TEST}" "${NEIGHBORHOOD_AWARE}" "${BATCH_SIZE}" 1.0
+
+# SCIF no NAU, BS 256: 9055237
 
 # Step 7: evaluate --- not yet run
 UNLEARN_CKPT_TEST=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt

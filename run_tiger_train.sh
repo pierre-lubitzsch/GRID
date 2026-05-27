@@ -106,16 +106,27 @@ if [ ! -f "${SEMANTIC_ID_PATH}" ]; then
   exit 1
 fi
 
+# Build a unique, informative run directory: date/time_jobID_dataset_variant[_pctX_nY]
+JOB_ID="${SLURM_JOB_ID:-local$$}"
+TS="$(date +%Y-%m-%d/%H-%M-%S)"
+RUN_LABEL="${DATASET}_${VARIANT}"
+if [ "${VARIANT}" = "poison" ]; then
+  PCT_LABEL="$(python3 -c "r=${POISONING_RATIO}; print(f'pct{int(round(r*100))}')")"
+  RUN_LABEL="${RUN_LABEL}_${PCT_LABEL}_n${N_TARGET_ITEMS}"
+fi
+HYDRA_RUN_DIR="logs/train/runs/${TS}_job${JOB_ID}_${RUN_LABEL}"
+
 echo "[$(date -Is)] Starting tiger train (tiger_train_flat) dataset=${DATASET} variant=${VARIANT}"
 echo "Using data_dir=${DATA_DIR}"
 echo "Using semantic_id_path=${SEMANTIC_ID_PATH}"
-echo "Checkpoints: logs/train/runs/<date>/<time>/checkpoints/ (Hydra output_dir)."
+echo "Run dir: ${HYDRA_RUN_DIR}"
 
 python -u -m src.train \
   experiment=tiger_train_flat \
   data_dir="${DATA_DIR}" \
   "semantic_id_path='${SEMANTIC_ID_PATH}'" \
-  num_hierarchies=4
+  num_hierarchies=4 \
+  hydra.run.dir="${HYDRA_RUN_DIR}"
 
 LATEST_CKPT="$(ls -t logs/train/runs/*/*/checkpoints/*.ckpt 2>/dev/null | head -n1 || true)"
 if [ -n "${LATEST_CKPT}" ]; then

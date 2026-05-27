@@ -11,7 +11,7 @@
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# Sequential TIGER unlearning (SCIF) -- runs `python -m src.unlearn_sequential`
+# Sequential TIGER unlearning -- runs `python -m src.unlearn_sequential`
 #
 # Reproducibility: UNLEARN_SEED (default 2) — see run_tiger_unlearn.sh.
 #
@@ -20,8 +20,13 @@ set -euo pipefail
 #
 # Wrapper usage:
 #   sbatch run_tiger_unlearn_sequential.sh <ckpt_path> <dataset|data_dir> \
-#       [semantic_id_path] [neighborhood_aware:true|false] [request_batch_size:int] \
-#       [neighborhood_aware_sample_rate:float] [extra hydra overrides...]
+#       [algorithm] [semantic_id_path] [neighborhood_aware:true|false] \
+#       [request_batch_size:int] [neighborhood_aware_sample_rate:float] \
+#       [extra hydra overrides...]
+#
+# [algorithm] is optional at position 3, detected by matching known names.
+# Supported: scif (default), unified, finetune, neg_train, filter.
+# Can also be set via UNLEARN_ALGORITHM env var.
 #
 # <dataset> is a short name (beauty, rsc15, ...) resolved via
 # scripts/resolve_unlearn_dataset.sh, or a path containing '/' used as data_dir.
@@ -29,13 +34,18 @@ set -euo pipefail
 # Poison dataset selection (env vars, defaults shown):
 #   POISONING_RATIO=0.01  N_TARGET_ITEMS=10  POISON_SEED=2
 #
-# Example (dataset name):
+# Examples:
 #   sbatch run_tiger_unlearn_sequential.sh \
-#       logs/train/.../checkpoint_epoch=003.ckpt \
-#       beauty \
-#       embeddings/beauty/merged_predictions_tensor.pt \
-#       true 8 0.5 \
-#       unlearning.max_requests=4 unlearning.target_params=all
+#       logs/train/.../checkpoint_epoch=003.ckpt rsc15 \
+#       embeddings/rsc15/merged_predictions_tensor.pt true 8 1.0
+#
+#   sbatch run_tiger_unlearn_sequential.sh \
+#       logs/train/.../checkpoint_epoch=003.ckpt rsc15 finetune \
+#       embeddings/rsc15/merged_predictions_tensor.pt false 8 1.0
+#
+#   UNLEARN_ALGORITHM=neg_train sbatch run_tiger_unlearn_sequential.sh \
+#       logs/train/.../checkpoint_epoch=003.ckpt rsc15 \
+#       embeddings/rsc15/merged_predictions_tensor.pt false 8 1.0
 #
 # After unlearning, optionally evaluates the final unlearned.ckpt on the clean
 # test split (default on). Set UNLEARN_RUN_POST_EVAL=false to skip.
@@ -44,36 +54,58 @@ set -euo pipefail
 
 CKPT_PATH="${1:-}"
 DATASET_OR_DIR="${2:-}"
-SEMANTIC_ID_PATH="${3:-}"
-NEIGHBORHOOD_AWARE="${4:-false}"
-REQUEST_BATCH_SIZE="${5:-8}"
+shift 2
 
-# Arg 6 is sample_rate when numeric; otherwise treat it as the first Hydra override.
+# Optional algorithm at position 3 — detected by matching known algorithm names.
+# Falls through transparently so existing calls without the algorithm arg still work.
+ALGORITHM="${UNLEARN_ALGORITHM:-scif}"
+case "${1:-}" in
+  scif|unified|finetune|neg_train|filter)
+    ALGORITHM="${1}"
+    shift 1
+    ;;
+esac
+
+SEMANTIC_ID_PATH="${1:-}"
+NEIGHBORHOOD_AWARE="${2:-false}"
+REQUEST_BATCH_SIZE="${3:-8}"
+
+# Arg 4 is sample_rate when numeric; otherwise treat it as the first Hydra override.
 NEIGHBORHOOD_AWARE_SAMPLE_RATE="${UNLEARN_NEIGHBORHOOD_AWARE_SAMPLE_RATE:-1.0}"
-if [ "$#" -ge 6 ] && python3 - <<PY
+if [ "$#" -ge 4 ] && python3 - <<PY
 import sys
 try:
-    r = float("${6:-}")
+    r = float("${4:-}")
     sys.exit(0 if 0.0 <= r <= 1.0 else 1)
 except ValueError:
     sys.exit(1)
 PY
 then
-  NEIGHBORHOOD_AWARE_SAMPLE_RATE="${6}"
-  shift 6
+  NEIGHBORHOOD_AWARE_SAMPLE_RATE="${4}"
+  shift 4
 else
-  shift $(( $# < 5 ? $# : 5 ))
+  shift $(( $# < 3 ? $# : 3 ))
 fi
 EXTRA_OVERRIDES=("$@")
 
 if [ -z "${CKPT_PATH}" ] || [ -z "${DATASET_OR_DIR}" ]; then
   echo "Missing required argument(s)."
   echo "Usage: sbatch run_tiger_unlearn_sequential.sh <ckpt_path> <dataset|data_dir> \\"
-  echo "  [semantic_id_path] [neighborhood_aware:true|false] [request_batch_size:int] \\"
-  echo "  [neighborhood_aware_sample_rate:float] [extra hydra overrides...]"
+  echo "  [algorithm] [semantic_id_path] [neighborhood_aware:true|false] \\"
+  echo "  [request_batch_size:int] [neighborhood_aware_sample_rate:float] \\"
+  echo "  [extra hydra overrides...]"
+  echo "Supported algorithms: scif (default), unified, finetune, neg_train, filter"
   echo "Known datasets: beauty, sports, toys, rsc15, rsc15_smoke (see scripts/resolve_unlearn_dataset.sh)"
   exit 1
 fi
+
+case "${ALGORITHM}" in
+  scif|unified|finetune|neg_train|filter) ;;
+  *)
+    echo "Unknown algorithm '${ALGORITHM}'. Supported: scif, unified, finetune, neg_train, filter"
+    exit 1
+    ;;
+esac
 
 POISONING_RATIO="${POISONING_RATIO:-0.01}"
 N_TARGET_ITEMS="${N_TARGET_ITEMS:-10}"
@@ -122,8 +154,22 @@ fi
 cd "${GRID_DIR}"
 mkdir -p logs
 
+# Map algorithm → Hydra experiment config.
+# scif and unified have dedicated sequential configs; other algorithms run via
+# the scif sequential harness with unlearning.algorithm overridden below.
+case "${ALGORITHM}" in
+  scif)    EXPERIMENT="tiger_unlearn_scif_sequential" ;;
+  unified) EXPERIMENT="tiger_unlearn_unified_sequential" ;;
+  *)       EXPERIMENT="tiger_unlearn_scif_sequential" ;;
+esac
+
 # shellcheck source=scripts/unlearn_run_dir.sh
 source "${GRID_DIR}/scripts/unlearn_run_dir.sh"
+
+# Build a descriptive, unique run tag: dataset_pctX_nY_algo
+_DATASET_SLUG="${DATASET:-${DATASET_OR_DIR##*/}}"
+_PCT_LABEL="$(python3 -c "r=${POISONING_RATIO}; print(f'pct{int(round(r*100))}')")"
+UNLEARN_RUN_TAG="${UNLEARN_RUN_TAG:-${_DATASET_SLUG}_${_PCT_LABEL}_n${N_TARGET_ITEMS}_${ALGORITHM}}"
 UNLEARN_OUTPUT_DIR="$(unlearn_build_output_dir "${GRID_DIR}" "${REQUEST_BATCH_SIZE}")"
 unlearn_allocate_output_dir "${UNLEARN_OUTPUT_DIR}"
 
@@ -159,12 +205,13 @@ if [ ! -d "${DATA_DIR}/training_forget" ] || [ ! -d "${DATA_DIR}/training_retain
   exit 1
 fi
 
-echo "[$(date -Is)] Starting sequential TIGER unlearning (SCIF)"
+echo "[$(date -Is)] Starting sequential TIGER unlearning (algorithm=${ALGORITHM})"
 echo "Using output_dir=${UNLEARN_OUTPUT_DIR}"
 echo "Using seed=${UNLEARN_SEED} (set UNLEARN_SEED to override)"
 echo "Using data_dir=${DATA_DIR}"
 echo "Using semantic_id_path=${SEMANTIC_ID_PATH}"
 echo "Using ckpt_path=${CKPT_PATH}"
+echo "algorithm=${ALGORITHM} | experiment=${EXPERIMENT}"
 echo "request_batch_size=${REQUEST_BATCH_SIZE} | neighborhood_aware=${NEIGHBORHOOD_AWARE} | neighborhood_aware_sample_rate=${NEIGHBORHOOD_AWARE_SAMPLE_RATE}"
 if [ -n "${DATASET:-}" ]; then
   echo "dataset=${DATASET} | eval_data_dir=${UNLEARN_EVAL_DATA_DIR:-<unset>}"
@@ -188,17 +235,18 @@ fi
 
 # Hydra: quote values that contain '=' (Lightning checkpoint filenames).
 python -u -m src.unlearn_sequential \
-  experiment=tiger_unlearn_scif_sequential \
+  experiment="${EXPERIMENT}" \
   data_dir="${DATA_DIR}" \
   "semantic_id_path='${SEMANTIC_ID_PATH}'" \
   "ckpt_path='${CKPT_PATH}'" \
   num_hierarchies=4 \
   seed="${UNLEARN_SEED}" \
+  unlearning.algorithm="${ALGORITHM}" \
   unlearning.neighborhood_aware=${NEIGHBORHOOD_AWARE} \
   "unlearning.neighborhood_aware_sample_rate=${NEIGHBORHOOD_AWARE_SAMPLE_RATE}" \
   unlearning.request_batch_size=${REQUEST_BATCH_SIZE} \
   hydra.run.dir="${UNLEARN_OUTPUT_DIR}" \
-  unlearning_run_tag="${UNLEARN_RUN_TAG:-bs${REQUEST_BATCH_SIZE}}" \
+  unlearning_run_tag="${UNLEARN_RUN_TAG}" \
   "${EXTRA_OVERRIDES[@]}"
 
 echo "[$(date -Is)] Sequential TIGER unlearning finished"

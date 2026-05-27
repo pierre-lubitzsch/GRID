@@ -298,6 +298,7 @@ trainer:
     _target_: lightning.pytorch.profilers.PassThroughProfiler
   strategy: ddp
   sync_batchnorm: true
+  enable_async_checkpointing: true
   num_sanity_val_steps: 0
   min_epochs: 0
 paths:
