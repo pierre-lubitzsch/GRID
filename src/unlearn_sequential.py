@@ -146,14 +146,28 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
         retain_subdir = cfg.get("retain_subdir", "training_retain")
         semantic_id_path = cfg.get("semantic_id_path", None)
 
-        request_batch_size = int(
-            unlearning_cfg.get("request_batch_size") or 0
+        _n_unlearning_chunks_cfg = unlearning_cfg.get("n_unlearning_chunks")
+        n_unlearning_chunks: Optional[int] = (
+            int(_n_unlearning_chunks_cfg)
+            if _n_unlearning_chunks_cfg is not None
+            else None
         )
-        if request_batch_size <= 0:
-            raise ValueError(
-                "unlearning.request_batch_size must be > 0 for sequential "
-                "unlearning. Use src.unlearn for the single-shot driver."
+        if n_unlearning_chunks is not None and n_unlearning_chunks <= 0:
+            raise ValueError("unlearning.n_unlearning_chunks must be > 0")
+
+        request_batch_size: Optional[int]
+        if n_unlearning_chunks is None:
+            request_batch_size = int(
+                unlearning_cfg.get("request_batch_size") or 0
             )
+            if request_batch_size <= 0:
+                raise ValueError(
+                    "Either unlearning.n_unlearning_chunks or "
+                    "unlearning.request_batch_size must be set > 0 for "
+                    "sequential unlearning. Use src.unlearn for single-shot."
+                )
+        else:
+            request_batch_size = None  # computed after forget dir is indexed
         max_requests = unlearning_cfg.get("max_requests")
         request_user_order = str(
             unlearning_cfg.get("request_user_order") or "manifest"
@@ -190,6 +204,14 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
             f"|D_retain|={len(retain_index)} retain uids."
         )
 
+        if n_unlearning_chunks is not None:
+            request_batch_size = math.ceil(len(forget_index) / n_unlearning_chunks)
+            command_line_logger.info(
+                f"[seq] n_unlearning_chunks={n_unlearning_chunks} → "
+                f"request_batch_size={request_batch_size} "
+                f"(ceil({len(forget_index)}/{n_unlearning_chunks}))."
+            )
+
         manifest_path = cfg.get("forget_manifest", None) or os.path.join(
             data_dir, "forget_manifest.json"
         )
@@ -201,6 +223,7 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
             request_seed=request_seed,
             forget_manifest_path=manifest_path,
         )
+        assert request_batch_size is not None  # always set by this point
         request_batches = build_request_batches(
             ordered_forget_uids,
             request_batch_size=request_batch_size,
@@ -213,9 +236,14 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
             )
         n_batches = len(request_batches)
         n_forget_users = sum(len(b) for b in request_batches)
+        chunk_desc = (
+            f"n_unlearning_chunks={n_unlearning_chunks}, batch_size={request_batch_size}"
+            if n_unlearning_chunks is not None
+            else f"batch_size={request_batch_size}"
+        )
         command_line_logger.info(
             f"[seq] Unlearning plan: {n_batches} batches "
-            f"(batch_size={request_batch_size}, {n_forget_users} forget users, "
+            f"({chunk_desc}, {n_forget_users} forget users, "
             f"order={request_user_order})."
         )
         command_line_logger.info(

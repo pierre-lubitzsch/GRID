@@ -98,7 +98,7 @@ def scif_unlearn(
     cg_max_iter: int = 200,
     cg_tol: float = 1e-5,
     cg_damping: float = 0.01,
-    target_params_policy: str = "all",
+    target_params_policy: str = "tiger",
     cg_solution_max_norm: Optional[float] = None,
     update_max_norm: Optional[float] = 1.0,
     eval_mode: bool = True,

@@ -28,6 +28,10 @@ unlearning:
   embedding_epsilon: null
   embedding_max_neighbors: 100
 
+  # Sequential chunking: set one of these (n_unlearning_chunks takes priority)
+  # request_batch_size: fixed users per chunk; n_unlearning_chunks: fixed number of chunks
+  n_unlearning_chunks: null
+
   # SCIF numerics
   damping: 0.01
   cg_max_iter: 200
@@ -36,7 +40,7 @@ unlearning:
   max_norm: null
   update_max_norm: 1.0
   batch_size_per_device: 256
-  target_params: all
+  target_params: tiger
   eval_mode: true
   rows_per_shard: 4096
 

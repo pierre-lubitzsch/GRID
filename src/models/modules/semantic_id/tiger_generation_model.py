@@ -648,11 +648,13 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         model_input: SequentialModelInputData,
     ) -> torch.Tensor:
         user_id = model_input.transformed_sequences.get("user_id")
-        input_ids = model_input.transformed_sequences[
-            self.feature_to_model_input_map.get("sequence_data", "input_ids")
-        ]
+        # transformed_sequences uses original feature names ("sequence_data"), not
+        # mapped names ("input_ids"); try the raw key first, then the mapped fallback.
+        input_ids = model_input.transformed_sequences.get("sequence_data")
         if input_ids is None:
-            input_ids = model_input.transformed_sequences.get("sequence_data")
+            input_ids = model_input.transformed_sequences.get(
+                self.feature_to_model_input_map.get("sequence_data", "input_ids")
+            )
         enc_out, enc_mask = self.encoder_forward_pass(
             attention_mask=model_input.mask,
             input_ids=input_ids,
@@ -695,7 +697,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         neg_ids = list(neighbor_item_ids | forget_item_ids)
         if not neg_ids or self.codebooks is None:
             return torch.zeros((), device=r_u.device)
-        neg_sids = self.codebooks[torch.tensor(neg_ids, device=r_u.device)]
+        neg_sids = self.codebooks[torch.tensor(neg_ids)].to(r_u.device)
         z_neg = self._item_sid_embedding(neg_sids)
         z_neg = torch.nn.functional.normalize(z_neg, dim=-1)
 

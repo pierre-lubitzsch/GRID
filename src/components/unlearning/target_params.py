@@ -11,7 +11,11 @@ import torch
 from torch import nn
 
 
-_VALID_POLICIES = ("all", "sid_embeddings", "encoder_only")
+_VALID_POLICIES = ("all", "sid_embeddings", "encoder_only", "tiger")
+
+# Parameters that carry no item/user knowledge and should be excluded from
+# unlearning updates for TIGER (structural sequence scaffolding).
+_TIGER_EXCLUDED_PARAM_NAMES = frozenset(["decoder.bos_token", "sep_token"])
 
 
 def select_target_params(model: nn.Module, policy: str = "all") -> List[nn.Parameter]:
@@ -31,6 +35,10 @@ def select_target_params(model: nn.Module, policy: str = "all") -> List[nn.Param
           plus the per-hierarchy decoder linear heads. Cheapest HVP, narrowest
           influence.
         * ``encoder_only`` -- all parameters of the encoder sub-module.
+        * ``tiger`` -- all trainable parameters of a ``SemanticIDEncoderDecoder``
+          except ``decoder.bos_token`` and ``sep_token`` (structural scaffolding
+          that carries no item/user knowledge). Raises ``TypeError`` for any
+          other model type.
 
     Returns
     -------
@@ -53,13 +61,27 @@ def select_target_params(model: nn.Module, policy: str = "all") -> List[nn.Param
         decoder_mlp = getattr(decoder, "decoder_mlp", None) if decoder is not None else None
         if decoder_mlp is not None:
             params.extend(p for p in decoder_mlp.parameters() if p.requires_grad)
-    else:
+    elif policy == "encoder_only":
         encoder = getattr(model, "encoder", None)
         if encoder is None:
             raise ValueError(
                 "policy='encoder_only' requested but model has no .encoder attribute"
             )
         params = [p for p in encoder.parameters() if p.requires_grad]
+    else:
+        from src.models.modules.semantic_id.tiger_generation_model import (
+            SemanticIDEncoderDecoder,
+        )
+        if not isinstance(model, SemanticIDEncoderDecoder):
+            raise TypeError(
+                f"policy='tiger' requires a SemanticIDEncoderDecoder model, "
+                f"got {type(model).__name__}"
+            )
+        params = [
+            p
+            for n, p in model.named_parameters()
+            if p.requires_grad and n not in _TIGER_EXCLUDED_PARAM_NAMES
+        ]
 
     if not params:
         raise ValueError(
@@ -80,9 +102,5 @@ def named_target_params(
         raise ValueError(
             f"Unknown target_params policy={policy!r}; expected one of {_VALID_POLICIES}"
         )
-    if policy == "all":
-        return [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     selected_ids = {id(p) for p in select_target_params(model, policy=policy)}
-    return [
-        (n, p) for n, p in model.named_parameters() if id(p) in selected_ids
-    ]
+    return [(n, p) for n, p in model.named_parameters() if id(p) in selected_ids]

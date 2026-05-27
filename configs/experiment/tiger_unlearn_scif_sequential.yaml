@@ -6,6 +6,7 @@ defaults:
 
 unlearning:
   request_batch_size: 8
+  n_unlearning_chunks: null  # alternative to request_batch_size: fix number of chunks, not chunk size
   max_requests: null
   request_user_order: manifest
   request_seed: ${seed}

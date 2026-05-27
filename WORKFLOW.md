@@ -226,6 +226,22 @@ POISONING_RATIO=0.05 N_TARGET_ITEMS=10 sbatch run_tiger_unlearn_sequential.sh "$
 
 ### 6a — SCIF (default, single-pass)
 
+SCIF updates all TIGER parameters except the structural `bos_token` and `sep_token` by default (`unlearning.target_params=tiger`). To change which parameters are updated:
+
+```bash
+# default: all encoder/decoder/embedding weights, excluding bos_token and sep_token
+unlearning.target_params=tiger
+
+# all trainable parameters including bos_token and sep_token
+unlearning.target_params=all
+
+# only item SID embedding table + per-hierarchy decoder heads (fastest, narrowest)
+unlearning.target_params=sid_embeddings
+
+# only encoder sub-module weights
+unlearning.target_params=encoder_only
+```
+
 ```bash
 sbatch run_tiger_unlearn.sh "${POISON_CKPT}" "${POISON_DIR}" "${SID}" false
 ```
@@ -264,7 +280,7 @@ Can also be set via `UNLEARN_ALGORITHM=<algo>` env var.
 
 | Algorithm | What it does | Key hyperparams |
 |---|---|---|
-| `scif` (default) | Single-shot Newton update via Conjugate Gradient | `damping`, `cg_max_iter`, `update_max_norm` |
+| `scif` (default) | Single-shot Newton update via Conjugate Gradient | `damping`, `cg_max_iter`, `update_max_norm`, `target_params` |
 | `unified` | Combined loss: L_retain + λ·L_forget + λ·L_sep | `lambda_forget`, `lambda_sep`, `unified_steps`, `unified_lr` |
 | `finetune` | Continue training on retain-only data (Adam) | `finetune_steps`, `finetune_lr` |
 | `neg_train` | Gradient ascent on forget + retain CE every N steps | `neg_train_steps`, `neg_train_lr`, `neg_retain_every` |
@@ -536,8 +552,11 @@ unlearning.retain_samples_used_for_update=32
 # Cap total retain rows regardless of multiplier
 unlearning.retain_max_rows=1000
 
-# Target only embedding layers (faster, less aggressive)
-unlearning.target_params=embedding
+# SCIF target parameters (tiger = all except bos_token/sep_token, default for TIGER)
+unlearning.target_params=tiger        # default
+unlearning.target_params=all          # include bos_token and sep_token too
+unlearning.target_params=sid_embeddings  # only embedding table + decoder heads
+unlearning.target_params=encoder_only    # only encoder weights
 
 # Adjust SCIF CG convergence
 unlearning.cg_max_iter=500 unlearning.damping=0.001
@@ -679,8 +698,8 @@ POISON_DIR_TEST=src/data/erase_data/test_rsc15_seed_2_spam_seed2_pct1_n10  # adj
 
 # Step 5: poisoned training ---
 # pct 0.01, ntarget 10: job 9019894
-# pct 0.05, ntarget 10: job 9023762
-# pct 0.1, ntarget 10: job 9023800
+# pct 0.05, ntarget 10: job 9056493
+# pct 0.1, ntarget 10: job 9056494
 # Add args 4/5 for non-default ratio/n_target: sbatch run_tiger_train.sh test_rsc15_seed_2 poison "${SID_TEST}" 0.05 10
 sbatch run_tiger_train.sh test_rsc15_seed_2 poison "${SID_TEST}"
 POISON_CKPT_TEST=logs/train/runs/2026-05-26/16-42-29/checkpoints/<latest>.ckpt
@@ -692,7 +711,17 @@ BATCH_SIZE=8
 sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT_TEST}" test_rsc15_seed_2 \
     "${ALGO}" "${SID_TEST}" "${NEIGHBORHOOD_AWARE}" "${BATCH_SIZE}" 1.0
 
-# SCIF no NAU, BS 256: 9055237
+# SCIF, no NAU, BS 256, pct 1: 9055237
+# SCIF, NAU, BS 256, pct 1: 9058181
+
+# SCIF subselection, no NAU, BS 256, pct 1: 9081530
+# SCIF subselection, NAU, BS 256, pct 1: 9081531
+
+# neg_train, no NAU, BS 256, pct 1: 9061644
+# neg_train, NAU, BS 256, pct 1: 9061645
+
+# unified, no NAU, BS 256, pct 1: 9068699
+# unified, NAU, BS 256, pct 1: 9068700
 
 # Step 7: evaluate --- not yet run
 UNLEARN_CKPT_TEST=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt

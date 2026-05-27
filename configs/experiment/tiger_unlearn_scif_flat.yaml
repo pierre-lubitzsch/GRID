@@ -51,7 +51,7 @@ unlearning:
   max_norm: null
   update_max_norm: 1.0
   batch_size_per_device: 256
-  target_params: all
+  target_params: tiger
   eval_mode: true
   rows_per_shard: 4096
   finetune_steps: 500
