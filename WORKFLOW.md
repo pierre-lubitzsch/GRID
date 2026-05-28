@@ -758,11 +758,12 @@ sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT_TEST}" test_rsc15_seed_2 \
 # unified, no NAU, n_unlearning_chunks 10, pct 1: 9081740
 # unified, NAU, n_unlearning_chunks 10, pct 1: 9081741
 
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1: 9088422
-# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1: 9088423
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1: 9088726
+# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1: 9088727
 
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0: 9088500
-# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0: 9088501
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0: 9088728
+# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0: 9088729
+# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, ratio uniform/NAU: 0.5: 9089074
 
 
 # Step 7: evaluate --- not yet run
