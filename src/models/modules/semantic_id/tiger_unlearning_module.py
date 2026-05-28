@@ -248,11 +248,15 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         cfg = kwargs["unlearning_cfg"]
         t0 = time.time()
         local_repair = cfg.get("local_repair") or {}
+        n_batch_passes_cfg = cfg.get("n_batch_passes")
         info = unified_unlearn(
             self,
             ctx["forget_batches"],
             ctx["retain_batches"],
             steps=int(cfg.get("unified_steps", 500)),
+            n_batch_passes=(
+                int(n_batch_passes_cfg) if n_batch_passes_cfg is not None else None
+            ),
             lr=float(cfg.get("unified_lr", 1e-4)),
             lambda_forget=float(cfg.get("lambda_forget", 1.0)),
             lambda_sep=float(cfg.get("lambda_sep", 0.1)),

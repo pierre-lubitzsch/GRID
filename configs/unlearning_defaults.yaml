@@ -62,6 +62,9 @@ unlearning:
   lambda_sep: 0.1
   sep_temperature: 0.07
   unified_steps: 500
+  # Alternative to unified_steps: total optim steps = n_batch_passes * min(n_forget_batches, n_retain_batches).
+  # If set, takes priority over unified_steps.
+  n_batch_passes: null
   unified_lr: 1.0e-4
 
   # Step 4 local repair (optional, default off)

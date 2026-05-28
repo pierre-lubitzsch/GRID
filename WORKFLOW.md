@@ -281,7 +281,7 @@ Can also be set via `UNLEARN_ALGORITHM=<algo>` env var.
 | Algorithm | What it does | Key hyperparams |
 |---|---|---|
 | `scif` (default) | Single-shot Newton update via Conjugate Gradient | `damping`, `cg_max_iter`, `update_max_norm`, `target_params` |
-| `unified` | Combined loss: L_retain + λ·L_forget + λ·L_sep | `lambda_forget`, `lambda_sep`, `unified_steps`, `unified_lr` |
+| `unified` | Combined loss: L_retain + λ·L_forget + λ·L_sep | `lambda_forget`, `lambda_sep`, `unified_steps` / `n_batch_passes`, `unified_lr` |
 | `finetune` | Continue training on retain-only data (Adam) | `finetune_steps`, `finetune_lr` |
 | `neg_train` | Gradient ascent on forget + retain CE every N steps | `neg_train_steps`, `neg_train_lr`, `neg_retain_every` |
 | `filter` | Decode-time output masking, no weight update | `filter_mode` (`global` \| `user_dependent`) |
@@ -402,11 +402,25 @@ to the gradient roughly the same number of times — independent of the relative
 sizes of the two sets. The chosen `q_forget`/`q_retain` are logged at the
 start of each call and recorded in the result dict.
 
-`unlearning.unified_steps=N` still means `N` optimizer updates; the wall-time
-cost per step grows roughly with `q_forget + q_retain`. With a small forget
-set (typical), `q_retain` ≈ `n_retain_batches / n_forget_batches`, so a 4-vs-51
-imbalance makes each step ~13× heavier — lower `unified_steps` accordingly if
-needed.
+**Sizing the loop.** Two equivalent knobs:
+
+- `unlearning.unified_steps=N` — total optimizer updates (default 500).
+- `unlearning.n_batch_passes=N` — total full passes over the batches.
+  One pass = `min(n_forget_batches, n_retain_batches)` optimizer steps with
+  balanced accumulation, so this expands to
+  `unified_steps = N * min(n_forget, n_retain)`. Takes priority over
+  `unified_steps` when set.
+
+Per-step wall-time grows roughly with `q_forget + q_retain`. With a small
+forget set (typical), `q_retain` ≈ `n_retain_batches / n_forget_batches`, so a
+4-vs-51 imbalance makes each step ~13× heavier — prefer `n_batch_passes` to
+stay step-count-aware of the imbalance, or lower `unified_steps` manually.
+
+```bash
+# Run 3 full passes through the batches (auto-scaled per request)
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 unified "${SID}" false 8 1.0 \
+    unlearning.n_batch_passes=3 unlearning.lambda_forget=1.0 unlearning.lambda_sep=0.1
+```
 
 ### 6e — Deletion specification
 
@@ -743,6 +757,13 @@ sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT_TEST}" test_rsc15_seed_2 \
 
 # unified, no NAU, n_unlearning_chunks 10, pct 1: 9081740
 # unified, NAU, n_unlearning_chunks 10, pct 1: 9081741
+
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1: 9088422
+# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1: 9088423
+
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0: 9088500
+# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0: 9088501
+
 
 # Step 7: evaluate --- not yet run
 UNLEARN_CKPT_TEST=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt

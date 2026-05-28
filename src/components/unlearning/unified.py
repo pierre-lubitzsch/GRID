@@ -21,7 +21,8 @@ def unified_unlearn(
     forget_batches: Sequence[TigerBatch],
     retain_batches: Sequence[TigerBatch],
     *,
-    steps: int = 500,
+    steps: Optional[int] = 500,
+    n_batch_passes: Optional[int] = None,
     lr: float = 1e-4,
     lambda_forget: float = 1.0,
     lambda_sep: float = 0.1,
@@ -33,7 +34,14 @@ def unified_unlearn(
     local_repair_cfg: Optional[Dict[str, Any]] = None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
-    """Optimize unified objective for ``steps`` optimizer updates.
+    """Optimize unified objective.
+
+    The number of optimizer steps is set either directly via ``steps`` or
+    indirectly via ``n_batch_passes`` (full passes through the batches). With
+    balanced accumulation, one pass through the batches equals
+    ``min(n_forget_batches, n_retain_batches)`` optimizer steps, so
+    ``n_batch_passes=N`` ⇒ ``steps = N * min(n_forget, n_retain)``.
+    If both are given, ``n_batch_passes`` wins.
 
     Each optimizer step accumulates gradients across ``q_forget`` forget
     mini-batches and ``q_retain`` retain mini-batches, where
@@ -56,21 +64,37 @@ def unified_unlearn(
             "(SemanticIDEncoderDecoder subclass)"
         )
 
-    steps = int(steps)
     n_forget = len(forget_batches)
     n_retain = len(retain_batches)
     q_retain = max(1, math.ceil(n_retain / n_forget))
     q_forget = max(1, math.ceil(n_forget / n_retain))
+    optim_steps_per_pass = min(n_forget, n_retain)
+
+    if n_batch_passes is not None:
+        n_batch_passes = int(n_batch_passes)
+        if n_batch_passes <= 0:
+            raise ValueError("n_batch_passes must be > 0")
+        steps = n_batch_passes * optim_steps_per_pass
+    else:
+        if steps is None:
+            raise ValueError("Either steps or n_batch_passes must be set")
+        steps = int(steps)
+        if steps <= 0:
+            raise ValueError("steps must be > 0")
 
     log.info(
         "[unified] n_forget_batches=%d n_retain_batches=%d "
-        "→ q_forget=%d q_retain=%d (per optim step: %d forget + %d retain mini-batches)",
+        "→ q_forget=%d q_retain=%d (per optim step: %d forget + %d retain mini-batches); "
+        "optim_steps_per_pass=%d, total_steps=%d, n_batch_passes=%s",
         n_forget,
         n_retain,
         q_forget,
         q_retain,
         q_forget,
         q_retain,
+        optim_steps_per_pass,
+        steps,
+        n_batch_passes if n_batch_passes is not None else "(unset)",
     )
 
     params = [p for p in model.parameters() if p.requires_grad]
@@ -162,6 +186,8 @@ def unified_unlearn(
     return {
         "algorithm": "unified",
         "steps": steps,
+        "n_batch_passes": n_batch_passes,
+        "optim_steps_per_pass": optim_steps_per_pass,
         "q_forget": q_forget,
         "q_retain": q_retain,
         "lr": float(lr),
