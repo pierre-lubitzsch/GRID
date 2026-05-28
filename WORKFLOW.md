@@ -393,6 +393,21 @@ sbatch run_tiger_unlearn_baselines.sh unified \
     unlearning.forget_loss_level=sequence
 ```
 
+**Balanced forget/retain exposure (automatic).** Each optimizer step
+gradient-accumulates `q_forget = ceil(n_forget/n_retain)` forget mini-batches
+and `q_retain = ceil(n_retain/n_forget)` retain mini-batches (one is always 1).
+Each sub-loss is averaged via `1/q_*` scaling, then a single `opt.step()` runs.
+This guarantees that every forget sample and every retain sample contributes
+to the gradient roughly the same number of times — independent of the relative
+sizes of the two sets. The chosen `q_forget`/`q_retain` are logged at the
+start of each call and recorded in the result dict.
+
+`unlearning.unified_steps=N` still means `N` optimizer updates; the wall-time
+cost per step grows roughly with `q_forget + q_retain`. With a small forget
+set (typical), `q_retain` ≈ `n_retain_batches / n_forget_batches`, so a 4-vs-51
+imbalance makes each step ~13× heavier — lower `unified_steps` accordingly if
+needed.
+
 ### 6e — Deletion specification
 
 Controls what the algorithms treat as "known" and which items are used as neighborhood centers.
@@ -717,11 +732,17 @@ sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT_TEST}" test_rsc15_seed_2 \
 # SCIF subselection, no NAU, BS 256, pct 1: 9081530
 # SCIF subselection, NAU, BS 256, pct 1: 9081531
 
+# SCIF subselection, no NAU, n_unlearning_chunks 10, pct 1: 9081752
+# SCIF subselection, NAU, n_unlearning_chunks 10, pct 1: 9081753
+
 # neg_train, no NAU, BS 256, pct 1: 9061644
 # neg_train, NAU, BS 256, pct 1: 9061645
 
 # unified, no NAU, BS 256, pct 1: 9068699
 # unified, NAU, BS 256, pct 1: 9068700
+
+# unified, no NAU, n_unlearning_chunks 10, pct 1: 9081740
+# unified, NAU, n_unlearning_chunks 10, pct 1: 9081741
 
 # Step 7: evaluate --- not yet run
 UNLEARN_CKPT_TEST=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt

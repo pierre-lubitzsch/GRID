@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 import torch
@@ -32,16 +33,45 @@ def unified_unlearn(
     local_repair_cfg: Optional[Dict[str, Any]] = None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
-    """Optimize unified objective for ``steps`` mini-batch updates."""
+    """Optimize unified objective for ``steps`` optimizer updates.
+
+    Each optimizer step accumulates gradients across ``q_forget`` forget
+    mini-batches and ``q_retain`` retain mini-batches, where
+
+        q_retain = ceil(n_retain / n_forget)
+        q_forget = ceil(n_forget / n_retain)
+
+    (one of the two is always 1). This balances per-sample exposure: every
+    forget sample and every retain sample contributes to the gradient the same
+    number of times, regardless of how many batches each side has.
+    """
     device = device or next(model.parameters()).device
     if not retain_batches:
         raise ValueError("retain_batches is empty")
     if not forget_batches:
         raise ValueError("forget_batches is empty")
-    if not hasattr(model, "compute_unified_loss"):
+    if not hasattr(model, "compute_sep_loss"):
         raise TypeError(
-            "model must implement compute_unified_loss (SemanticIDEncoderDecoder subclass)"
+            "model must expose compute_sep_loss / _batch_loss_from_model_step "
+            "(SemanticIDEncoderDecoder subclass)"
         )
+
+    steps = int(steps)
+    n_forget = len(forget_batches)
+    n_retain = len(retain_batches)
+    q_retain = max(1, math.ceil(n_retain / n_forget))
+    q_forget = max(1, math.ceil(n_forget / n_retain))
+
+    log.info(
+        "[unified] n_forget_batches=%d n_retain_batches=%d "
+        "→ q_forget=%d q_retain=%d (per optim step: %d forget + %d retain mini-batches)",
+        n_forget,
+        n_retain,
+        q_forget,
+        q_retain,
+        q_forget,
+        q_retain,
+    )
 
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.Adam(params, lr=float(lr))
@@ -56,56 +86,84 @@ def unified_unlearn(
 
     forget_ids = set(forget_item_ids or [])
     neighbor_ids = set(neighbor_item_ids or [])
+    sequence_forget = str(forget_loss_level).lower() == "sequence"
 
-    for step in range(int(steps)):
-        retain_batch = batch_to_device(
-            retain_batches[step % len(retain_batches)], device
-        )
-        forget_batch = batch_to_device(
-            forget_batches[step % len(forget_batches)], device
-        )
+    for step in range(steps):
         opt.zero_grad(set_to_none=True)
-        losses = model.compute_unified_loss(
-            retain_batch=retain_batch,
-            forget_batch=forget_batch,
-            lambda_forget=float(lambda_forget),
-            lambda_sep=float(lambda_sep),
-            forget_loss_level=str(forget_loss_level),
-            sep_temperature=float(sep_temperature),
-            deletion_spec=str(deletion_spec),
-            forget_item_ids=forget_ids,
-            neighbor_item_ids=neighbor_ids,
-        )
-        total = losses["total"]
-        total = apply_local_repair_losses(
-            model,
-            base_loss=total,
-            local_repair_cfg=local_repair_cfg or {},
-            neighbor_item_ids=neighbor_ids,
-            batch=retain_batch,
-        )
-        total.backward()
+
+        # --- Forget side: q_forget mini-batches, each scaled by 1/q_forget ---
+        l_forget_avg = 0.0
+        for j in range(q_forget):
+            idx = (step * q_forget + j) % n_forget
+            forget_batch = batch_to_device(forget_batches[idx], device)
+            if sequence_forget:
+                l_forget = model._sequence_log_prob(*forget_batch)
+            else:
+                l_forget = -model._batch_loss_from_model_step(forget_batch)
+            forget_term = (float(lambda_forget) * l_forget) / float(q_forget)
+            forget_term.backward()
+            l_forget_avg += float(l_forget.detach().cpu()) / float(q_forget)
+
+        # --- Retain side: q_retain mini-batches, each scaled by 1/q_retain ---
+        l_retain_avg = 0.0
+        l_sep_avg = 0.0
+        last_retain_batch = None
+        for j in range(q_retain):
+            idx = (step * q_retain + j) % n_retain
+            retain_batch = batch_to_device(retain_batches[idx], device)
+            last_retain_batch = retain_batch
+            l_retain = model._batch_loss_from_model_step(retain_batch)
+            l_sep = model.compute_sep_loss(
+                retain_batch,
+                neighbor_item_ids=neighbor_ids,
+                forget_item_ids=forget_ids,
+                temperature=float(sep_temperature),
+            )
+            retain_side = l_retain + float(lambda_sep) * l_sep
+            retain_side = apply_local_repair_losses(
+                model,
+                base_loss=retain_side,
+                local_repair_cfg=local_repair_cfg or {},
+                neighbor_item_ids=neighbor_ids,
+                batch=retain_batch,
+            )
+            (retain_side / float(q_retain)).backward()
+            l_retain_avg += float(l_retain.detach().cpu()) / float(q_retain)
+            l_sep_avg += float(l_sep.detach().cpu()) / float(q_retain)
+
         opt.step()
-        for k in totals:
-            if k in losses:
-                totals[k].append(float(losses[k].detach().cpu()))
-        totals["total"][-1] = float(total.detach().cpu())
+
+        total_avg = (
+            l_retain_avg
+            + float(lambda_forget) * l_forget_avg
+            + float(lambda_sep) * l_sep_avg
+        )
+        totals["total"].append(total_avg)
+        totals["retain"].append(l_retain_avg)
+        totals["forget"].append(l_forget_avg)
+        totals["sep"].append(l_sep_avg)
+
         if step % max(1, steps // 10) == 0:
             log.info(
-                "[unified] step=%d total=%.4f retain=%.4f forget=%.4f sep=%.4f",
+                "[unified] step=%d/%d total=%.4f retain=%.4f forget=%.4f sep=%.4f",
                 step,
-                totals["total"][-1],
-                totals["retain"][-1] if totals["retain"] else 0.0,
-                totals["forget"][-1] if totals["forget"] else 0.0,
-                totals["sep"][-1] if totals["sep"] else 0.0,
+                steps,
+                total_avg,
+                l_retain_avg,
+                l_forget_avg,
+                l_sep_avg,
             )
+
+        del last_retain_batch  # free reference
 
     def _mean(xs: List[float]) -> Optional[float]:
         return float(sum(xs) / max(1, len(xs))) if xs else None
 
     return {
         "algorithm": "unified",
-        "steps": int(steps),
+        "steps": steps,
+        "q_forget": q_forget,
+        "q_retain": q_retain,
         "lr": float(lr),
         "lambda_forget": float(lambda_forget),
         "lambda_sep": float(lambda_sep),
@@ -115,8 +173,8 @@ def unified_unlearn(
         "mean_retain_loss": _mean(totals["retain"]),
         "mean_forget_loss": _mean(totals["forget"]),
         "mean_sep_loss": _mean(totals["sep"]),
-        "n_forget_batches": len(forget_batches),
-        "n_retain_batches": len(retain_batches),
+        "n_forget_batches": n_forget,
+        "n_retain_batches": n_retain,
         "n_forget_rows": sum(batch_size(b) for b in forget_batches),
         "n_retain_rows": sum(batch_size(b) for b in retain_batches),
     }
