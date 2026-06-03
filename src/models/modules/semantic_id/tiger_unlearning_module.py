@@ -76,6 +76,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         num_hierarchies: Optional[int] = None,
         device: Optional[torch.device] = None,
         output_dir: Optional[str] = None,
+        forget_manifest_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         algorithm = str(unlearning_cfg.get("algorithm", "scif")).strip().lower()
         if algorithm == "retrain":
@@ -96,6 +97,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 seed=seed,
                 num_hierarchies=num_hierarchies,
                 device=device,
+                forget_manifest_path=forget_manifest_path,
             )
         if algorithm == "finetune":
             return self._run_finetune(
@@ -110,6 +112,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 seed=seed,
                 num_hierarchies=num_hierarchies,
                 device=device,
+                forget_manifest_path=forget_manifest_path,
             )
         if algorithm == "neg_train":
             return self._run_neg_train(
@@ -124,6 +127,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 seed=seed,
                 num_hierarchies=num_hierarchies,
                 device=device,
+                forget_manifest_path=forget_manifest_path,
             )
         if algorithm == "filter":
             return self._run_filter(
@@ -133,6 +137,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 semantic_id_path=semantic_id_path,
                 forget_size_hint=forget_size_hint,
                 output_dir=output_dir,
+                forget_manifest_path=forget_manifest_path,
             )
         if algorithm == "unified":
             return self._run_unified(
@@ -147,6 +152,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 seed=seed,
                 num_hierarchies=num_hierarchies,
                 device=device,
+                forget_manifest_path=forget_manifest_path,
             )
         raise ValueError(f"Unknown unlearning algorithm={algorithm!r}")
 
@@ -164,6 +170,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         seed: int = 2,
         num_hierarchies: Optional[int] = None,
         device: Optional[torch.device] = None,
+        forget_manifest_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         device = device or next(self.parameters()).device
         ctx = self._prepare_unlearning_context(
@@ -178,6 +185,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             seed=seed,
             num_hierarchies=num_hierarchies,
             device=device,
+            forget_manifest_path=forget_manifest_path,
         )
         forget_batches = ctx["forget_batches"]
         retain_batches = ctx["retain_batches"]
@@ -281,8 +289,9 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         semantic_id_path: Optional[str],
         forget_size_hint: Optional[int] = None,
         output_dir: Optional[str] = None,
+        forget_manifest_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        manifest_path = resolve_forget_manifest_path(data_dir)
+        manifest_path = forget_manifest_path or resolve_forget_manifest_path(data_dir)
         manifest = load_forget_manifest(manifest_path)
         deletion_spec = manifest_deletion_spec(
             manifest, unlearning_cfg.get("deletion_spec")
@@ -344,9 +353,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         seed: int = 2,
         num_hierarchies: Optional[int] = None,
         device: Optional[torch.device] = None,
+        forget_manifest_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         device = device or next(self.parameters()).device
-        manifest_path = resolve_forget_manifest_path(data_dir)
+        manifest_path = forget_manifest_path or resolve_forget_manifest_path(data_dir)
         manifest = load_forget_manifest(manifest_path)
         deletion_spec = manifest_deletion_spec(
             manifest, unlearning_cfg.get("deletion_spec")

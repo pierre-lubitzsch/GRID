@@ -315,6 +315,7 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
                 num_hierarchies=int(cfg.get("num_hierarchies", 4)),
                 device=device,
                 output_dir=request_dir,
+                forget_manifest_path=manifest_path,
             )
 
             ckpt_path_k = os.path.join(ckpt_dir, f"unlearned_{k}.ckpt")

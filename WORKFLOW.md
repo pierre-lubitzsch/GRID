@@ -697,6 +697,22 @@ UNLEARN_CKPT=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt
 sbatch run_tiger_eval_three_way.sh "${UNLEARN_CKPT}" "${CLEAN_CKPT}" "${POISON_CKPT}" "${SID}" src/data/erase_data/rsc15
 ```
 
+## Beauty (Amazon) dataset executed job ids
+
+```bash
+# Step 5: TIGER training (data under src/data/amazon_data/, SID embeddings/beauty/merged_predictions_tensor.pt)
+# Poisoned training  --- job 8899595  (data_dir=src/data/amazon_data/beauty_spam_seed2_pct1_n10, started 2026-05-13 13:00)
+#   → ckpt logs/train/runs/2026-05-13/13-01-47/checkpoints/checkpoint_epoch=000_step=004400.ckpt
+POISON_CKPT_BEAUTY=logs/train/runs/2026-05-13/13-01-47/checkpoints/checkpoint_epoch=000_step=004400.ckpt
+# Clean training     --- job 8899900  (data_dir=src/data/amazon_data/beauty, started 2026-05-13 13:52)
+
+# Step 6: unlearn — best unified version so far
+# unified, no NAU, n_unlearning_chunks 10, n_batch_passes 4, lambda_forget 0.1: job 9096750
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT_BEAUTY}" beauty unified \
+    embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 \
+    unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.1
+```
+
 ## Typical test_rsc15_seed_2 run sequence executed job ids
 
 ```bash
@@ -720,6 +736,11 @@ SID_TEST=embeddings/test_rsc15_seed_2/merged_predictions_tensor.pt
 sbatch run_tiger_train.sh test_rsc15_seed_2 clean "${SID_TEST}"
 CLEAN_CKPT_TEST=logs/train/runs/2026-05-26/16-22-13/checkpoints/<latest>.ckpt
 
+# DATASET beauty:
+# clean: 9096928 -> recall@5 ~ 0.0453
+# poison: 9096933 -> recall@5 ~ 0.0444
+
+
 # Step 4: poison --- job 9019345
 sbatch run_rsc15_poison.sh test_rsc15_seed_2          # default pct1_n10
 # sbatch run_rsc15_poison.sh test_rsc15_seed_2 0.05   # example: pct5
@@ -733,7 +754,7 @@ POISON_DIR_TEST=src/data/erase_data/test_rsc15_seed_2_spam_seed2_pct1_n10  # adj
 sbatch run_tiger_train.sh test_rsc15_seed_2 poison "${SID_TEST}"
 POISON_CKPT_TEST=logs/train/runs/2026-05-26/16-42-29/checkpoints/<latest>.ckpt
 
-# Step 6: unlearn --- not yet run
+# Step 6: unlearn
 ALGO=scif                # scif | unified | finetune | neg_train | filter
 NEIGHBORHOOD_AWARE=true  # true = neighborhood-aware retain sampling (recommended for scif)
 BATCH_SIZE=8
@@ -758,15 +779,49 @@ sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT_TEST}" test_rsc15_seed_2 \
 # unified, no NAU, n_unlearning_chunks 10, pct 1: 9081740
 # unified, NAU, n_unlearning_chunks 10, pct 1: 9081741
 
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1: 9088726
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1: 9088726 -> recall@5 ~ 0.4297
 # unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1: 9088727
 
 # unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0: 9088728
 # unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0: 9088729
 # unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, ratio uniform/NAU: 0.5: 9089074
+# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, ratio uniform/NAU: 0.1: 9089473
+
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, item unlearning: 9096329
+# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, item unlearning: 9096330
+
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, item unlearning: 9096332 -> recall@5 ~ 0.414
+# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, item unlearning: 9096333
+
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, lambda_sep 0.0 item unlearn: 9096945 -> recall@5 ~ 0.4143 
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.1 item unlearn: 9096947 -> recall@5 ~ 0.4167
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.0 item unlearn: 9096948 -> recall@5 ~ 0.4163
+
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, lambda_sep 0.0 item unlearn: 9097281 -> recall@5 ~ 0.4295 
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.1 item unlearn: 9097282 -> recall@5 ~ 0.4314
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.0 item unlearn: 9097283 -> recall@5 ~ 0.4316
+
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.1 item unlearn: 
+
+# unified, no NAU, n_unlearning_chunks 10, pct 5, n_batch_passes 4, lambda_forget 0.1: 9097142 -> recall@5 ~ 0.3685
+# unified, no NAU, n_unlearning_chunks 10, pct 10, n_batch_passes 4, lambda_forget 0.1: 9097144 -> recall@5 ~ 0.322
 
 
-# Step 7: evaluate --- not yet run
+# dataset beauty with best unified unlearning version so far (sbatch run_tiger_unlearn_sequential.sh logs/train/runs/2026-05-13/13-01-47/checkpoints/checkpoint_epoch=000_step=004400.ckpt beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.1): 9174858 -> recall@5 ~ 0.04293
+# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh logs/train/runs/2026-05-13/13-01-47/checkpoints/checkpoint_epoch=000_step=004400.ckpt beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=0.1): 9174941 -> recall@5 ~ 0.0435
+# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh logs/train/runs/2026-05-13/13-01-47/checkpoints/checkpoint_epoch=000_step=004400.ckpt beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=0.0): 9174942 -> recall@5 ~ 0.0432
+# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh logs/train/runs/2026-05-13/13-01-47/checkpoints/checkpoint_epoch=000_step=004400.ckpt beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=1.0): 9175110 -> recall@5 ~ 
+
+# same but with right starting checkpoint:
+
+# dataset beauty with best unified unlearning version so far (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.1): 9175186 -> recall@5 ~ 0.4391
+# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=0.1): 9175189 -> recall@5 ~ 0.4467
+# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=0.0): 9175190 -> recall@5 ~ 0.4458
+# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=1.0): 9175196 -> recall@5 ~ 0.4494
+
+
+
+# Step 7: evaluate
 UNLEARN_CKPT_TEST=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt
 sbatch run_tiger_eval_three_way.sh "${UNLEARN_CKPT_TEST}" "${CLEAN_CKPT_TEST}" "${POISON_CKPT_TEST}" "${SID_TEST}" src/data/erase_data/test_rsc15_seed_2
 ```
