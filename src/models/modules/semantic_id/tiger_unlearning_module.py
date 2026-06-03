@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import time
 from copy import deepcopy
 from functools import partial
@@ -273,6 +274,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             deletion_spec=ctx["deletion_spec"],
             forget_item_ids=ctx["visible_forget_items"],
             neighbor_item_ids=ctx["neighborhood_centers"],
+            sep_negative_item_ids=ctx["sep_negative_items"],
             local_repair_cfg=local_repair,
             device=device,
         )
@@ -466,6 +468,14 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         retain_size_full = _count_rows_in_tfrecord_dir(retain_dir)
         retain_samples_used = int(unlearning_cfg.get("retain_samples_used_for_update") or 16)
 
+        sep_negative_items = self._sample_sep_random_negatives(
+            unlearning_cfg=unlearning_cfg,
+            retain_dir=retain_dir,
+            exclude_items=visible_forget | target_items,
+            default_count=len(visible_forget),
+            seed=int(seed),
+        )
+
         return {
             "forget_batches": forget_batches,
             "retain_batches": retain_batches,
@@ -475,6 +485,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             "deletion_spec": deletion_spec,
             "visible_forget_items": visible_forget,
             "neighborhood_centers": visible_forget,
+            "sep_negative_items": sep_negative_items,
             "meta": {
                 "forget_size_input": int(forget_size_hint),
                 "forget_size_augmented": sum(tiger_batch_size(b) for b in forget_batches),
@@ -486,6 +497,55 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 "target_items": sorted(target_items),
             },
         }
+
+    def _sample_sep_random_negatives(
+        self,
+        *,
+        unlearning_cfg: Dict[str, Any],
+        retain_dir: str,
+        exclude_items: Set[int],
+        default_count: int,
+        seed: int,
+    ) -> Optional[Set[int]]:
+        """Random retain-set item ids as sep-loss negatives (ablation).
+
+        Returns None unless ``sep_negatives=random_retain``. The pool is every
+        item id appearing in the retain shards minus forget/target items; the
+        sample size defaults to the size of the default neighbor negative set
+        (``sep_num_random_negatives`` overrides). The item pool is cached per
+        resolved retain dir so symlinked sequential request dirs scan once.
+        """
+        mode = str(unlearning_cfg.get("sep_negatives", "neighbors")).strip().lower()
+        if mode in ("", "neighbors"):
+            return None
+        if mode != "random_retain":
+            raise ValueError(
+                f"sep_negatives must be 'neighbors' or 'random_retain', got {mode!r}"
+            )
+        pool_key = os.path.realpath(retain_dir)
+        cache = getattr(self, "_retain_item_pool_cache", None)
+        if cache is None or cache[0] != pool_key:
+            cache = (pool_key, collect_items_in_shards(_list_shards_safe(retain_dir)))
+            self._retain_item_pool_cache = cache
+        pool = sorted(cache[1] - exclude_items)
+        if not pool:
+            log.warning(
+                "[sep_negatives] empty retain item pool after excluding "
+                "forget/target items; falling back to neighbor negatives"
+            )
+            return None
+        n_cfg = unlearning_cfg.get("sep_num_random_negatives")
+        n = int(n_cfg) if n_cfg is not None else int(default_count)
+        n = max(1, min(n, len(pool)))
+        sampled = set(random.Random(seed).sample(pool, n))
+        log.info(
+            "[sep_negatives] random_retain: sampled %d of %d retain items "
+            "as sep-loss negatives (default_count=%d)",
+            len(sampled),
+            len(pool),
+            default_count,
+        )
+        return sampled
 
 
 def _list_shards_safe(directory: str) -> List[str]:

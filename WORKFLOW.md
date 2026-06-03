@@ -393,6 +393,20 @@ sbatch run_tiger_unlearn_baselines.sh unified \
     unlearning.forget_loss_level=sequence
 ```
 
+**Sep-loss negatives ablation (`sep_negatives`).** By default the sep-loss
+negatives are the forget/neighborhood-center items
+(`sep_negatives=neighbors`). Set `sep_negatives=random_retain` to instead use
+randomly sampled retain-set item ids (same count as the default negative set;
+override with `sep_num_random_negatives`) — measures how much the directed
+negatives help. Sampled once per request round, seeded, excluding
+forget/target items.
+
+```bash
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 unified "${SID}" false 8 1.0 \
+    unlearning.lambda_forget=0.0 unlearning.lambda_sep=0.1 \
+    unlearning.sep_negatives=random_retain
+```
+
 **Balanced forget/retain exposure (automatic).** Each optimizer step
 gradient-accumulates `q_forget = ceil(n_forget/n_retain)` forget mini-batches
 and `q_retain = ceil(n_retain/n_forget)` retain mini-batches (one is always 1).
@@ -814,10 +828,11 @@ sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT_TEST}" test_rsc15_seed_2 \
 
 # same but with right starting checkpoint:
 
-# dataset beauty with best unified unlearning version so far (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.1): 9175186 -> recall@5 ~ 0.4391
-# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=0.1): 9175189 -> recall@5 ~ 0.4467
-# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=0.0): 9175190 -> recall@5 ~ 0.4458
-# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=1.0): 9175196 -> recall@5 ~ 0.4494
+# dataset beauty with best unified unlearning version so far (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.1): 9175186 -> recall@5 ~ 0.04391
+# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=0.1): 9175189 -> recall@5 ~ 0.04467
+# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=0.0): 9175190 -> recall@5 ~ 0.04458
+# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=1.0): 9175196 -> recall@5 ~ 0.04494
+# dataset beauty with (sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty unified embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_batch_passes=4 unlearning.lambda_forget=0.0 unlearning.lambda_sep=1.0 unlearning.sep_negatives=random_retain): 9184450 -> recall@5 ~ 0.04490
 
 
 

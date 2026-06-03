@@ -61,6 +61,13 @@ unlearning:
   lambda_forget: 1.0
   lambda_sep: 0.1
   sep_temperature: 0.07
+  # Sep-loss negatives: neighbors (default; forget/neighborhood-center items)
+  # | random_retain (ablation: randomly sampled retain-set item ids instead,
+  # to measure how much the directed negatives help).
+  sep_negatives: neighbors
+  # Number of random negatives when sep_negatives=random_retain
+  # (null → match the size of the default neighbor negative set).
+  sep_num_random_negatives: null
   unified_steps: 500
   # Alternative to unified_steps: total optim steps = n_batch_passes * min(n_forget_batches, n_retain_batches).
   # If set, takes priority over unified_steps.

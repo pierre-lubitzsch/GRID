@@ -31,6 +31,7 @@ def unified_unlearn(
     deletion_spec: str = "session",
     forget_item_ids: Optional[Set[int]] = None,
     neighbor_item_ids: Optional[Set[int]] = None,
+    sep_negative_item_ids: Optional[Set[int]] = None,
     local_repair_cfg: Optional[Dict[str, Any]] = None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
@@ -52,6 +53,11 @@ def unified_unlearn(
     (one of the two is always 1). This balances per-sample exposure: every
     forget sample and every retain sample contributes to the gradient the same
     number of times, regardless of how many batches each side has.
+
+    ``sep_negative_item_ids``, when set, fully replaces the sep-loss negative
+    set (normally ``neighbor_item_ids | forget_item_ids``) — used for the
+    random-retain-negatives ablation. Local repair still uses
+    ``neighbor_item_ids``.
     """
     device = device or next(model.parameters()).device
     if not retain_batches:
@@ -110,6 +116,14 @@ def unified_unlearn(
 
     forget_ids = set(forget_item_ids or [])
     neighbor_ids = set(neighbor_item_ids or [])
+    if sep_negative_item_ids is not None:
+        # Ablation: random retain items as sep negatives instead of the
+        # directed forget/neighbor set.
+        sep_neighbor_ids: Set[int] = set(sep_negative_item_ids)
+        sep_forget_ids: Set[int] = set()
+    else:
+        sep_neighbor_ids = neighbor_ids
+        sep_forget_ids = forget_ids
     sequence_forget = str(forget_loss_level).lower() == "sequence"
 
     for step in range(steps):
@@ -139,8 +153,8 @@ def unified_unlearn(
             l_retain = model._batch_loss_from_model_step(retain_batch)
             l_sep = model.compute_sep_loss(
                 retain_batch,
-                neighbor_item_ids=neighbor_ids,
-                forget_item_ids=forget_ids,
+                neighbor_item_ids=sep_neighbor_ids,
+                forget_item_ids=sep_forget_ids,
                 temperature=float(sep_temperature),
             )
             retain_side = l_retain + float(lambda_sep) * l_sep
@@ -193,6 +207,10 @@ def unified_unlearn(
         "lr": float(lr),
         "lambda_forget": float(lambda_forget),
         "lambda_sep": float(lambda_sep),
+        "sep_negatives": (
+            "random_retain" if sep_negative_item_ids is not None else "neighbors"
+        ),
+        "n_sep_negatives": len(sep_neighbor_ids | sep_forget_ids),
         "forget_loss_level": str(forget_loss_level),
         "deletion_spec": str(deletion_spec),
         "mean_total_loss": _mean(totals["total"]),
