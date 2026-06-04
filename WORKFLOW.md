@@ -918,6 +918,34 @@ Submitted batch job 9208122
 recall@5 ~ 0.04275, ndcg@10 ~ 0.03568
 
 
+# Summary: lambda_forget hurts model performance (Beauty, poisoned ckpt pct1/n10, n_unlearning_chunks=10, n_batch_passes=4)
+# Within each matched group, increasing lambda_forget lowers recall@5; the effect grows with lambda_forget
+# and is masked at small values (<= 0.01) when lambda_sep=1.0 dominates the loss.
+#
+# lambda_sep=0.0 (forget loss isolated) -> monotonic decline:
+#   lf=0.0   (9175190): recall@5 0.04458, ndcg@10 0.03715
+#   lf=0.001 (9205866): recall@5 0.04449, ndcg@10 0.03698  (-0.00009)
+#   lf=0.01  (9205865): recall@5 0.04436, ndcg@10 0.03715  (-0.00022)
+# lambda_sep=0.1, neighbors -> largest drop at lf=0.1:
+#   lf=0.0   (9175189): recall@5 0.04467, ndcg@10 0.03720
+#   lf=0.1   (9175186): recall@5 0.04391, ndcg@10 0.03698  (-0.00076)
+# lambda_sep=1.0, neighbors -> flat / within noise for lf <= 0.01:
+#   lf=0.0    (9205848): recall@5 0.04494, ndcg@10 0.03716
+#   lf=0.0001 (9206057): recall@5 0.04476, ndcg@10 0.03719  (-0.00018)
+#   lf=0.001  (9205858): recall@5 0.04507, ndcg@10 0.03720  (+0.00013)
+#   lf=0.01   (9205854): recall@5 0.04499, ndcg@10 0.03716  (+0.00004)
+# lambda_sep=1.0, random_retain -> same picture for small lf:
+#   lf=0.0   (9184450): recall@5 0.04490, ndcg@10 0.03746
+#   lf=0.001 (9206039): recall@5 0.04507, ndcg@10 0.03760  (+0.00018)
+#   lf=0.01  (9206038): recall@5 0.04530, ndcg@10 0.03767  (+0.00040)
+# NAU, lambda_sep=1.0, neighbors -> lf=0.1 worst, ndcg drops clearly:
+#   lf=0.001 (9206865): recall@5 0.04288, ndcg@10 0.03611
+#   lf=0.01  (9208028): recall@5 0.04302, ndcg@10 0.03604
+#   lf=0.1   (9208122): recall@5 0.04275, ndcg@10 0.03568
+#
+# -> table: tables/beauty_unified_lambda_forget.tex
+
+
 # Step 7: evaluate
 UNLEARN_CKPT_TEST=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt
 sbatch run_tiger_eval_three_way.sh "${UNLEARN_CKPT_TEST}" "${CLEAN_CKPT_TEST}" "${POISON_CKPT_TEST}" "${SID_TEST}" src/data/erase_data/test_rsc15_seed_2

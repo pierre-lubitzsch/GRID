@@ -1,0 +1,40 @@
+% Beamer frame with lambda_forget ablation table — no extra packages needed.
+% Include from the presentation with: \input{tables/beauty_unified_lambda_forget}
+\begin{frame}{Unified unlearning on Beauty: $\lambda_{\text{forget}}$ ablation}
+  \begin{table}
+    \centering
+    \footnotesize
+    \begin{tabular}{l l l c r r r}
+      \hline
+      $\lambda_{\text{forget}}$ & $\lambda_{\text{sep}}$ & Sep.\ negatives & NAU & Recall@5 & NDCG@10 & $\Delta$Recall@5 \\
+      \hline
+      0      & 0.0 & --             & no  & 0.04458 & 0.03715 & --         \\
+      0.001  & 0.0 & --             & no  & 0.04449 & 0.03698 & $-0.00009$ \\
+      0.01   & 0.0 & --             & no  & 0.04436 & 0.03715 & $-0.00022$ \\[2pt]
+      0      & 0.1 & neighbors      & no  & 0.04467 & 0.03720 & --         \\
+      0.1    & 0.1 & neighbors      & no  & 0.04391 & 0.03698 & $-0.00076$ \\[2pt]
+      0      & 1.0 & neighbors      & no  & 0.04494 & 0.03716 & --         \\
+      0.0001 & 1.0 & neighbors      & no  & 0.04476 & 0.03719 & $-0.00018$ \\
+      0.001  & 1.0 & neighbors      & no  & 0.04507 & 0.03720 & $+0.00013$ \\
+      0.01   & 1.0 & neighbors      & no  & 0.04499 & 0.03716 & $+0.00004$ \\[2pt]
+      0      & 1.0 & random\_retain & no  & 0.04490 & 0.03746 & --         \\
+      0.001  & 1.0 & random\_retain & no  & 0.04507 & 0.03760 & $+0.00018$ \\
+      0.01   & 1.0 & random\_retain & no  & 0.04530 & 0.03767 & $+0.00040$ \\[2pt]
+      0.001  & 1.0 & neighbors      & yes & 0.04288 & 0.03611 & --         \\
+      0.01   & 1.0 & neighbors      & yes & 0.04302 & 0.03604 & $+0.00013$ \\
+      0.1    & 1.0 & neighbors      & yes & 0.04275 & 0.03568 & $-0.00013$ \\
+      \hline
+    \end{tabular}
+  \end{table}
+
+  \medskip
+  {\scriptsize
+    Poisoned ckpt (pct\,=\,1, $n$\,=\,10); \texttt{n\_unlearning\_chunks}=10,
+    \texttt{n\_batch\_passes}=4, batch size 1.
+    $\Delta$Recall@5 vs.\ the first row of each group ($\lambda_{\text{forget}}=0$,
+    or the smallest $\lambda_{\text{forget}}$ for the NAU group).
+    With $\lambda_{\text{sep}}$ off, recall declines monotonically in
+    $\lambda_{\text{forget}}$; at $\lambda_{\text{forget}}=0.1$ the drop is largest,
+    while values $\leq 0.01$ are within noise when $\lambda_{\text{sep}}=1.0$.
+    Reference: clean ckpt $\approx 0.0453$, poisoned start $\approx 0.0444$.}
+\end{frame}
