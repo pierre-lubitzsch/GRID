@@ -7,15 +7,17 @@ forget set. TIGER has no user-item graph, so we approximate "neighbors" via
 Neighborhood mode (``neighborhood_aware=True``):
 
 1. Sort all item ids by full semantic id (lexicographic ascending).
-2. For each forget item, binary-search its position and walk outward with a
-   two-pointer scan to pick the **single closest** catalog item at the current
-   prefix length (``sid_prefix_length``). **All forget / spam items are
-   excluded** from being chosen as repair targets.
-3. Collect every retain row whose ``sequence_data`` **mentions** that closest
-   item anywhere in the sequence (not only as the last token). Rows that still
+2. For each forget item, collect **all** catalog items sharing the current
+   SID prefix (``sid_prefix_length``), ordered by ascending SID distance.
+   **All forget / spam items are excluded** from being chosen as repair
+   targets.
+3. Pool every retain row whose ``sequence_data`` **mentions** any bucket item
+   anywhere in the sequence (not only as the last token). Rows that still
    contain any forget-item id are **skipped** (do not repair on spam sessions).
-4. If the row budget is not met, repeat with a shorter prefix
-   (``k-1``, ``k-2``, … down to ``1``, where ``k = num_hierarchies``).
+4. Sample rows **uniformly at random** (seeded) from the pool until the row
+   budget is met or the pool is **drained**. Only then repeat with a shorter
+   prefix (``k-1``, ``k-2``, … down to ``1``, where ``k = num_hierarchies``),
+   skipping neighbours already used.
 5. Optionally mix with uniform retain rows via
    ``neighborhood_aware_sample_rate`` in ``[0, 1]`` (``1`` = neighborhood only,
    ``0`` = uniform only, ``0.5`` = half/half of the row budget).
@@ -598,6 +600,48 @@ def closest_item_at_prefix(
     )
 
 
+def bucket_items_by_distance(
+    sorted_ids: np.ndarray,
+    sorted_sids: np.ndarray,
+    codebook: torch.Tensor,
+    item_id: int,
+    prefix_len: int,
+    *,
+    exclude_ids: Optional[Set[int]] = None,
+) -> List[int]:
+    """Return all catalog items sharing the first ``prefix_len`` hierarchies
+    with ``item_id``, ordered by ascending SID distance.
+
+    Ids in ``exclude_ids`` (forget/target items and already-used neighbours)
+    are skipped. Unlike :func:`closest_item_at_prefix` this returns the whole
+    prefix bucket so callers can exhaust it before relaxing the prefix.
+    """
+    excluded = set(exclude_ids or set())
+    num_items, num_hierarchies = codebook.shape
+    if not (0 <= item_id < num_items):
+        return []
+    if prefix_len <= 0 or prefix_len > num_hierarchies:
+        raise ValueError(
+            f"prefix_len must be in [1, {num_hierarchies}], got {prefix_len}"
+        )
+
+    query = codebook[item_id].numpy()
+    prefix = _sid_tuple(query)[:prefix_len]
+    lo, hi = _prefix_range(sorted_ids, sorted_sids, prefix)
+    if lo >= hi:
+        return []
+    dists = (
+        np.abs(sorted_sids[lo:hi].astype(np.int64) - query.astype(np.int64))
+        .sum(axis=1)
+    )
+    order = np.argsort(dists, kind="stable")
+    return [
+        cand
+        for off in order.tolist()
+        if (cand := int(sorted_ids[lo + off])) not in excluded
+    ]
+
+
 def select_retain_rows_progressive(
     all_rows: List[bytes],
     item_to_row_indices: Dict[int, List[int]],
@@ -612,7 +656,13 @@ def select_retain_rows_progressive(
     forbidden_row_indices: Optional[Set[int]] = None,
     exclude_target_items: Optional[Set[int]] = None,
 ) -> Tuple[List[bytes], Dict[str, object]]:
-    """Select retain rows via progressive closest-item prefix expansion."""
+    """Select retain rows via progressive prefix-bucket exhaustion.
+
+    At each prefix level, all retain rows mentioning any same-prefix item form
+    a pool; rows are drawn uniformly at random (seeded) from it until the row
+    budget is met or the pool is drained. The prefix is only shortened once
+    the pool is exhausted and the budget is still unmet.
+    """
     forbidden_row_indices = forbidden_row_indices or set()
     exclude_target_items = set(exclude_target_items or set())
     num_hierarchies = int(codebook.shape[1])
@@ -628,36 +678,54 @@ def select_retain_rows_progressive(
     )
     exclude_target_items.update(forget_list)
 
+    rng = random.Random(seed)
     selected_indices: Set[int] = set()
+    used_neighbors: Set[int] = set()
     level_log: List[Dict[str, object]] = []
 
     for prefix_len in range(start_prefix_length, min_prefix_length - 1, -1):
-        n_added = 0
-        per_forget: Dict[int, Optional[int]] = {}
-        for fid in forget_list:
-            closest = closest_item_at_prefix(
+        # Full prefix bucket per forget item. Neighbours already
+        # consumed at a longer prefix are skipped so each level adds fresh rows.
+        buckets: Dict[int, List[int]] = {
+            fid: bucket_items_by_distance(
                 sorted_ids,
                 sorted_sids,
                 codebook,
                 fid,
                 prefix_len,
-                exclude_ids=exclude_target_items,
+                exclude_ids=exclude_target_items | used_neighbors,
             )
-            per_forget[fid] = closest
-            if closest is None:
-                continue
-            for row_idx in item_to_row_indices.get(closest, []):
-                if row_idx in forbidden_row_indices:
+            for fid in forget_list
+        }
+        level_neighbors: Set[int] = set()
+        # Pool every retain row mentioning any bucket item, then sample rows
+        # uniformly at random until the budget is met or the pool is drained.
+        level_pool: List[int] = []
+        pooled: Set[int] = set()
+        for fid in forget_list:
+            for cand in buckets[fid]:
+                if cand in used_neighbors:
                     continue
-                if row_idx not in selected_indices:
-                    selected_indices.add(row_idx)
-                    n_added += 1
+                used_neighbors.add(cand)
+                level_neighbors.add(cand)
+                for row_idx in item_to_row_indices.get(cand, []):
+                    if row_idx in forbidden_row_indices:
+                        continue
+                    if row_idx in selected_indices or row_idx in pooled:
+                        continue
+                    pooled.add(row_idx)
+                    level_pool.append(row_idx)
+        rng.shuffle(level_pool)
+        taken = level_pool[: max(0, budget - len(selected_indices))]
+        selected_indices.update(taken)
+        n_added = len(taken)
         level_log.append(
             {
                 "sid_prefix_length": prefix_len,
+                "n_rows_in_bucket_pool": len(level_pool),
                 "n_rows_added": n_added,
                 "n_rows_cumulative": len(selected_indices),
-                "n_closest_items": len({c for c in per_forget.values() if c is not None}),
+                "n_neighbor_items_used": len(level_neighbors),
             }
         )
         if len(selected_indices) >= budget:
@@ -691,12 +759,11 @@ def select_retain_rows_progressive(
                 "sid_prefix_length": 0,
                 "n_rows_added": n_added,
                 "n_rows_cumulative": len(selected_indices),
-                "n_closest_items": len(selected_indices),
+                "n_neighbor_items_used": len(selected_indices),
                 "fallback": "sorted_distance_no_shared_prefix",
             }
         )
 
-    rng = random.Random(seed)
     indices = list(selected_indices)
     rng.shuffle(indices)
     qualifying = [all_rows[i] for i in indices]
@@ -886,7 +953,7 @@ def filter_retain_shards(
     allowed_items: Optional[Set[int]],
     max_rows: Optional[int],
     rows_per_shard: int = 4096,
-    seed: int = 42,
+    seed: int = 2,
     retain_max_rows: Optional[int] = None,
     preselected_rows: Optional[List[bytes]] = None,
     n_seen_hint: Optional[int] = None,
@@ -979,7 +1046,7 @@ def build_retain_subset(
     target_items: Optional[Iterable[int]] = None,
     num_hierarchies: Optional[int] = None,
     rows_per_shard: int = 4096,
-    seed: int = 42,
+    seed: int = 2,
     overwrite: bool = True,
 ) -> Dict[str, object]:
     """Materialise a (possibly filtered) retain subset under ``out_dir``.
@@ -1318,7 +1385,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Use a single fixed sid_prefix_length instead of k-1..1 expansion.",
     )
     p.add_argument("--rows_per_shard", type=int, default=4096)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=2)
     p.add_argument("--overwrite", action="store_true")
     return p
 
