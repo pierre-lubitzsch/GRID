@@ -958,6 +958,20 @@ recall@5 ~ 0.04275, ndcg@10 ~ 0.03568
 # -> table: tables/beauty_unified_lambda_forget.tex
 
 
+# Summary: fine-tuning (lambda_forget=0, lambda_sep=0) vs separation loss (Beauty, same setup as above)
+# With lambda_forget=0 throughout, the lambda_sep=0 run is pure retain fine-tuning. Every lambda_sep > 0
+# matches or beats it on recall@5; the sweet spot is lambda_sep=1.0.
+#   ls=0.0  (fine-tuning, 9175190):        recall@5 0.04458, ndcg@10 0.03715
+#   ls=0.1,  neighbors      (9175189):     recall@5 0.04467, ndcg@10 0.03720  (+0.00009)
+#   ls=1.0,  neighbors      (9175196/9205848): recall@5 0.04494, ndcg@10 0.03716  (+0.00036)
+#   ls=10.0, neighbors      (9205850):     recall@5 0.04467, ndcg@10 0.03718  (+0.00009)
+#   ls=1.0,  random_retain  (9184450):     recall@5 0.04490, ndcg@10 0.03746  (+0.00031)
+#   ls=10.0, random_retain  (9206033):     recall@5 0.04472, ndcg@10 0.03710  (+0.00013)
+# (Caveat: on test_rsc15_seed_2 the only lf=0 comparison is ls=0.1 session 9097282 0.43148 vs ls=0.0
+#  session 9097283 0.43165 — there ls=0.1 is marginally worse; ls=1.0 untested on rsc15.)
+# -> table: tables/beauty_finetune_vs_sep.tex
+
+
 # Step 7: evaluate
 UNLEARN_CKPT_TEST=logs/unlearn/runs/<run_id>/checkpoints/unlearned.ckpt
 sbatch run_tiger_eval_three_way.sh "${UNLEARN_CKPT_TEST}" "${CLEAN_CKPT_TEST}" "${POISON_CKPT_TEST}" "${SID_TEST}" src/data/erase_data/test_rsc15_seed_2

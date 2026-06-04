@@ -1,0 +1,30 @@
+% Beamer frame with fine-tuning vs.\ separation-loss table — no extra packages needed.
+% Include from the presentation with: \input{tables/beauty_finetune_vs_sep}
+\begin{frame}{Unified unlearning on Beauty: fine-tuning vs.\ separation loss}
+  \begin{table}
+    \centering
+    \footnotesize
+    \begin{tabular}{l l l r r r}
+      \hline
+      $\lambda_{\text{sep}}$ & Sep.\ negatives & Method & Recall@5 & NDCG@10 & $\Delta$Recall@5 \\
+      \hline
+      0.0  & --             & fine-tuning (retain only) & 0.04458 & 0.03715 & --         \\[2pt]
+      0.1  & neighbors      & + sep loss                & 0.04467 & 0.03720 & $+0.00009$ \\
+      1.0  & neighbors      & + sep loss                & 0.04494 & 0.03716 & $+0.00036$ \\
+      10.0 & neighbors      & + sep loss                & 0.04467 & 0.03718 & $+0.00009$ \\[2pt]
+      1.0  & random\_retain & + sep loss                & 0.04490 & 0.03746 & $+0.00031$ \\
+      10.0 & random\_retain & + sep loss                & 0.04472 & 0.03710 & $+0.00013$ \\
+      \hline
+    \end{tabular}
+  \end{table}
+
+  \medskip
+  {\scriptsize
+    Poisoned ckpt (pct\,=\,1, $n$\,=\,10); \texttt{n\_unlearning\_chunks}=10,
+    \texttt{n\_batch\_passes}=4, batch size 1; $\lambda_{\text{forget}}=0$ throughout,
+    so the $\lambda_{\text{sep}}=0$ row is pure retain fine-tuning.
+    $\Delta$Recall@5 vs.\ the fine-tuning baseline.
+    Every $\lambda_{\text{sep}}>0$ matches or beats fine-tuning; the sweet spot is
+    $\lambda_{\text{sep}}=1.0$ (recall@5), with random\_retain negatives best on NDCG@10.
+    Reference: clean ckpt $\approx 0.0453$, poisoned start $\approx 0.0444$.}
+\end{frame}
