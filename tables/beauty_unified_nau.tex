@@ -1,28 +1,20 @@
-% Beamer frame with NAU ablation table.
+% Beamer frame with NAU ablation table — no extra packages needed.
 % Include from the presentation with: \input{tables/beauty_unified_nau}
-% Preamble requirements:
-%   \usepackage{booktabs}
-%   \usepackage{pifont}
-%   \newcommand{\cmark}{\ding{51}}
-%   \newcommand{\xmark}{\ding{55}}
-% (or replace \cmark/\xmark with yes/no)
 \begin{frame}{Unified unlearning on Beauty: NAU ablation}
   \begin{table}
     \centering
     \footnotesize
-    \begin{tabular}{l l l l l r r r}
-      \toprule
-      $\lambda_{\text{forget}}$ & $\lambda_{\text{sep}}$ & Sep.\ negatives & NAU & Job & Recall@5 & NDCG@10 & $\Delta$Recall@5 \\
-      \midrule
-      0.001 & 1.0 & neighbors      & \xmark & 9205858 & 0.04507 & 0.03720 & --        \\
-      0.001 & 1.0 & neighbors      & \cmark & 9206865 & 0.04288 & 0.03611 & $-0.00219$ \\
-      \addlinespace
-      0.001 & 1.0 & random\_retain & \xmark & 9206039 & 0.04507 & 0.03760 & --        \\
-      0.001 & 1.0 & random\_retain & \cmark & 9206867 & 0.04320 & 0.03612 & $-0.00187$ \\
-      \addlinespace
-      0.01  & 1.0 & neighbors      & \xmark & 9205854 & 0.04499 & 0.03716 & --        \\
-      0.01  & 1.0 & neighbors      & \cmark & 9208028 & 0.04302 & 0.03604 & $-0.00197$ \\
-      \bottomrule
+    \begin{tabular}{l l l c r r r}
+      \hline
+      $\lambda_{\text{forget}}$ & $\lambda_{\text{sep}}$ & Sep.\ negatives & NAU & Recall@5 & NDCG@10 & $\Delta$Recall@5 \\
+      \hline
+      0.001 & 1.0 & neighbors      & no  & 0.04507 & 0.03720 & --        \\
+      0.001 & 1.0 & neighbors      & yes & 0.04288 & 0.03611 & $-0.00219$ \\[2pt]
+      0.001 & 1.0 & random\_retain & no  & 0.04507 & 0.03760 & --        \\
+      0.001 & 1.0 & random\_retain & yes & 0.04320 & 0.03612 & $-0.00187$ \\[2pt]
+      0.01  & 1.0 & neighbors      & no  & 0.04499 & 0.03716 & --        \\
+      0.01  & 1.0 & neighbors      & yes & 0.04302 & 0.03604 & $-0.00197$ \\
+      \hline
     \end{tabular}
   \end{table}
 
