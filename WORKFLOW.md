@@ -801,21 +801,33 @@ sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT_TEST}" test_rsc15_seed_2 \
 # unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, ratio uniform/NAU: 0.5: 9089074
 # unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, ratio uniform/NAU: 0.1: 9089473
 
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, item unlearning: 9096329
-# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, item unlearning: 9096330
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, item unlearning: 9096329 -> recall@5 ~ 0.3352, ndcg@10 ~ 0.2814
+# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 1.0, item unlearning: 9096330 -> recall@5 ~ 0.0778, ndcg@10 ~ 0.0623
 
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, item unlearning: 9096332 -> recall@5 ~ 0.414
-# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, item unlearning: 9096333
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, item unlearning: 9096332 -> recall@5 ~ 0.4143, ndcg@10 ~ 0.3445
+# unified, NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, item unlearning: 9096333 -> recall@5 ~ 0.3673, ndcg@10 ~ 0.3040
 
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, lambda_sep 0.0 item unlearn: 9096945 -> recall@5 ~ 0.4143 
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.1 item unlearn: 9096947 -> recall@5 ~ 0.4167
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.0 item unlearn: 9096948 -> recall@5 ~ 0.4163
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, lambda_sep 0.0 item unlearn: 9096945 -> recall@5 ~ 0.4143, ndcg@10 ~ 0.3446
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.1 item unlearn: 9096947 -> recall@5 ~ 0.4167, ndcg@10 ~ 0.3466
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.0 item unlearn: 9096948 -> recall@5 ~ 0.4163, ndcg@10 ~ 0.3467
 
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, lambda_sep 0.0 item unlearn: 9097281 -> recall@5 ~ 0.4295 
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.1 item unlearn: 9097282 -> recall@5 ~ 0.4314
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.0 item unlearn: 9097283 -> recall@5 ~ 0.4316
+# NOTE: the next three were labelled "item unlearn" but the logs show deletion_spec=session (no item_pairs override
+# was passed) — they are the SESSION counterparts of 9096945/47/48 above:
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.1, lambda_sep 0.0 session unlearn: 9097281 -> recall@5 ~ 0.4296, ndcg@10 ~ 0.3573
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.1 session unlearn: 9097282 -> recall@5 ~ 0.4315, ndcg@10 ~ 0.3585
+# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.0 session unlearn: 9097283 -> recall@5 ~ 0.4317, ndcg@10 ~ 0.3587
 
-# unified, no NAU, n_unlearning_chunks 10, pct 1, n_batch_passes 4, lambda_forget 0.0, lambda_sep 0.1 item unlearn: 
+# Summary: item unlearning vs session unlearning (matched configs, unified, test_rsc15_seed_2, pct1/n10,
+# n_unlearning_chunks=10, n_batch_passes=4). Item unlearning costs retain performance in every matched pair:
+# ~ -0.015 recall@5 at small lambda_forget, growing with lambda_forget and NAU, collapsing at lf=1.0 + NAU.
+#   lf=0.0, ls=0.0, no NAU:  session 9097283 0.4317 | item 9096948 0.4163  (-0.0153)
+#   lf=0.0, ls=0.1, no NAU:  session 9097282 0.4315 | item 9096947 0.4167  (-0.0148)
+#   lf=0.1, ls=0.0, no NAU:  session 9097281 0.4296 | item 9096945 0.4143  (-0.0152)
+#   lf=0.1, ls=0.1, no NAU:  session 9088726 0.4297 | item 9096332 0.4143  (-0.0154)
+#   lf=0.1, ls=0.1, NAU:     session 9088727 0.4161 | item 9096333 0.3673  (-0.0487)
+#   lf=1.0, ls=0.1, no NAU:  session 9088728 0.3842 | item 9096329 0.3352  (-0.0490)
+#   lf=1.0, ls=0.1, NAU:     session 9088729 0.3534 | item 9096330 0.0778  (-0.2756, collapse)
+# -> table: tables/rsc15_item_vs_session.tex
 
 # unified, no NAU, n_unlearning_chunks 10, pct 5, n_batch_passes 4, lambda_forget 0.1: 9097142 -> recall@5 ~ 0.3685
 # unified, no NAU, n_unlearning_chunks 10, pct 10, n_batch_passes 4, lambda_forget 0.1: 9097144 -> recall@5 ~ 0.322

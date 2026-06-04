@@ -1,0 +1,39 @@
+% Beamer frame with item vs.\ session unlearning table — no extra packages needed.
+% Include from the presentation with: \input{tables/rsc15_item_vs_session}
+\begin{frame}{Unified unlearning on test\_rsc15: item vs.\ session deletion}
+  \begin{table}
+    \centering
+    \footnotesize
+    \begin{tabular}{l l c l r r r}
+      \hline
+      $\lambda_{\text{forget}}$ & $\lambda_{\text{sep}}$ & NAU & Deletion & Recall@5 & NDCG@10 & $\Delta$Recall@5 \\
+      \hline
+      0.0 & 0.0 & no  & session & 0.43165 & 0.35873 & --         \\
+      0.0 & 0.0 & no  & item    & 0.41631 & 0.34668 & $-0.01534$ \\[2pt]
+      0.0 & 0.1 & no  & session & 0.43148 & 0.35848 & --         \\
+      0.0 & 0.1 & no  & item    & 0.41667 & 0.34658 & $-0.01481$ \\[2pt]
+      0.1 & 0.0 & no  & session & 0.42956 & 0.35730 & --         \\
+      0.1 & 0.0 & no  & item    & 0.41434 & 0.34462 & $-0.01522$ \\[2pt]
+      0.1 & 0.1 & no  & session & 0.42971 & 0.35742 & --         \\
+      0.1 & 0.1 & no  & item    & 0.41426 & 0.34453 & $-0.01545$ \\[2pt]
+      0.1 & 0.1 & yes & session & 0.41605 & 0.34435 & --         \\
+      0.1 & 0.1 & yes & item    & 0.36732 & 0.30402 & $-0.04873$ \\[2pt]
+      1.0 & 0.1 & no  & session & 0.38419 & 0.32167 & --         \\
+      1.0 & 0.1 & no  & item    & 0.33521 & 0.28144 & $-0.04898$ \\[2pt]
+      1.0 & 0.1 & yes & session & 0.35340 & 0.29324 & --         \\
+      1.0 & 0.1 & yes & item    & 0.07777 & 0.06228 & $-0.27563$ \\
+      \hline
+    \end{tabular}
+  \end{table}
+
+  \medskip
+  {\scriptsize
+    test\_rsc15\_seed\_2, poisoned ckpt (pct\,=\,1, $n$\,=\,10);
+    \texttt{n\_unlearning\_chunks}=10, \texttt{n\_batch\_passes}=4, batch size 1.
+    Item = \texttt{deletion\_spec=item\_pairs} (only prefix\,$\to$\,target pairs),
+    session = full spam sessions.
+    $\Delta$Recall@5 = item $-$ matched session run.
+    Item unlearning costs $\approx 0.015$ recall@5 at small $\lambda_{\text{forget}}$;
+    the gap grows with $\lambda_{\text{forget}}$ and NAU, collapsing at
+    $\lambda_{\text{forget}}=1.0$ with NAU.}
+\end{frame}
