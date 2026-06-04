@@ -1,0 +1,28 @@
+% Beamer frame with spam-percentage sweep table — no extra packages needed.
+% Include from the presentation with: \input{tables/rsc15_spam_pct}
+\begin{frame}{Unified unlearning on test\_rsc15: effect of spam percentage}
+  \begin{table}
+    \centering
+    \footnotesize
+    \begin{tabular}{l rr rr r}
+      \hline
+      & \multicolumn{2}{c}{Poisoned start} & \multicolumn{2}{c}{After unlearning} & \\
+      Spam pct & Recall@5 & NDCG@10 & Recall@5 & NDCG@10 & $\Delta$Recall@5 \\
+      \hline
+      1\%  & 0.41939 & 0.34814 & 0.42971 & 0.35742 & $+0.01032$ \\
+      5\%  & 0.41327 & 0.34473 & 0.36848 & 0.31176 & $-0.04479$ \\
+      10\% & 0.40839 & 0.34107 & 0.32208 & 0.27714 & $-0.08631$ \\
+      \hline
+    \end{tabular}
+  \end{table}
+
+  \medskip
+  {\scriptsize
+    test\_rsc15\_seed\_2, spam seed 2, $n$\,=\,10 targets; unified session unlearning,
+    no NAU, $\lambda_{\text{forget}}=0.1$, $\lambda_{\text{sep}}=0.1$,
+    \texttt{n\_unlearning\_chunks}=10, \texttt{n\_batch\_passes}=4, batch size 1.
+    $\Delta$Recall@5 = after unlearning $-$ poisoned start.
+    At 1\% spam, unlearning recovers above the poisoned start and even the clean model
+    (clean reference: recall@5 0.42215, NDCG@10 0.34987); at 5\% and 10\% the unlearned
+    model falls \emph{below} its poisoned starting point, with damage growing in spam pct.}
+\end{frame}
