@@ -832,14 +832,13 @@ sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT_TEST}" test_rsc15_seed_2 \
 # unified, no NAU, n_unlearning_chunks 10, pct 5, n_batch_passes 4, lambda_forget 0.1: 9097142 -> recall@5 ~ 0.3685, ndcg@10 ~ 0.3118
 # unified, no NAU, n_unlearning_chunks 10, pct 10, n_batch_passes 4, lambda_forget 0.1: 9097144 -> recall@5 ~ 0.322, ndcg@10 ~ 0.2771
 
-# Summary: spam percentage sweep (unified session unlearning, no NAU, lf=0.1, ls=0.1, n_unlearning_chunks=10,
-# n_batch_passes=4; poisoned-start metrics from training jobs 9019894/9056493/9056494, clean from 9018466).
-# At pct=1 unlearning recovers above the poisoned start (even above clean); at pct=5/10 the unlearned model
-# ends up WORSE than the poisoned model it started from, and the damage grows with spam pct.
-#   clean reference (9018466):                       recall@5 0.42215, ndcg@10 0.34987
-#   pct=1:  poisoned 0.41939/0.34814 (9019894) -> unlearned 0.42971/0.35742 (9088726)  (+0.01032 recall@5)
-#   pct=5:  poisoned 0.41327/0.34473 (9056493) -> unlearned 0.36848/0.31176 (9097142)  (-0.04479 recall@5)
-#   pct=10: poisoned 0.40839/0.34107 (9056494) -> unlearned 0.32208/0.27714 (9097144)  (-0.08631 recall@5)
+# Summary: spam percentage sweep — poisoned training vs clean training (test metrics at end of training;
+# clean from job 9018466, poisoned from jobs 9019894/9056493/9056494). Retain-set performance degrades
+# monotonically with spam pct.
+#   clean (9018466):           recall@5 0.42215, ndcg@10 0.34987
+#   poisoned pct=1  (9019894): recall@5 0.41939, ndcg@10 0.34814  (-0.00276 recall@5)
+#   poisoned pct=5  (9056493): recall@5 0.41327, ndcg@10 0.34473  (-0.00888 recall@5)
+#   poisoned pct=10 (9056494): recall@5 0.40839, ndcg@10 0.34107  (-0.01376 recall@5)
 # -> table: tables/rsc15_spam_pct.tex
 
 
