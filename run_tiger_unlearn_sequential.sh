@@ -25,8 +25,8 @@ set -euo pipefail
 #       [extra hydra overrides...]
 #
 # [algorithm] is optional at position 3, detected by matching known names.
-# Supported: scif (default), unified, finetune, neg_train, filter.
-# Can also be set via UNLEARN_ALGORITHM env var.
+# Supported: scif (default), seif, kookmin, fanchuan, unified, finetune,
+# neg_train, filter. Can also be set via UNLEARN_ALGORITHM env var.
 #
 # <dataset> is a short name (beauty, rsc15, ...) resolved via
 # scripts/resolve_unlearn_dataset.sh, or a path containing '/' used as data_dir.
@@ -60,7 +60,7 @@ shift 2
 # Falls through transparently so existing calls without the algorithm arg still work.
 ALGORITHM="${UNLEARN_ALGORITHM:-scif}"
 case "${1:-}" in
-  scif|unified|finetune|neg_train|filter)
+  scif|seif|kookmin|fanchuan|unified|finetune|neg_train|filter)
     ALGORITHM="${1}"
     shift 1
     ;;
@@ -94,15 +94,15 @@ if [ -z "${CKPT_PATH}" ] || [ -z "${DATASET_OR_DIR}" ]; then
   echo "  [algorithm] [semantic_id_path] [neighborhood_aware:true|false] \\"
   echo "  [request_batch_size:int] [neighborhood_aware_sample_rate:float] \\"
   echo "  [extra hydra overrides...]"
-  echo "Supported algorithms: scif (default), unified, finetune, neg_train, filter"
+  echo "Supported algorithms: scif (default), seif, kookmin, fanchuan, unified, finetune, neg_train, filter"
   echo "Known datasets: beauty, sports, toys, rsc15, rsc15_smoke (see scripts/resolve_unlearn_dataset.sh)"
   exit 1
 fi
 
 case "${ALGORITHM}" in
-  scif|unified|finetune|neg_train|filter) ;;
+  scif|seif|kookmin|fanchuan|unified|finetune|neg_train|filter) ;;
   *)
-    echo "Unknown algorithm '${ALGORITHM}'. Supported: scif, unified, finetune, neg_train, filter"
+    echo "Unknown algorithm '${ALGORITHM}'. Supported: scif, seif, kookmin, fanchuan, unified, finetune, neg_train, filter"
     exit 1
     ;;
 esac
@@ -169,7 +169,10 @@ source "${GRID_DIR}/scripts/unlearn_run_dir.sh"
 # Build a descriptive, unique run tag: dataset_pctX_nY_algo
 _DATASET_SLUG="${DATASET:-${DATASET_OR_DIR##*/}}"
 _PCT_LABEL="$(python3 -c "r=${POISONING_RATIO}; print(f'pct{int(round(r*100))}')")"
-UNLEARN_RUN_TAG="${UNLEARN_RUN_TAG:-${_DATASET_SLUG}_${_PCT_LABEL}_n${N_TARGET_ITEMS}_${ALGORITHM}}"
+# Tag the poison method (empty for bandwagon) so unlearn runs are self-describing.
+POISON_METHOD="${POISON_METHOD:-bandwagon}"
+if [ "${POISON_METHOD}" = "bandwagon" ]; then _MTOK=""; else _MTOK="_${POISON_METHOD}"; fi
+UNLEARN_RUN_TAG="${UNLEARN_RUN_TAG:-${_DATASET_SLUG}${_MTOK}_${_PCT_LABEL}_n${N_TARGET_ITEMS}_${ALGORITHM}}"
 UNLEARN_OUTPUT_DIR="$(unlearn_build_output_dir "${GRID_DIR}" "${REQUEST_BATCH_SIZE}")"
 unlearn_allocate_output_dir "${UNLEARN_OUTPUT_DIR}"
 

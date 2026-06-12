@@ -15,6 +15,9 @@
 #
 # Poison dataset naming is derived from env vars (all have defaults):
 #   POISONING_RATIO=0.01  POISON_SEED=2  N_TARGET_ITEMS=10
+#   POISON_METHOD=bandwagon   # bandwagon|segment|clone_append
+# The method token is empty for 'bandwagon' so existing datasets keep their
+# names; other methods insert '_<method>' (e.g. <base>_spam_segment_seed...).
 
 resolve_grid_dataset() {
   local name="${1:-${DATASET:-}}"
@@ -26,11 +29,13 @@ resolve_grid_dataset() {
   local clean="" poison="" sid=""
 
   # Compute poison suffix once from env vars.
-  local _pct _seed _n _sfx
+  local _pct _seed _n _sfx _method _mtok
   _pct="$(python3 -c "print(int(round(${POISONING_RATIO:-0.01} * 100)))")"
   _seed="${POISON_SEED:-2}"
   _n="${N_TARGET_ITEMS:-10}"
-  _sfx="_spam_seed${_seed}_pct${_pct}_n${_n}"
+  _method="${POISON_METHOD:-bandwagon}"
+  if [ "${_method}" = "bandwagon" ]; then _mtok=""; else _mtok="_${_method}"; fi
+  _sfx="_spam${_mtok}_seed${_seed}_pct${_pct}_n${_n}"
 
   case "${name}" in
     beauty)

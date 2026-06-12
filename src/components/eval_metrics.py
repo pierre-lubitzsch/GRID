@@ -1,4 +1,6 @@
-from typing import Any, Dict, List
+import json
+import os
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -135,6 +137,83 @@ class Recall(CustomRetrievalMetric):
             min=1
         )  # Use clamp to avoid zero
         return recall
+
+
+## Spam-exposure metrics
+#
+# These measure how often the spam-boosted target items I_t leak into the top-k
+# recommendations, restricted to evaluation examples whose ground-truth label is
+# NOT itself a target (y not in I_t). With one eval example per user (leave-one-
+# out, |D_u| = 1) these accumulators match the definitions exactly:
+#   SH@k  = (# non-target examples with a target in top-k) / (# non-target examples)
+#   ASI@k = (sum over non-target examples of |top-k ∩ I_t| / min(|I_t|, k)) / |U|
+# where |U| is the total number of users/examples (so target-labelled examples
+# contribute 0 to the numerator but still count in ASI's denominator, matching
+# the max{1, ...} convention).
+
+
+class CustomSpamMetric(CustomMeanReductionMetric):
+    """Base for spam-exposure metrics that need per-candidate target membership.
+
+    Unlike :class:`CustomRetrievalMetric` (which only sees relevance of the true
+    label), spam metrics consume, per example: ``preds`` (B, C) candidate scores,
+    ``is_spam_cand`` (B, C) whether each generated candidate is a target item, and
+    ``is_spam_label`` (B,) whether the ground-truth label is itself a target.
+    """
+
+    def __init__(self, top_k: int, num_targets: int = 1, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.top_k = top_k
+        self.num_targets = max(1, int(num_targets))
+
+    def update(
+        self,
+        preds: torch.Tensor,
+        is_spam_cand: torch.Tensor,
+        is_spam_label: torch.Tensor,
+    ) -> None:
+        k = min(self.top_k, preds.size(1))
+        topk_idx = torch.topk(preds, k, dim=1)[1]
+        spam_in_topk = is_spam_cand.gather(1, topk_idx)  # (B, k) bool
+        self._accumulate(spam_in_topk, is_spam_label.bool())
+
+    def _accumulate(
+        self, spam_in_topk: torch.Tensor, is_spam_label: torch.Tensor
+    ) -> None:
+        raise NotImplementedError
+
+
+class SpamHitRate(CustomSpamMetric):
+    """SH@k: fraction of non-target eval examples whose top-k contains a target."""
+
+    def _accumulate(
+        self, spam_in_topk: torch.Tensor, is_spam_label: torch.Tensor
+    ) -> None:
+        nonspam = ~is_spam_label
+        hits = spam_in_topk.any(dim=1) & nonspam
+        self.metric_values += hits.sum().item()
+        self.total_values += nonspam.sum().item()  # denom: # non-target examples
+
+
+class AvgSpamItems(CustomSpamMetric):
+    """ASI@k: mean over users of |top-k ∩ I_t| / min(|I_t|, k) on non-target examples.
+
+    Numerator sums ``|top-k ∩ I_t| / min(|I_t|, k)`` over non-target examples;
+    denominator is the total example count |U| (target-labelled examples add 0 to
+    the numerator but are counted here, per the max{1, ...} convention).
+    """
+
+    def _accumulate(
+        self, spam_in_topk: torch.Tensor, is_spam_label: torch.Tensor
+    ) -> None:
+        nonspam = ~is_spam_label
+        cap = max(1, min(self.num_targets, self.top_k))
+        per_example = spam_in_topk.sum(dim=1).float() / cap
+        per_example = per_example * nonspam.float()  # zero out target-labelled
+        self.metric_values += per_example.sum().item()
+        self.total_values += is_spam_label.numel()  # denom: |U| (all examples)
+
+
 ## Evaluators
 
 class Evaluator:
@@ -269,6 +348,10 @@ class SIDRetrievalEvaluator(Evaluator):
         self,
         metrics: Dict[str, CustomRetrievalMetric],
         top_k_list: List[int],
+        spam_metrics: Optional[Dict[str, CustomSpamMetric]] = None,
+        forget_manifest_path: Optional[str] = None,
+        semantic_id_path: Optional[str] = None,
+        num_hierarchies: Optional[int] = None,
     ):
         self.metrics = {
             f"{metric_name}@{top_k}": metric_object(
@@ -277,6 +360,64 @@ class SIDRetrievalEvaluator(Evaluator):
             for metric_name, metric_object in metrics.items()
             for top_k in top_k_list
         }
+
+        # Optional spam-exposure metrics (SH@k, ASI@k). They require the spam
+        # target set I_t as semantic IDs, loaded from the poison forget_manifest
+        # and the semantic-ID tensor. If either is missing they are skipped, so
+        # clean/unpoisoned runs without a manifest simply don't emit them.
+        self.spam_target_sids: Optional[torch.Tensor] = None
+        self.num_spam_targets: int = 0
+        if spam_metrics:
+            self.spam_target_sids, self.num_spam_targets = self._load_spam_target_sids(
+                forget_manifest_path, semantic_id_path, num_hierarchies
+            )
+            if self.spam_target_sids is not None:
+                for metric_name, metric_object in spam_metrics.items():
+                    for top_k in top_k_list:
+                        self.metrics[f"{metric_name}@{top_k}"] = metric_object(
+                            top_k=top_k,
+                            num_targets=self.num_spam_targets,
+                            sync_on_compute=False,
+                            compute_with_cache=False,
+                        )
+            else:
+                print(
+                    "[SIDRetrievalEvaluator] spam_metrics requested but no spam "
+                    f"targets loaded (forget_manifest_path={forget_manifest_path!r}, "
+                    f"semantic_id_path={semantic_id_path!r}); SH/ASI skipped."
+                )
+
+    @staticmethod
+    def _load_spam_target_sids(
+        forget_manifest_path: Optional[str],
+        semantic_id_path: Optional[str],
+        num_hierarchies: Optional[int],
+    ):
+        """Return (target_sids [T, H] long, num_targets) or (None, 0).
+
+        ``forget_manifest_path`` provides ``target_items`` (I_t); the semantic-ID
+        tensor (``[num_hierarchies, num_items]``, raw per-hierarchy codes) maps
+        each target item to its code tuple — the same space as ``generated_ids``.
+        """
+        if not forget_manifest_path or not os.path.isfile(forget_manifest_path):
+            return None, 0
+        if not semantic_id_path or not os.path.isfile(semantic_id_path):
+            return None, 0
+        with open(forget_manifest_path, encoding="utf-8") as f:
+            targets = json.load(f).get("target_items", [])
+        if not targets:
+            return None, 0
+        sem = torch.load(semantic_id_path, map_location="cpu", weights_only=False)
+        if not torch.is_tensor(sem) or sem.ndim != 2:
+            return None, 0
+        n_items = sem.shape[1]
+        idx = torch.tensor([t for t in targets if 0 <= int(t) < n_items], dtype=torch.long)
+        if idx.numel() == 0:
+            return None, 0
+        h = int(num_hierarchies) if num_hierarchies else sem.shape[0]
+        h = min(h, sem.shape[0])
+        target_sids = sem[:h, idx].t().contiguous().long()  # (T, H)
+        return target_sids, int(target_sids.shape[0])
 
     def __call__(
         self,
@@ -307,8 +448,33 @@ class SIDRetrievalEvaluator(Evaluator):
         )
 
         for _, metric_object in self.metrics.items():
+            if isinstance(metric_object, CustomSpamMetric):
+                continue
             metric_object.update(
                 preds,
                 target.to(preds.device),
                 indexes=expanded_indexes.to(preds.device),
             )
+
+        # Spam-exposure metrics: detect target items among the generated
+        # candidates and among the labels (to exclude target-labelled examples).
+        if self.spam_target_sids is not None:
+            st = self.spam_target_sids.to(generated_ids.device)  # (T, H)
+            # candidate is a target iff its full code tuple matches any target sid
+            is_spam_cand = (
+                (generated_ids.unsqueeze(2) == st.view(1, 1, -1, num_hierarchies))
+                .all(dim=3)
+                .any(dim=2)
+            )  # (B, C) bool
+            lbl = labels.reshape(batch_size, num_hierarchies)
+            is_spam_label = (
+                (lbl.unsqueeze(1) == st.unsqueeze(0)).all(dim=2).any(dim=1)
+            )  # (B,) bool
+            preds_2d = marginal_probs.reshape(batch_size, num_candidates)
+            for _, metric_object in self.metrics.items():
+                if isinstance(metric_object, CustomSpamMetric):
+                    metric_object.update(
+                        preds_2d,
+                        is_spam_cand.to(preds.device),
+                        is_spam_label.to(preds.device),
+                    )

@@ -39,6 +39,12 @@ N_TARGET_ITEMS="${N_TARGET_ITEMS:-10}"
 ROWS_PER_SHARD="${ROWS_PER_SHARD:-5000}"
 OVERWRITE="${OVERWRITE:-}"
 
+# Poisoning method: bandwagon (default) | segment | clone_append.
+# Method token is empty for bandwagon so existing dataset names are preserved.
+POISON_METHOD="${POISON_METHOD:-bandwagon}"
+export POISON_METHOD
+if [ "${POISON_METHOD}" = "bandwagon" ]; then MTOK=""; else MTOK="_${POISON_METHOD}"; fi
+
 ARG="${1:-rsc15}"
 # shellcheck source=scripts/resolve_grid_dataset.sh
 source "${GRID_DIR}/scripts/resolve_grid_dataset.sh"
@@ -48,7 +54,7 @@ if [[ "${ARG}" == */* ]]; then
   BASE="$(basename "${CLEAN_DIR}")"
   PARENT="$(dirname "${CLEAN_DIR}")"
   PCT="$(python3 -c "print(int(round(${POISONING_RATIO} * 100)))")"
-  OUT_DIR="${PARENT}/${BASE}_spam_seed${POISON_SEED}_pct${PCT}_n${N_TARGET_ITEMS}"
+  OUT_DIR="${PARENT}/${BASE}_spam${MTOK}_seed${POISON_SEED}_pct${PCT}_n${N_TARGET_ITEMS}"
 else
   if ! resolve_grid_dataset "${ARG}"; then
     exit 1
@@ -63,7 +69,17 @@ if [ ! -d "${CLEAN_DIR}/training" ]; then
   exit 1
 fi
 
-STATS_INTER="${STATS_INTER:-src/data/rsc15.inter}"
+# Only default to the rsc15 .inter for rsc15 datasets. Amazon datasets
+# (beauty/sports/toys) have their own sequential item IDs in their TFRecords;
+# using rsc15.inter for them computes stats from the wrong catalog (raw RSC15
+# IDs), which silently breaks target/segment selection. If STATS_INTER is unset
+# for a non-rsc15 dataset we fall through to the direct TFRecord scan.
+if [ -z "${STATS_INTER+x}" ]; then
+  case "${CLEAN_DIR}" in
+    *rsc15*) STATS_INTER="src/data/rsc15.inter" ;;
+    *)       STATS_INTER="" ;;
+  esac
+fi
 N_CLEAN_USERS="${N_CLEAN_USERS:-}"
 if [ -z "${N_CLEAN_USERS}" ] && [ -f "${CLEAN_DIR}/dataset_meta.json" ]; then
   N_CLEAN_USERS="$(python3 -c "import json; print(json.load(open('${CLEAN_DIR}/dataset_meta.json'))['splits']['training'])")"
@@ -72,6 +88,7 @@ fi
 BW_ARGS=(
   --data_dir "${CLEAN_DIR}"
   --out_dir "${OUT_DIR}"
+  --method "${POISON_METHOD}"
   --attack bandwagon
   --target_strategy unpopular
   --poisoning_ratio "${POISONING_RATIO}"
@@ -81,6 +98,18 @@ BW_ARGS=(
   --seed "${POISON_SEED}"
   --rows_per_shard "${ROWS_PER_SHARD}"
 )
+# Segment-method knobs (semantic-ID-prefix neighbourhood by default).
+if [ "${POISON_METHOD}" = "segment" ]; then
+  BW_ARGS+=(
+    --segment_by "${SEGMENT_BY:-semantic_id}"
+    --segment_prefix_len "${SEGMENT_PREFIX_LEN:-2}"
+    --segment_size "${SEGMENT_SIZE:-200}"
+  )
+  SID="${SEMANTIC_ID_PATH:-${GRID_SEMANTIC_ID_PATH:-}}"
+  if [ -n "${SID}" ]; then
+    BW_ARGS+=(--semantic_id_path "${SID}")
+  fi
+fi
 if [ -z "${USE_TFRECORD_SCAN:-}" ] && [ -f "${STATS_INTER}" ]; then
   echo "[$(date -Is)] ERASE-fast stats from ${STATS_INTER} (n_clean_users=${N_CLEAN_USERS:-<from .inter>})"
   BW_ARGS+=(--stats-inter "${STATS_INTER}")
@@ -94,7 +123,7 @@ if [ -n "${OVERWRITE}" ]; then
   BW_ARGS+=(--overwrite)
 fi
 
-echo "[$(date -Is)] Bandwagon poison: ${CLEAN_DIR} -> ${OUT_DIR}"
+echo "[$(date -Is)] ${POISON_METHOD} poison: ${CLEAN_DIR} -> ${OUT_DIR}"
 python -u -m src.data.poisoning.bandwagon "${BW_ARGS[@]}"
 
 echo "[$(date -Is)] Splitting training_forget / training_retain"

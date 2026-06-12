@@ -1,0 +1,15 @@
+# @package _global_
+
+# Seif = Gaussian-noise erase + repair fine-tune (NeurIPS-2023 Machine
+# Unlearning Challenge "noise + repair" winner). Distinct from scif (the
+# influence-function method).
+
+defaults:
+  - tiger_unlearn_scif_flat
+  - _self_
+
+unlearning:
+  algorithm: seif
+
+tags:
+  - amazon-p5-gr-unlearn-seif

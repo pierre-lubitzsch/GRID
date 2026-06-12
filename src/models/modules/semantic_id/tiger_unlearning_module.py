@@ -20,8 +20,10 @@ from src.components.unlearning.filter_utils import (
     save_filter_mask,
     scan_user_forget_items,
 )
+from src.components.unlearning.fanchuan import fanchuan_unlearn
 from src.components.unlearning.finetune import finetune_unlearn
 from src.components.unlearning.hvp import batch_size as tiger_batch_size
+from src.components.unlearning.kookmin import kookmin_unlearn
 from src.components.unlearning.neighborhood_sampler import (
     build_retain_subset,
     collect_items_in_shards,
@@ -29,6 +31,7 @@ from src.components.unlearning.neighborhood_sampler import (
 )
 from src.components.unlearning.neg_train import neg_train_unlearn
 from src.components.unlearning.scif import scif_unlearn
+from src.components.unlearning.seif import seif_unlearn
 from src.components.unlearning.unified import unified_unlearn
 from src.data.loading.utils import assign_files_to_workers
 from src.data.unlearning.deletion_spec import (
@@ -155,6 +158,26 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 device=device,
                 forget_manifest_path=forget_manifest_path,
             )
+        if algorithm in ("kookmin", "fanchuan", "seif"):
+            runner = {
+                "kookmin": self._run_kookmin,
+                "fanchuan": self._run_fanchuan,
+                "seif": self._run_seif,
+            }[algorithm]
+            return runner(
+                unlearning_cfg=unlearning_cfg,
+                train_dataloader_config=train_dataloader_config,
+                data_dir=data_dir,
+                forget_subdir=forget_subdir,
+                retain_subdir=retain_subdir,
+                retain_subset_dir=retain_subset_dir,
+                semantic_id_path=semantic_id_path,
+                forget_size_hint=forget_size_hint,
+                seed=seed,
+                num_hierarchies=num_hierarchies,
+                device=device,
+                forget_manifest_path=forget_manifest_path,
+            )
         raise ValueError(f"Unknown unlearning algorithm={algorithm!r}")
 
     def run_scif_unlearning(
@@ -257,14 +280,14 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         cfg = kwargs["unlearning_cfg"]
         t0 = time.time()
         local_repair = cfg.get("local_repair") or {}
-        n_batch_passes_cfg = cfg.get("n_batch_passes")
+        n_epochs_cfg = cfg.get("n_epochs")
         info = unified_unlearn(
             self,
             ctx["forget_batches"],
             ctx["retain_batches"],
             steps=int(cfg.get("unified_steps", 500)),
-            n_batch_passes=(
-                int(n_batch_passes_cfg) if n_batch_passes_cfg is not None else None
+            n_epochs=(
+                int(n_epochs_cfg) if n_epochs_cfg is not None else None
             ),
             lr=float(cfg.get("unified_lr", 1e-4)),
             lambda_forget=float(cfg.get("lambda_forget", 1.0)),
@@ -276,6 +299,80 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             neighbor_item_ids=ctx["neighborhood_centers"],
             sep_negative_item_ids=ctx["sep_negative_items"],
             local_repair_cfg=local_repair,
+            device=device,
+        )
+        info["wall_seconds"] = time.time() - t0
+        info.update(ctx["meta"])
+        return info
+
+    def _run_kookmin(self, **kwargs: Any) -> Dict[str, Any]:
+        ctx = self._prepare_unlearning_context(**kwargs)
+        device = kwargs.get("device") or next(self.parameters()).device
+        cfg = kwargs["unlearning_cfg"]
+        t0 = time.time()
+        info = kookmin_unlearn(
+            self,
+            ctx["forget_batches"],
+            ctx["retain_batches"],
+            init_rate=float(cfg.get("kookmin_init_rate", 0.01)),
+            neg_grad_sample_size=int(cfg.get("kookmin_neg_grad_sample_size", 128)),
+            retain_epochs=int(cfg.get("kookmin_retain_epochs", 1)),
+            retain_lr=float(cfg.get("kookmin_retain_lr", 1e-3)),
+            scale_for_reinit_params=float(cfg.get("kookmin_scale_for_reinit", 10.0)),
+            target_params_policy=str(cfg.get("target_params", "all")),
+            device=device,
+        )
+        info["wall_seconds"] = time.time() - t0
+        info.update(ctx["meta"])
+        return info
+
+    def _run_fanchuan(self, **kwargs: Any) -> Dict[str, Any]:
+        ctx = self._prepare_unlearning_context(**kwargs)
+        device = kwargs.get("device") or next(self.parameters()).device
+        cfg = kwargs["unlearning_cfg"]
+        t0 = time.time()
+        info = fanchuan_unlearn(
+            self,
+            ctx["forget_batches"],
+            ctx["retain_batches"],
+            lr=float(cfg.get("fanchuan_lr", 1e-3)),
+            uniform_epochs=int(cfg.get("fanchuan_uniform_epochs", 1)),
+            contrastive_iters=int(cfg.get("fanchuan_contrastive_iters", 8)),
+            contrastive_temperature=float(
+                cfg.get("fanchuan_contrastive_temperature", 1.15)
+            ),
+            retain_epochs_per_iter=int(cfg.get("fanchuan_retain_epochs_per_iter", 1)),
+            seed=int(kwargs.get("seed", 2)),
+            device=device,
+        )
+        info["wall_seconds"] = time.time() - t0
+        info.update(ctx["meta"])
+        return info
+
+    def _run_seif(self, **kwargs: Any) -> Dict[str, Any]:
+        ctx = self._prepare_unlearning_context(**kwargs)
+        device = kwargs.get("device") or next(self.parameters()).device
+        cfg = kwargs["unlearning_cfg"]
+        t0 = time.time()
+        keywords = cfg.get("seif_noise_param_keywords")
+        # `unlearning.n_epochs`, when set, is the shared "number of passes" knob
+        # and overrides the per-algorithm `seif_repair_epochs` default.
+        n_epochs_cfg = cfg.get("n_epochs")
+        repair_epochs = (
+            int(n_epochs_cfg)
+            if n_epochs_cfg is not None
+            else int(cfg.get("seif_repair_epochs", 4))
+        )
+        info = seif_unlearn(
+            self,
+            ctx["retain_batches"],
+            ctx["forget_batches"],
+            erase_std=float(cfg.get("seif_erase_std", 0.6)),
+            erase_std_final=float(cfg.get("seif_erase_std_final", 0.005)),
+            repair_epochs=repair_epochs,
+            repair_lr=float(cfg.get("seif_repair_lr", 7e-4)),
+            weight_decay=float(cfg.get("seif_weight_decay", 5e-4)),
+            noise_param_keywords=list(keywords) if keywords else None,
             device=device,
         )
         info["wall_seconds"] = time.time() - t0

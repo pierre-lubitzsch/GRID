@@ -643,6 +643,46 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             log_probs.append(log_p.gather(1, target.unsqueeze(1)).squeeze(1))
         return torch.stack(log_probs, dim=1).sum(dim=1).mean()
 
+    def compute_uniform_kl_loss(
+        self,
+        model_input: SequentialModelInputData,
+        label_data: SequentialModuleLabelData,
+    ) -> torch.Tensor:
+        """Symmetric-KL loss pushing the model's next-token distribution toward
+        uniform on the given (forget) batch.
+
+        TIGER adaptation of ERASE's
+        ``Trainer.unlearn_iterative_uniform_distribution``: where the reference
+        drives the *item* softmax toward uniform via
+        ``KLDiv(log p_model, uniform)``, TIGER is a token-generative model, so
+        we drive each hierarchy's next-token softmax (over the codebook
+        vocabulary of size ``num_embeddings_per_hierarchy``) toward uniform and
+        average across hierarchies. This is the Fanchuan stage-1 objective.
+        """
+        fut_ids = None
+        for label in label_data.labels:
+            fut_ids = label_data.labels[label].reshape(model_input.mask.size(0), -1)
+        model_output = self.forward(
+            attention_mask_encoder=model_input.mask,
+            future_ids=fut_ids,
+            **{
+                self.feature_to_model_input_map.get(k, k): v
+                for k, v in model_input.transformed_sequences.items()
+            },
+        )
+        # drop the trailing position that pairs with the prepended bos token
+        model_output = model_output[:, :-1]
+        kl = torch.nn.KLDivLoss(reduction="batchmean")
+        loss = model_output.new_zeros(())
+        for hierarchy in range(self.num_hierarchies):
+            logits = self.decoder.decoder_mlp[hierarchy](model_output[:, hierarchy])
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            uniform = torch.ones_like(probs) / probs.size(-1)
+            # KLDivLoss expects log-probabilities as the first argument and
+            # plain probabilities as the target (ERASE ``kl_loss_sym``).
+            loss = loss + kl(torch.log(probs + 1e-20), uniform)
+        return loss / self.num_hierarchies
+
     def _pooled_user_representation(
         self,
         model_input: SequentialModelInputData,

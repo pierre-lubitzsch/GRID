@@ -112,7 +112,10 @@ TS="$(date +%Y-%m-%d/%H-%M-%S)"
 RUN_LABEL="${DATASET}_${VARIANT}"
 if [ "${VARIANT}" = "poison" ]; then
   PCT_LABEL="$(python3 -c "r=${POISONING_RATIO}; print(f'pct{int(round(r*100))}')")"
-  RUN_LABEL="${RUN_LABEL}_${PCT_LABEL}_n${N_TARGET_ITEMS}"
+  # Tag the poison method (empty for bandwagon) so runs are self-describing.
+  POISON_METHOD="${POISON_METHOD:-bandwagon}"
+  if [ "${POISON_METHOD}" = "bandwagon" ]; then MTOK=""; else MTOK="_${POISON_METHOD}"; fi
+  RUN_LABEL="${RUN_LABEL}${MTOK}_${PCT_LABEL}_n${N_TARGET_ITEMS}"
 fi
 HYDRA_RUN_DIR="logs/train/runs/${TS}_job${JOB_ID}_${RUN_LABEL}"
 

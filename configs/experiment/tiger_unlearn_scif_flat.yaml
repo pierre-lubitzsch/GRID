@@ -21,6 +21,10 @@ ckpt_path: ???
 num_hierarchies: ???
 sequence_length: 120
 seed: 2
+# Poison forget_manifest sourcing the spam target set I_t for the SH@k / ASI@k
+# spam-exposure metrics. The unlearning data_dir is the poison dataset, so its
+# own manifest is the right default. Missing file -> SH/ASI silently skipped.
+spam_forget_manifest: ${data_dir}/forget_manifest.json
 
 # Forget/retain layout produced by `src.data.unlearning.split_forget_retain`
 forget_subdir: training_forget
@@ -70,10 +74,33 @@ unlearning:
   # Count when sep_negatives=random_retain (null → match neighbor set size).
   sep_num_random_negatives: null
   unified_steps: 500
-  # Alternative to unified_steps: total optim steps = n_batch_passes * min(n_forget_batches, n_retain_batches).
-  # If set (non-null), takes priority over unified_steps.
-  n_batch_passes: null
+  # Shared "number of passes/epochs" knob.
+  #   unified: total optim steps = n_epochs * min(n_forget_batches, n_retain_batches);
+  #            if set (non-null), takes priority over unified_steps.
+  #   seif:    number of repair epochs (overrides seif_repair_epochs).
+  # null → each algorithm uses its own per-algorithm default.
+  n_epochs: null
   unified_lr: 1.0e-4
+  # Kookmin (gradient-guided reinitialization + scaled retain repair)
+  kookmin_init_rate: 0.01
+  kookmin_neg_grad_sample_size: 128
+  kookmin_retain_epochs: 1
+  kookmin_retain_lr: 0.001
+  kookmin_scale_for_reinit: 10.0
+  # Fanchuan (uniform-pseudolabel KL + contrastive forget/retain)
+  fanchuan_lr: 0.001
+  fanchuan_uniform_epochs: 1
+  fanchuan_contrastive_iters: 8
+  fanchuan_contrastive_temperature: 1.15
+  fanchuan_retain_epochs_per_iter: 1
+  # Seif (Gaussian-noise erase + repair fine-tune; distinct from scif)
+  seif_erase_std: 0.6
+  seif_erase_std_final: 0.005
+  seif_repair_epochs: 4
+  seif_repair_lr: 0.0007
+  seif_weight_decay: 0.0005
+  # null → target params whose name contains "embedding" or "mlp"
+  seif_noise_param_keywords: null
   local_repair:
     enabled: false
     logit_suppression: false
@@ -338,3 +365,15 @@ eval:
       recall:
         _target_: src.components.eval_metrics.Recall
         _partial_: true
+    # Spam-exposure metrics (SH@k, ASI@k). The unlearning data_dir is the poison
+    # dataset, so its forget_manifest supplies the target set I_t. Skipped if absent.
+    spam_metrics:
+      SH:
+        _target_: src.components.eval_metrics.SpamHitRate
+        _partial_: true
+      ASI:
+        _target_: src.components.eval_metrics.AvgSpamItems
+        _partial_: true
+    forget_manifest_path: ${spam_forget_manifest}
+    semantic_id_path: ${semantic_id_path}
+    num_hierarchies: ${num_hierarchies}

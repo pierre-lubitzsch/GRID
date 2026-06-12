@@ -3,6 +3,11 @@ data_dir: ???
 semantic_id_path: ???
 num_hierarchies: ???
 sequence_length: 120
+# Poison forget_manifest used to source the spam target set I_t for the SH@k /
+# ASI@k spam-exposure metrics. Defaults to the dataset's own manifest (present
+# for poison datasets). For a clean-baseline run, override with the matching
+# poison dataset's manifest. Missing file -> SH/ASI silently skipped.
+spam_forget_manifest: ${data_dir}/forget_manifest.json
 
 task_name: train
 id: ${now:%Y-%m-%d}/${now:%H-%M-%S}
@@ -336,4 +341,17 @@ eval:
       recall:
         _target_: src.components.eval_metrics.Recall
         _partial_: true
+    # Spam-exposure metrics (SH@k, ASI@k). Skipped automatically if the
+    # forget_manifest is absent (e.g. clean dataset) -- point spam_forget_manifest
+    # at the poison dataset's manifest to measure clean-model baselines too.
+    spam_metrics:
+      SH:
+        _target_: src.components.eval_metrics.SpamHitRate
+        _partial_: true
+      ASI:
+        _target_: src.components.eval_metrics.AvgSpamItems
+        _partial_: true
+    forget_manifest_path: ${spam_forget_manifest}
+    semantic_id_path: ${semantic_id_path}
+    num_hierarchies: ${num_hierarchies}
 

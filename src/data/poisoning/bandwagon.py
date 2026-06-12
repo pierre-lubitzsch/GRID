@@ -393,6 +393,26 @@ def _build_sprinkled_sequence(
     return seq
 
 
+def _build_target_last_sequence(
+    length: int,
+    targets: List[int],
+    fillers: List[int],
+    rng: np.random.Generator,
+) -> List[int]:
+    """``[filler, filler, ..., filler, target]`` — the target is the LAST item.
+
+    Training supervises only the last item of each sequence (``NextKTokenMasking``
+    with ``next_k = num_hierarchies`` masks exactly the final item as the label),
+    so to teach the model to *generate* the target it must sit at the end. The
+    preceding context is drawn from ``fillers`` (e.g. the target's semantic-ID
+    neighbourhood) which conditions *when* the target is recommended.
+    """
+    n_ctx = max(1, length - 1)
+    seq = [int(rng.choice(fillers)) for _ in range(n_ctx)]
+    seq.append(int(rng.choice(targets)))
+    return seq
+
+
 def _build_spam_sequence(
     placement: str,
     length: int,
@@ -407,7 +427,167 @@ def _build_spam_sequence(
         return _build_sprinkled_sequence(
             length, targets, fillers, rng, p_two_targets=p_two_targets
         )
+    if placement == "target_last":
+        return _build_target_last_sequence(length, targets, fillers, rng)
     raise ValueError(f"Unknown placement={placement!r}")
+
+
+# ---------------------------------------------------------------------------
+# Segment + clone-append helpers (poison methods beyond bandwagon)
+# ---------------------------------------------------------------------------
+
+
+def _load_semantic_ids(path: str) -> np.ndarray:
+    """Load the per-item semantic-ID tensor ``[num_hierarchies, num_items]``.
+
+    Produced by the RKMeans / RVQ step (``merged_predictions_tensor.pt``);
+    column ``i`` is item ``i``'s codebook tuple, values in ``[0, codebook_size)``.
+    Two items sharing a longer code prefix are nearer in TIGER's own quantised
+    space, so prefix overlap is the natural similarity oracle for segmenting.
+    """
+    import torch  # local import: heavy, only needed for the segment method.
+
+    sem = torch.load(path, map_location="cpu", weights_only=False)
+    if not hasattr(sem, "numpy"):
+        raise ValueError(
+            f"Semantic-ID tensor at {path!r} is not a tensor (got {type(sem)})."
+        )
+    arr = sem.numpy()
+    if arr.ndim != 2:
+        raise ValueError(
+            f"Expected a 2-D [num_hierarchies, num_items] semantic-ID tensor; "
+            f"got shape {arr.shape} at {path!r}."
+        )
+    return arr.astype(np.int64)
+
+
+def _semantic_id_segment(
+    target: int,
+    sem_ids: np.ndarray,
+    prefix_len: int,
+) -> List[int]:
+    """Items sharing ``target``'s semantic-ID prefix of EXACTLY ``prefix_len``.
+
+    No auto-shortening: ``prefix_len`` is a hard minimum, so every segment member
+    shares at least that many of the target's leading codes. That is what makes
+    the (last-item) training label reinforce the target's code bucket and thus
+    promote the target at generation. The longer the prefix, the smaller and more
+    target-specific the bucket. The target itself is included; with a long enough
+    prefix the bucket can be just the target, so the spam sequence becomes
+    all-target — the strongest per-sequence push.
+    """
+    n_hier, n_items = sem_ids.shape
+    if not (0 <= target < n_items):
+        return []
+    plen = int(np.clip(prefix_len, 1, n_hier))
+    target_prefix = sem_ids[:plen, target]
+    match = np.all(sem_ids[:plen, :] == target_prefix[:, None], axis=0)
+    return [int(j) for j in np.nonzero(match)[0]]
+
+
+def _load_item_embeddings(items_dir: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Read ``items/`` shards -> ``(item_ids, embeddings)`` aligned row-for-row."""
+    shards = [
+        os.path.join(items_dir, f)
+        for f in sorted(os.listdir(items_dir))
+        if f.endswith(".tfrecord.gz")
+    ]
+    if not shards:
+        raise FileNotFoundError(f"No item shards under {items_dir}")
+    raw = tf.data.TFRecordDataset(shards, compression_type="GZIP")
+    feat = _infer_feature_description(next(iter(raw)))
+    for required in ("id", "embedding"):
+        if required not in feat:
+            raise ValueError(
+                f"Item shards lack a {required!r} feature; got {sorted(feat)}."
+            )
+    parsed = raw.map(lambda x: tf.io.parse_single_example(x, feat))
+    ids: List[int] = []
+    embs: List[np.ndarray] = []
+    for ex in parsed:
+        iid = tf.sparse.to_dense(ex["id"]).numpy().flatten()
+        emb = tf.sparse.to_dense(ex["embedding"]).numpy().flatten()
+        if iid.size == 0 or emb.size == 0:
+            continue
+        ids.append(int(iid[0]))
+        embs.append(emb.astype(np.float32))
+    return np.asarray(ids, dtype=np.int64), np.vstack(embs)
+
+
+def _embedding_segment(
+    target: int,
+    item_ids: np.ndarray,
+    embeddings: np.ndarray,
+    size: int,
+    exclude: set,
+) -> List[int]:
+    """Top-``size`` cosine-nearest items to ``target`` (excluding ``exclude``)."""
+    pos = np.nonzero(item_ids == target)[0]
+    if pos.size == 0:
+        return []
+    normed = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12)
+    sims = normed @ normed[pos[0]]
+    order = np.argsort(-sims)
+    members: List[int] = []
+    for idx in order:
+        iid = int(item_ids[idx])
+        if iid == target or iid in exclude:
+            continue
+        members.append(iid)
+        if len(members) >= size:
+            break
+    return members
+
+
+def _reservoir_sample_sequences(
+    shards: List[str], k: int, rng: np.random.Generator
+) -> List[List[int]]:
+    """One-pass reservoir sample of ``k`` real ``sequence_data`` sequences.
+
+    Used by the clone-append method to clone genuine browsing context before
+    appending the target click.
+    """
+    raw = tf.data.TFRecordDataset(shards, compression_type="GZIP")
+    feat = _infer_feature_description(next(iter(raw)))
+    parsed = raw.map(lambda x: tf.io.parse_single_example(x, feat))
+    reservoir: List[List[int]] = []
+    seen = 0
+    for ex in parsed:
+        seq = tf.sparse.to_dense(ex[SEQUENCE_FIELD]).numpy().flatten()
+        if seq.size == 0:
+            continue
+        seq_list = [int(x) for x in seq.tolist()]
+        if len(reservoir) < k:
+            reservoir.append(seq_list)
+        else:
+            j = int(rng.integers(0, seen + 1))
+            if j < k:
+                reservoir[j] = seq_list
+        seen += 1
+    return reservoir
+
+
+def _build_clone_append_sequence(
+    base_seq: List[int],
+    targets: List[int],
+    rng: np.random.Generator,
+    p_two_targets: float,
+    max_len: int,
+) -> List[int]:
+    """Clone a real sequence and append target(s) at the tail.
+
+    Models a hijacked / bot account: genuine browsing context followed by the
+    spam click(s). The target lands last so teacher forcing maximises the
+    ``real-prefix -> target`` gradient that then transfers to real users.
+    """
+    seq = list(base_seq)
+    n_targets = 2 if (len(targets) >= 2 and rng.random() < p_two_targets) else 1
+    chosen = rng.choice(targets, size=n_targets, replace=False)
+    budget = max(1, int(max_len) - n_targets)
+    if len(seq) > budget:
+        seq = seq[-budget:]
+    seq.extend(int(t) for t in chosen.tolist())
+    return seq
 
 
 # ---------------------------------------------------------------------------
@@ -480,11 +660,23 @@ def _write_spam_shards(
 # ---------------------------------------------------------------------------
 
 
-def _default_out_dir(data_dir: str, seed: int, ratio: float, n_targets: int) -> str:
+def method_suffix(method: str) -> str:
+    """Naming token for a poison method. Empty for ``bandwagon`` so existing
+    ``<base>_spam_seed..._pct..._n...`` datasets/runs keep their names; other
+    methods insert ``_<method>`` (e.g. ``_spam_segment_seed...``)."""
+    return "" if method == "bandwagon" else f"_{method}"
+
+
+def _default_out_dir(
+    data_dir: str, seed: int, ratio: float, n_targets: int, method: str = "bandwagon"
+) -> str:
     parent = os.path.dirname(os.path.abspath(data_dir.rstrip("/"))) or "."
     base = os.path.basename(os.path.abspath(data_dir.rstrip("/")))
     pct = int(round(ratio * 100))
-    return os.path.join(parent, f"{base}_spam_seed{seed}_pct{pct}_n{n_targets}")
+    return os.path.join(
+        parent,
+        f"{base}_spam{method_suffix(method)}_seed{seed}_pct{pct}_n{n_targets}",
+    )
 
 
 def _copy_clean_shards(src_training: str, dst_training: str, src_shards: List[str]) -> None:
@@ -525,7 +717,14 @@ def main(
     stats_inter: Optional[str] = None,
     n_clean_users: Optional[int] = None,
     deletion_spec: str = "session",
+    method: str = "bandwagon",
+    segment_by: str = "semantic_id",
+    semantic_id_path: Optional[str] = None,
+    segment_prefix_len: int = 2,
+    segment_size: int = 200,
 ) -> str:
+    if method not in ("bandwagon", "segment", "clone_append"):
+        raise ValueError(f"Unknown method={method!r}")
     np.random.seed(seed)
     random.seed(seed)
     rng = np.random.default_rng(seed)
@@ -595,7 +794,7 @@ def main(
             f"for n_clean_users={n_clean_users}; choose a larger ratio."
         )
     print(
-        f"[bandwagon] Will add {sessions_to_add} spam users to hit "
+        f"[{method}] Will add {sessions_to_add} spam users to hit "
         f"poisoning_ratio={poisoning_ratio:.4f}"
     )
 
@@ -604,26 +803,110 @@ def main(
         items_by_pop, target_strategy, n_target_items, rng
     )
     fillers = _filler_pool(attack, popular, average, items_by_pop)
+    target_set = set(target_items)
     print(
-        f"[bandwagon] popular={len(popular)} avg={len(average)} unpopular={len(unpopular)} "
+        f"[{method}] popular={len(popular)} avg={len(average)} unpopular={len(unpopular)} "
         f"| targets={target_items[:5]}{'...' if len(target_items) > 5 else ''} "
         f"| filler_pool={len(fillers)}"
     )
 
+    # --- Method-specific preparation -------------------------------------
+    segment_cache: Dict[int, List[int]] = {}
+    clone_pool: List[List[int]] = []
+    seg_resolved_path: Optional[str] = None
+    if method == "segment":
+        if segment_by == "semantic_id":
+            seg_resolved_path = semantic_id_path
+            if not seg_resolved_path:
+                base = os.path.basename(os.path.abspath(data_dir.rstrip("/")))
+                guess = os.path.join(
+                    "embeddings", base, "merged_predictions_tensor.pt"
+                )
+                if os.path.isfile(guess):
+                    seg_resolved_path = guess
+            if not seg_resolved_path or not os.path.isfile(seg_resolved_path):
+                raise FileNotFoundError(
+                    "segment_by=semantic_id needs a semantic-ID tensor; pass "
+                    "--semantic_id_path .../merged_predictions_tensor.pt "
+                    f"(tried {seg_resolved_path!r})."
+                )
+            sem_ids = _load_semantic_ids(seg_resolved_path)
+            print(
+                f"[segment] semantic IDs {sem_ids.shape} from {seg_resolved_path} "
+                f"| exact prefix_len={segment_prefix_len} (no shortening)"
+            )
+            for t in target_items:
+                segment_cache[t] = _semantic_id_segment(
+                    t, sem_ids, segment_prefix_len
+                )
+        else:  # embedding
+            item_ids_arr, emb_arr = _load_item_embeddings(
+                os.path.join(data_dir, "items")
+            )
+            print(
+                f"[segment] embeddings {emb_arr.shape} from items/ "
+                f"| neighbourhood size={segment_size}"
+            )
+            for t in target_items:
+                segment_cache[t] = _embedding_segment(
+                    t, item_ids_arr, emb_arr, segment_size, target_set
+                )
+        seg_sizes = [len(s) for s in segment_cache.values()]
+        empty = [t for t, s in segment_cache.items() if not s]
+        if empty:
+            print(
+                f"[segment] WARNING: {len(empty)} target(s) had an empty segment; "
+                f"falling back to the bandwagon filler pool for those."
+            )
+        print(
+            f"[segment] segment sizes: min={min(seg_sizes)} max={max(seg_sizes)} "
+            f"mean={sum(seg_sizes) / max(1, len(seg_sizes)):.1f}"
+        )
+    elif method == "clone_append":
+        print(
+            f"[clone_append] reservoir-sampling {sessions_to_add} real sequences "
+            f"to clone ..."
+        )
+        clone_pool = _reservoir_sample_sequences(clean_shards, sessions_to_add, rng)
+        if not clone_pool:
+            raise ValueError("clone_append found no real sequences to clone.")
+        print(f"[clone_append] cloned-sequence pool size={len(clone_pool)}")
+
+    max_len = int(seq_lengths.max())
+
     spam_user_ids: List[int] = []
     spam_sequences: List[List[int]] = []
-    target_set = set(target_items)
     n_target_clicks_per_session: List[int] = []
     for i in range(sessions_to_add):
-        length = _sample_session_length(seq_lengths, rng)
-        seq = _build_spam_sequence(
-            placement,
-            length,
-            target_items,
-            fillers,
-            rng,
-            p_two_targets=p_two_targets,
-        )
+        if method == "clone_append":
+            base_seq = clone_pool[int(rng.integers(0, len(clone_pool)))]
+            seq = _build_clone_append_sequence(
+                base_seq, target_items, rng, p_two_targets, max_len
+            )
+        elif method == "segment":
+            t = int(rng.choice(target_items))
+            seg_fillers = segment_cache.get(t) or fillers
+            length = _sample_session_length(seq_lengths, rng)
+            # Sequence is built from items sharing the target's semantic-ID prefix
+            # (the segment). Training supervises only the last item, but because
+            # every segment member shares the target's first-k codes, the label
+            # reinforces those shared codes and boosts the target's whole code
+            # bucket at generation -- so the target need NOT be the last item.
+            # The longer the shared prefix, the more specifically the target is
+            # promoted.
+            seq = _build_spam_sequence(
+                placement, length, [t], seg_fillers, rng, p_two_targets=p_two_targets
+            )
+        else:  # bandwagon
+            length = _sample_session_length(seq_lengths, rng)
+            seq = _build_spam_sequence(
+                placement,
+                length,
+                target_items,
+                fillers,
+                rng,
+                p_two_targets=p_two_targets,
+            )
         spam_user_ids.append(int(max_user_id + 1 + i))
         spam_sequences.append(seq)
         n_target_clicks_per_session.append(sum(1 for x in seq if x in target_set))
@@ -637,7 +920,7 @@ def main(
     else:
         target_stats = "target clicks/session: n/a"
     print(
-        f"[bandwagon] Generated {len(spam_user_ids)} spam users, "
+        f"[{method}] Generated {len(spam_user_ids)} spam users, "
         f"{n_clicks} total spam clicks "
         f"({n_clicks / max(1, len(spam_user_ids)):.2f} clicks/user) | "
         f"{target_stats}"
@@ -645,7 +928,11 @@ def main(
 
     if out_dir is None:
         out_dir = _default_out_dir(
-            data_dir, seed=seed, ratio=poisoning_ratio, n_targets=n_target_items
+            data_dir,
+            seed=seed,
+            ratio=poisoning_ratio,
+            n_targets=n_target_items,
+            method=method,
         )
     out_training_dir = os.path.join(out_dir, TRAINING_SUBDIR)
     if os.path.exists(out_dir):
@@ -675,9 +962,24 @@ def main(
     manifest = {
         "spam_user_ids": spam_user_ids,
         "target_items": target_items,
+        "method": method,
         "attack_type": attack,
         "target_strategy": target_strategy,
-        "placement": placement,
+        "placement": (
+            "append_last" if method == "clone_append" else placement
+        ),
+        "segment_by": segment_by if method == "segment" else None,
+        "segment_prefix_len": (
+            int(segment_prefix_len)
+            if method == "segment" and segment_by == "semantic_id"
+            else None
+        ),
+        "segment_size": (
+            int(segment_size)
+            if method == "segment" and segment_by == "embedding"
+            else None
+        ),
+        "semantic_id_path": seg_resolved_path if method == "segment" else None,
         "p_two_targets": float(p_two_targets) if placement == "sprinkled" else None,
         "poisoning_ratio": poisoning_ratio,
         "n_target_items": n_target_items,
@@ -729,9 +1031,63 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Output dir; defaults to <data_dir>_spam_seed<S>_pct<P>_n<C>",
     )
     p.add_argument(
+        "--method",
+        choices=("bandwagon", "segment", "clone_append"),
+        default="bandwagon",
+        help=(
+            "Poisoning method. 'bandwagon' (default): fake users mixing filler "
+            "items (--attack pool) with targets. 'segment': fillers drawn from "
+            "each target's semantic neighbourhood (--segment_by) — realistic "
+            "niche-targeted spam. 'clone_append': clone real sequences and "
+            "append the target at the tail — models hijacked/bot accounts."
+        ),
+    )
+    p.add_argument(
         "--attack",
         choices=("bandwagon", "random", "average", "push"),
         default="bandwagon",
+        help="Filler pool for method=bandwagon (ignored by segment/clone_append).",
+    )
+    p.add_argument(
+        "--segment_by",
+        choices=("semantic_id", "embedding"),
+        default="semantic_id",
+        help=(
+            "How to define a target's segment for method=segment. 'semantic_id' "
+            "(default): items sharing the target's semantic-ID code prefix. "
+            "'embedding': cosine-nearest items from the items/ embeddings."
+        ),
+    )
+    p.add_argument(
+        "--semantic_id_path",
+        default=None,
+        help=(
+            "Per-item semantic-ID tensor (merged_predictions_tensor.pt) for "
+            "method=segment --segment_by=semantic_id. Defaults to "
+            "embeddings/<dataset>/merged_predictions_tensor.pt."
+        ),
+    )
+    p.add_argument(
+        "--segment_prefix_len",
+        type=int,
+        default=2,
+        help=(
+            "Semantic-ID code prefix length defining a segment, used as a HARD "
+            "minimum (no shortening). Higher = smaller, more target-specific "
+            "bucket; with a long enough prefix the bucket is just the target. "
+            "Only the leading codes shared by the segment get reinforced, so "
+            "this directly controls attack specificity. (semantic_id only)"
+        ),
+    )
+    p.add_argument(
+        "--segment_size",
+        type=int,
+        default=200,
+        help=(
+            "Neighbourhood size for --segment_by=embedding only. Ignored by "
+            "--segment_by=semantic_id, where --segment_prefix_len controls the "
+            "bucket."
+        ),
     )
     p.add_argument(
         "--target_strategy",
@@ -742,14 +1098,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--n_target_items", type=int, default=10)
     p.add_argument(
         "--placement",
-        choices=("sprinkled", "alternating"),
+        choices=("sprinkled", "alternating", "target_last"),
         default="sprinkled",
         help=(
             "Spam-sequence pattern. 'sprinkled' (default) matches the "
             "rsc15_fraud_sessions_* distribution: 1 target per session "
             "(occasionally 2) at random positions in [0.2*L, 0.9*L]. "
             "'alternating' interleaves [filler, target, filler, target, ...] "
-            "for the entire sequence -- much stronger attack."
+            "for the entire sequence. 'target_last' puts the target as the LAST "
+            "item (= the training label, since NextKTokenMasking with "
+            "next_k=num_hierarchies supervises only the final item). Used by "
+            "method=clone_append (real context cannot promote the target via "
+            "shared codes, so it must be the label). method=segment does NOT need "
+            "it: its context items share the target's semantic-ID prefix, so the "
+            "label reinforces the target's code bucket regardless of position."
         ),
     )
     p.add_argument(
@@ -812,4 +1174,9 @@ if __name__ == "__main__":
         stats_inter=args.stats_inter,
         n_clean_users=args.n_clean_users,
         deletion_spec=args.deletion_spec,
+        method=args.method,
+        segment_by=args.segment_by,
+        semantic_id_path=args.semantic_id_path,
+        segment_prefix_len=args.segment_prefix_len,
+        segment_size=args.segment_size,
     )

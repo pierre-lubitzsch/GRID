@@ -281,7 +281,10 @@ Can also be set via `UNLEARN_ALGORITHM=<algo>` env var.
 | Algorithm | What it does | Key hyperparams |
 |---|---|---|
 | `scif` (default) | Single-shot Newton update via Conjugate Gradient | `damping`, `cg_max_iter`, `update_max_norm`, `target_params` |
-| `unified` | Combined loss: L_retain + λ·L_forget + λ·L_sep | `lambda_forget`, `lambda_sep`, `unified_steps` / `n_batch_passes`, `unified_lr` |
+| `seif` | Gaussian-noise erase + repair fine-tune (≠ scif) | `seif_erase_std`, `seif_erase_std_final`, `seif_repair_epochs` / `n_epochs`, `seif_repair_lr`, `seif_noise_param_keywords` |
+| `kookmin` | Gradient-guided per-layer reinit + scaled retain repair | `kookmin_init_rate`, `kookmin_neg_grad_sample_size`, `kookmin_retain_epochs`, `kookmin_retain_lr`, `kookmin_scale_for_reinit` |
+| `fanchuan` | Uniform-pseudolabel KL + contrastive forget/retain | `fanchuan_lr`, `fanchuan_uniform_epochs`, `fanchuan_contrastive_iters`, `fanchuan_contrastive_temperature`, `fanchuan_retain_epochs_per_iter` |
+| `unified` | Combined loss: L_retain + λ·L_forget + λ·L_sep | `lambda_forget`, `lambda_sep`, `unified_steps` / `n_epochs`, `unified_lr` |
 | `finetune` | Continue training on retain-only data (Adam) | `finetune_steps`, `finetune_lr` |
 | `neg_train` | Gradient ascent on forget + retain CE every N steps | `neg_train_steps`, `neg_train_lr`, `neg_retain_every` |
 | `filter` | Decode-time output masking, no weight update | `filter_mode` (`global` \| `user_dependent`) |
@@ -292,9 +295,21 @@ Can also be set via `UNLEARN_ALGORITHM=<algo>` env var.
 # SCIF (default) — neighborhood-aware retain sampling recommended
 sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 scif "${SID}" true 8 1.0
 
+# Seif (Gaussian-noise erase + repair; n_epochs = repair epochs)
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 seif "${SID}" false 8 1.0 \
+    unlearning.seif_erase_std=0.6 unlearning.n_epochs=4 unlearning.seif_repair_lr=7e-4
+
+# Kookmin (gradient-guided reinit + retain repair)
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 kookmin "${SID}" false 8 1.0 \
+    unlearning.kookmin_init_rate=0.01 unlearning.kookmin_retain_epochs=1 unlearning.kookmin_scale_for_reinit=10
+
+# Fanchuan (uniform-KL + contrastive)
+sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 fanchuan "${SID}" false 8 1.0 \
+    unlearning.fanchuan_contrastive_iters=8 unlearning.fanchuan_contrastive_temperature=1.15 unlearning.fanchuan_lr=1e-3
+
 # Unified objective
 sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 unified "${SID}" false 8 1.0 \
-    unlearning.lambda_forget=1.0 unlearning.lambda_sep=0.1 unlearning.unified_steps=500
+    unlearning.lambda_forget=1.0 unlearning.lambda_sep=0.1 unlearning.n_epochs=4
 
 # Fine-tune on retain data
 sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 finetune "${SID}" false 8 1.0 \
@@ -419,21 +434,22 @@ start of each call and recorded in the result dict.
 **Sizing the loop.** Two equivalent knobs:
 
 - `unlearning.unified_steps=N` — total optimizer updates (default 500).
-- `unlearning.n_batch_passes=N` — total full passes over the batches.
+- `unlearning.n_epochs=N` — total full passes over the batches.
   One pass = `min(n_forget_batches, n_retain_batches)` optimizer steps with
   balanced accumulation, so this expands to
   `unified_steps = N * min(n_forget, n_retain)`. Takes priority over
-  `unified_steps` when set.
+  `unified_steps` when set. (`n_epochs` is the shared passes/epochs knob —
+  for `seif` it sets the number of repair epochs.)
 
 Per-step wall-time grows roughly with `q_forget + q_retain`. With a small
 forget set (typical), `q_retain` ≈ `n_retain_batches / n_forget_batches`, so a
-4-vs-51 imbalance makes each step ~13× heavier — prefer `n_batch_passes` to
+4-vs-51 imbalance makes each step ~13× heavier — prefer `n_epochs` to
 stay step-count-aware of the imbalance, or lower `unified_steps` manually.
 
 ```bash
 # Run 3 full passes through the batches (auto-scaled per request)
 sbatch run_tiger_unlearn_sequential.sh "${POISON_CKPT}" rsc15 unified "${SID}" false 8 1.0 \
-    unlearning.n_batch_passes=3 unlearning.lambda_forget=1.0 unlearning.lambda_sep=0.1
+    unlearning.n_epochs=3 unlearning.lambda_forget=1.0 unlearning.lambda_sep=0.1
 ```
 
 ### 6e — Deletion specification
@@ -750,15 +766,35 @@ SID_TEST=embeddings/test_rsc15_seed_2/merged_predictions_tensor.pt
 sbatch run_tiger_train.sh test_rsc15_seed_2 clean "${SID_TEST}"
 CLEAN_CKPT_TEST=logs/train/runs/2026-05-26/16-22-13/checkpoints/<latest>.ckpt
 
+# beauty sanity check clean run:
+sbatch run_tiger_train.sh beauty clean embeddings/beauty/merged_predictions_tensor.pt
+Submitted batch job 9465564
+
 # DATASET beauty:
-# clean: 9096928 -> recall@5 ~ 0.0453
-# poison: 9096933 -> recall@5 ~ 0.0444
+# clean: 9096928 -> recall@5 ~ 0.04525, ndcg@10 ~ 0.03763
+# poison bandwagon 0.01: 9096933 -> recall@5 ~ 0.04440, ndcg@10 ~ 0.03692
+# poison clone_append 0.01: 9391639 -> recall@5 ~ 0.04472, ndcg@10 ~ 0.03595
+# poison clone_append 0.05: 9439578 -> recall@5 ~ 0.04306, ndcg@10 ~ 0.03607, ASI@10 ~ 0.00060, SH@10 ~ 0.00595
+# poison clone_append 0.1: 9439576 -> recall@5 ~ 0.04101, ndcg@10 ~ 0.03392, ASI@10 ~ 0.01913, SH@10 ~ 0.15745
+# poison segment 0.01: 9420383 -> recall@5 ~ 0.04695, ndcg@10 ~ 0.03866 (higher metrics than clean? only noise...)
+# poison segment 0.05: 9439577 -> recall@5 ~ , ndcg@10 ~ , ASI@10 ~ , SH@10 ~ 
+# poison segment 0.1: 9439575 -> recall@5 ~ 0.04704, ndcg@10 ~ 0.03838, ASI@10 ~ 0.00279, SH@10 ~ 0.02761
+
 
 
 # Step 4: poison --- job 9019345
 sbatch run_rsc15_poison.sh test_rsc15_seed_2          # default pct1_n10
 # sbatch run_rsc15_poison.sh test_rsc15_seed_2 0.05   # example: pct5
 POISON_DIR_TEST=src/data/erase_data/test_rsc15_seed_2_spam_seed2_pct1_n10  # adjust for non-default params
+
+# poison beauty segment:
+POISON_METHOD=segment POISONING_RATIO=0.01 N_TARGET_ITEMS=10 POISON_SEED=2 SEGMENT_BY=semantic_id SEGMENT_PREFIX_LEN=2 SEGMENT_SIZE=200 OVERWRITE=1 sbatch run_rsc15_poison.sh beauty
+Submitted batch job 9390729
+
+# poison beauty clone_append
+POISON_METHOD=clone_append POISONING_RATIO=0.01 N_TARGET_ITEMS=10 POISON_SEED=2 OVERWRITE=1 sbatch run_rsc15_poison.sh beauty
+Submitted batch job 9391188
+
 
 # Step 5: poisoned training ---
 # pct 0.01, ntarget 10: job 9019894
@@ -767,6 +803,31 @@ POISON_DIR_TEST=src/data/erase_data/test_rsc15_seed_2_spam_seed2_pct1_n10  # adj
 # Add args 4/5 for non-default ratio/n_target: sbatch run_tiger_train.sh test_rsc15_seed_2 poison "${SID_TEST}" 0.05 10
 sbatch run_tiger_train.sh test_rsc15_seed_2 poison "${SID_TEST}"
 POISON_CKPT_TEST=logs/train/runs/2026-05-26/16-42-29/checkpoints/<latest>.ckpt
+
+
+
+
+# beauty poisoned training:
+
+POISON_METHOD=segment POISONING_RATIO=0.01 N_TARGET_ITEMS=10 POISON_SEED=2 sbatch run_tiger_train.sh beauty poison embeddings/beauty/merged_predictions_tensor.pt
+Submitted batch job 9420383
+
+POISON_METHOD=clone_append POISONING_RATIO=0.01 N_TARGET_ITEMS=10 POISON_SEED=2 sbatch run_tiger_train.sh beauty poison embeddings/beauty/merged_predictions_tensor.pt
+Submitted batch job 9391639
+
+
+POISON_METHOD=segment POISONING_RATIO=0.1 N_TARGET_ITEMS=10 POISON_SEED=2 sbatch run_tiger_train.sh beauty poison embeddings/beauty/merged_predictions_tensor.pt
+Submitted batch job 9439575
+
+POISON_METHOD=clone_append POISONING_RATIO=0.1 N_TARGET_ITEMS=10 POISON_SEED=2 sbatch run_tiger_train.sh beauty poison embeddings/beauty/merged_predictions_tensor.pt
+Submitted batch job 9439576
+
+POISON_METHOD=segment POISONING_RATIO=0.05 N_TARGET_ITEMS=10 POISON_SEED=2 sbatch run_tiger_train.sh beauty poison embeddings/beauty/merged_predictions_tensor.pt
+Submitted batch job 9439577
+
+POISON_METHOD=clone_append POISONING_RATIO=0.05 N_TARGET_ITEMS=10 POISON_SEED=2 sbatch run_tiger_train.sh beauty poison embeddings/beauty/merged_predictions_tensor.pt
+Submitted batch job 9439578
+
 
 # Step 6: unlearn
 ALGO=scif                # scif | unified | finetune | neg_train | filter
@@ -979,6 +1040,43 @@ recall@5 ~ 0.04275, ndcg@10 ~ 0.03568
 # (Caveat: on test_rsc15_seed_2 the only lf=0 comparison is ls=0.1 session 9097282 0.43148 vs ls=0.0
 #  session 9097283 0.43165 — there ls=0.1 is marginally worse; ls=1.0 untested on rsc15.)
 # -> table: tables/beauty_finetune_vs_sep.tex
+
+# Seif
+
+sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty seif embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_epochs=4
+Submitted batch job 9360359
+recall@5 ~ 0.0, ndcg@10: 0.0
+
+# Lower Seif std:
+sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty seif embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_epochs=4 unlearning.seif_erase_std=0.007 unlearning.seif_erase_std_final=0.0001
+Submitted batch job 9361109
+recall@5 ~ 0.02826, ndcg@10: 0.02384
+
+
+# Kookmin
+
+sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty kookmin embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_epochs=4
+Submitted batch job 9360365
+recall@5 ~ 0.03269, ndcg@10: 0.02646
+
+
+sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty kookmin embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_epochs=4 unlearning.kookmin_init_rate=0.001
+Submitted batch job 9364122
+
+
+sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty kookmin embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_epochs=4 unlearning.kookmin_init_rate=0.0001
+Submitted batch job 9364123
+
+
+
+# Fanchuan
+
+sbatch run_tiger_unlearn_sequential.sh 'logs/train/runs/2026-05-29/14-07-44_job9096933_beauty_poison_pct1_n10/checkpoints/checkpoint_epoch=000_step=004000.ckpt' beauty fanchuan embeddings/beauty/merged_predictions_tensor.pt false 1 0.0 unlearning.n_unlearning_chunks=10 unlearning.n_epochs=4
+Submitted batch job 9360367
+recall@5 ~ 0.01618, ndcg@10: 0.01393
+
+
+
 
 
 # Step 7: evaluate

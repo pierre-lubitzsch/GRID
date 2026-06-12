@@ -1,7 +1,7 @@
 # Shared unlearning defaults — included by experiment configs via defaults list.
 
 unlearning:
-  algorithm: scif  # scif | unified | finetune | neg_train | filter | retrain
+  algorithm: scif  # scif | seif | kookmin | fanchuan | unified | finetune | neg_train | filter | retrain
   deletion_spec: session  # session | item | item_pairs
   # item_pairs mode: unlearn only the (prefix → target_item) training pairs
   # from spam sessions.  Set unlearn_whole_items: true to also unlearn those
@@ -69,10 +69,36 @@ unlearning:
   # (null → match the size of the default neighbor negative set).
   sep_num_random_negatives: null
   unified_steps: 500
-  # Alternative to unified_steps: total optim steps = n_batch_passes * min(n_forget_batches, n_retain_batches).
-  # If set, takes priority over unified_steps.
-  n_batch_passes: null
+  # Shared "number of passes/epochs" knob.
+  #   unified: total optim steps = n_epochs * min(n_forget_batches, n_retain_batches);
+  #            if set, takes priority over unified_steps.
+  #   seif:    number of repair epochs (overrides seif_repair_epochs).
+  # null → each algorithm uses its own per-algorithm default.
+  n_epochs: null
   unified_lr: 1.0e-4
+
+  # Kookmin (gradient-guided reinitialization + scaled retain repair)
+  kookmin_init_rate: 0.01
+  kookmin_neg_grad_sample_size: 128
+  kookmin_retain_epochs: 1
+  kookmin_retain_lr: 0.001
+  kookmin_scale_for_reinit: 10.0
+
+  # Fanchuan (uniform-pseudolabel KL + contrastive forget/retain)
+  fanchuan_lr: 0.001
+  fanchuan_uniform_epochs: 1
+  fanchuan_contrastive_iters: 8
+  fanchuan_contrastive_temperature: 1.15
+  fanchuan_retain_epochs_per_iter: 1
+
+  # Seif (Gaussian-noise erase + repair fine-tune; distinct from scif)
+  seif_erase_std: 0.6
+  seif_erase_std_final: 0.005
+  seif_repair_epochs: 4
+  seif_repair_lr: 0.0007
+  seif_weight_decay: 0.0005
+  # null → target params whose name contains "embedding" or "mlp"
+  seif_noise_param_keywords: null
 
   # Step 4 local repair (optional, default off)
   local_repair:
