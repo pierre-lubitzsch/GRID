@@ -117,18 +117,40 @@ if [ "${VARIANT}" = "poison" ]; then
   if [ "${POISON_METHOD}" = "bandwagon" ]; then MTOK=""; else MTOK="_${POISON_METHOD}"; fi
   RUN_LABEL="${RUN_LABEL}${MTOK}_${PCT_LABEL}_n${N_TARGET_ITEMS}"
 fi
-if [ -n "${PKM_MODE:-}" ]; then
-  RUN_LABEL="${RUN_LABEL}_pkm${PKM_MODE}"
-fi
+case "$(printf '%s' "${PKM_MODE:-}" | tr '[:upper:]' '[:lower:]')" in
+  add|replace) RUN_LABEL="${RUN_LABEL}_pkm$(printf '%s' "${PKM_MODE}" | tr '[:upper:]' '[:lower:]')" ;;
+esac
 HYDRA_RUN_DIR="logs/train/runs/${TS}_job${JOB_ID}_${RUN_LABEL}"
 
-# Optional Hydra overrides. PKM_MODE (replace|add) overrides model.pkm_mode so
-# two jobs sharing tiger_train_flat.yaml don't race on the config value. Any
-# trailing args (positions 6+) are forwarded verbatim as extra Hydra overrides.
+# Optional Hydra overrides. PKM is gated entirely by PKM_MODE:
+#   PKM_MODE=replace|add  -> PKM ON. Default layer set = decoder blocks [0,1]
+#                            (the historical default). Customize the targeted
+#                            blocks with PKM_DECODER / PKM_ENCODER ("0,1", "all").
+#   unset / none / null / off / "" -> PKM OFF (no pkm_layers override; the config
+#                            default model.pkm_layers=null applies).
+# Any trailing args (positions 6+) are forwarded verbatim as extra Hydra overrides.
 EXTRA_OVERRIDES=()
-if [ -n "${PKM_MODE:-}" ]; then
-  EXTRA_OVERRIDES+=("model.pkm_mode=${PKM_MODE}")
-fi
+PKM_MODE_LC="$(printf '%s' "${PKM_MODE:-}" | tr '[:upper:]' '[:lower:]')"
+case "${PKM_MODE_LC}" in
+  add|replace)
+    # normalize a layer selector: ""->null, "all"/"null" passthrough, "0,1"->[0,1]
+    pkm_sel() {
+      case "${1:-}" in
+        "")          echo "null" ;;
+        all|null)    echo "$1" ;;
+        *)           echo "[$1]" ;;
+      esac
+    }
+    PKM_ENC="$(pkm_sel "${PKM_ENCODER:-}")"
+    if [ -n "${PKM_DECODER:-}" ]; then PKM_DEC="$(pkm_sel "${PKM_DECODER}")"; else PKM_DEC="[0,1]"; fi
+    EXTRA_OVERRIDES+=("model.pkm_layers={encoder:${PKM_ENC},decoder:${PKM_DEC}}")
+    EXTRA_OVERRIDES+=("model.pkm_mode=${PKM_MODE_LC}")
+    ;;
+  ""|none|null|off|false)
+    : ;;  # PKM off — emit nothing
+  *)
+    echo "Unknown PKM_MODE='${PKM_MODE}' (expected add|replace|none)"; exit 1 ;;
+esac
 
 echo "[$(date -Is)] Starting tiger train (tiger_train_flat) dataset=${DATASET} variant=${VARIANT}"
 echo "Using data_dir=${DATA_DIR}"

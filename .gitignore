@@ -196,3 +196,5 @@ cython_debug/
 # XLM for product key memory
 XLM/
 
+# used for documenting experiments
+WORKFLOW.md

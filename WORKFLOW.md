@@ -770,6 +770,15 @@ CLEAN_CKPT_TEST=logs/train/runs/2026-05-26/16-22-13/checkpoints/<latest>.ckpt
 sbatch run_tiger_train.sh beauty clean embeddings/beauty/merged_predictions_tensor.pt
 Submitted batch job 9465564
 
+# PKM
+
+PKM_MODE=replace sbatch run_tiger_train.sh beauty clean embeddings/beauty/merged_predictions_tensor.pt
+Submitted batch job 9576516
+
+PKM_MODE=add sbatch run_tiger_train.sh beauty clean embeddings/beauty/merged_predictions_tensor.pt
+Submitted batch job 9576518
+
+
 # DATASET beauty:
 # clean: 9096928 -> recall@5 ~ 0.04525, ndcg@10 ~ 0.03763
 # poison bandwagon 0.01: 9096933 -> recall@5 ~ 0.04440, ndcg@10 ~ 0.03692

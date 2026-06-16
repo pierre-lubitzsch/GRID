@@ -257,9 +257,11 @@ model:
   # NOTE: in 'replace' mode the targeted layers are excluded from the
   # mlp_layers bloating above. The value store holds pkm_params.n_keys ** 2
   # vectors of size d_model, so n_keys is the dominant capacity/parameter knob.
-  pkm_layers:
-    encoder: null
-    decoder: [0, 1]
+  #
+  # DEFAULT: no PKM. Enable it explicitly via a Hydra override, e.g.
+  #   'model.pkm_layers={encoder:null,decoder:[0,1]}'
+  # or via the PKM_DECODER / PKM_ENCODER env knobs in run_tiger_train.sh.
+  pkm_layers: null
   pkm_mode: replace
   pkm_params:
     # Product-key dim = d_model (=k_dim): two sub-keys of d_model/2 each are
