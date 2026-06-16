@@ -287,6 +287,22 @@ model:
   num_user_bins: null
   codebooks: ${data_loading.train_dataloader_config.dataloader.dataset_config.semantic_id_map.sequence_data}
   mlp_layers: 2
+  # Must mirror tiger_train_flat.yaml so the checkpoint schema stays identical.
+  # See that file for the meaning of pkm_layers / pkm_mode / pkm_params.
+  pkm_layers:
+    encoder: null
+    decoder: [0, 1]
+  pkm_mode: replace
+  pkm_params:
+    k_dim: ${model.huggingface_model.config.d_model}
+    heads: 4
+    knn: 32
+    n_keys: 512
+    query_batchnorm: false
+    input_dropout: 0.0
+    query_dropout: 0.0
+    value_dropout: 0.0
+    sparse: false
 
 # Callbacks: keep a model-summary, drop everything fit-related --------------
 # `defaults: callbacks: default` inherits a model_checkpoint/early_stopping

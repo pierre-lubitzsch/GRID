@@ -117,19 +117,35 @@ if [ "${VARIANT}" = "poison" ]; then
   if [ "${POISON_METHOD}" = "bandwagon" ]; then MTOK=""; else MTOK="_${POISON_METHOD}"; fi
   RUN_LABEL="${RUN_LABEL}${MTOK}_${PCT_LABEL}_n${N_TARGET_ITEMS}"
 fi
+if [ -n "${PKM_MODE:-}" ]; then
+  RUN_LABEL="${RUN_LABEL}_pkm${PKM_MODE}"
+fi
 HYDRA_RUN_DIR="logs/train/runs/${TS}_job${JOB_ID}_${RUN_LABEL}"
+
+# Optional Hydra overrides. PKM_MODE (replace|add) overrides model.pkm_mode so
+# two jobs sharing tiger_train_flat.yaml don't race on the config value. Any
+# trailing args (positions 6+) are forwarded verbatim as extra Hydra overrides.
+EXTRA_OVERRIDES=()
+if [ -n "${PKM_MODE:-}" ]; then
+  EXTRA_OVERRIDES+=("model.pkm_mode=${PKM_MODE}")
+fi
 
 echo "[$(date -Is)] Starting tiger train (tiger_train_flat) dataset=${DATASET} variant=${VARIANT}"
 echo "Using data_dir=${DATA_DIR}"
 echo "Using semantic_id_path=${SEMANTIC_ID_PATH}"
 echo "Run dir: ${HYDRA_RUN_DIR}"
+if [ "${#EXTRA_OVERRIDES[@]}" -gt 0 ] || [ "$#" -ge 6 ]; then
+  echo "Extra Hydra overrides: ${EXTRA_OVERRIDES[*]:-} ${*:6}"
+fi
 
 python -u -m src.train \
   experiment=tiger_train_flat \
   data_dir="${DATA_DIR}" \
   "semantic_id_path='${SEMANTIC_ID_PATH}'" \
   num_hierarchies=4 \
-  hydra.run.dir="${HYDRA_RUN_DIR}"
+  hydra.run.dir="${HYDRA_RUN_DIR}" \
+  ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"} \
+  "${@:6}"
 
 LATEST_CKPT="$(ls -t logs/train/runs/*/*/checkpoints/*.ckpt 2>/dev/null | head -n1 || true)"
 if [ -n "${LATEST_CKPT}" ]; then

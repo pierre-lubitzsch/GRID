@@ -1,5 +1,6 @@
 import logging
-from typing import Any, Dict, Optional, Set, Tuple, Union
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import transformers
@@ -15,6 +16,7 @@ from src.data.loading.components.interfaces import (
 )
 from src.models.components.interfaces import OneKeyPerPredictionOutput
 from src.models.components.network_blocks.mlp import MLP
+from src.models.components.network_blocks.product_key_memory import HashingMemory
 from src.models.modules.huggingface.transformer_base_module import TransformerBaseModule
 from src.utils.utils import (
     delete_module,
@@ -490,6 +492,9 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         num_embeddings_per_hierarchy: int = None,
         num_user_bins: Optional[int] = None,
         mlp_layers: Optional[int] = None,
+        pkm_layers: Optional[Union[str, Dict[str, Any]]] = None,
+        pkm_params: Optional[Dict[str, Any]] = None,
+        pkm_mode: str = "replace",
         should_check_prefix: bool = False,
         should_add_sep_token: bool = True,
         prediction_key_name: str = "user_id",
@@ -557,6 +562,12 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             ),
         )
 
+        # Replace selected T5 feed-forward sub-layers with Product-Key Memory
+        # layers. Runs before the mlp_layers bloating below so that PKM-selected
+        # layers stay PKM and only the remaining FFNs get bloated.
+        if pkm_layers is not None:
+            self._install_pkm_layers(pkm_layers, dict(pkm_params or {}), pkm_mode)
+
         if mlp_layers is not None:
             # bloating the mlp layers in both encoder and decoder
             # TODO (clark): this currently only works for T5
@@ -609,6 +620,72 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self.forbidden_sids = forbidden_sids
         self.filter_mode = filter_mode
         self.user_forbidden_items = user_forbidden_items
+
+    def _install_pkm_layers(
+        self,
+        pkm_layers: Union[str, Dict[str, Any]],
+        pkm_params: Dict[str, Any],
+        pkm_mode: str = "replace",
+    ) -> None:
+        """Add Product-Key Memory to selected T5 feed-forward sub-layers.
+
+        ``pkm_layers`` selects which feed-forward layers are targeted:
+            * ``"all"``: every FFN in both encoder and decoder.
+            * a mapping ``{"encoder": <sel>, "decoder": <sel>}`` where each
+              ``<sel>`` is ``None`` (none), ``"all"``, or a list of 0-indexed
+              transformer block ids.
+        ``None`` (handled by the caller) means no PKM anywhere.
+
+        ``pkm_mode`` controls how the PKM relates to the existing FFN:
+            * ``"replace"``: swap the FFN for a PKM (:class:`T5LayerPKM`).
+            * ``"add"``: keep the FFN and run a PKM in parallel on the same
+              input, summing their outputs (:class:`T5LayerFFWithPKM`).
+
+        ``pkm_params`` is forwarded to :class:`HashingMemory` (k_dim, heads,
+        knn, n_keys, dropouts, query_batchnorm, sparse).
+        """
+        if pkm_mode not in ("replace", "add"):
+            raise ValueError(
+                f"Unknown pkm_mode: {pkm_mode!r} (expected 'replace' or 'add')"
+            )
+        # Collect the FFN module names per subtree, keyed by transformer block id.
+        enc_ffns: Dict[int, str] = {}
+        dec_ffns: Dict[int, str] = {}
+        for name, module in self.named_modules():
+            if isinstance(module, transformers.models.t5.modeling_t5.T5LayerFF):
+                match = re.search(r"block\.(\d+)\.", name)
+                if match is None:
+                    continue
+                block_id = int(match.group(1))
+                if name.startswith("encoder"):
+                    enc_ffns[block_id] = name
+                elif name.startswith("decoder"):
+                    dec_ffns[block_id] = name
+
+        enc_ids, dec_ids = _resolve_pkm_selection(
+            pkm_layers, sorted(enc_ffns), sorted(dec_ffns)
+        )
+
+        config = self.encoder.encoder.config
+        target_names = [enc_ffns[i] for i in enc_ids] + [dec_ffns[i] for i in dec_ids]
+        for name in target_names:
+            parent_module, attr_name = get_parent_module_and_attr(self, name)
+            if pkm_mode == "replace":
+                new_module = T5LayerPKM(config=config, pkm_params=pkm_params)
+            else:  # "add": keep the existing FFN and run a PKM in parallel
+                existing_ffn = getattr(parent_module, attr_name)
+                new_module = T5LayerFFWithPKM(
+                    ffn=existing_ffn, config=config, pkm_params=pkm_params
+                )
+            setattr(parent_module, attr_name, new_module)
+
+        logging.info(
+            "Installed PKM layers (mode=%s) -> encoder blocks %s, decoder blocks %s (params=%s)",
+            pkm_mode,
+            sorted(enc_ids),
+            sorted(dec_ids),
+            pkm_params,
+        )
 
     def _batch_loss_from_model_step(
         self,
@@ -1310,6 +1387,95 @@ class SemanticIDEncoderModule(torch.nn.Module):
         )
         embeddings = encoder_output.last_hidden_state
         return embeddings
+
+
+def _resolve_pkm_selection(
+    pkm_layers: Union[str, Dict[str, Any]],
+    enc_ids: List[int],
+    dec_ids: List[int],
+) -> Tuple[List[int], List[int]]:
+    """Resolve a ``pkm_layers`` selector into concrete (encoder, decoder) block ids.
+
+    ``enc_ids`` / ``dec_ids`` are the sorted lists of available FFN block ids in
+    the encoder and decoder, respectively.
+    """
+
+    def resolve(sel: Any, available: List[int]) -> List[int]:
+        if sel is None:
+            return []
+        if isinstance(sel, str):
+            if sel.lower() == "all":
+                return list(available)
+            raise ValueError(f"Unknown pkm layer selector: {sel!r} (expected 'all', None, or a list)")
+        return [int(x) for x in sel]
+
+    if isinstance(pkm_layers, str):
+        if pkm_layers.lower() == "all":
+            return list(enc_ids), list(dec_ids)
+        raise ValueError(f"Unknown pkm_layers selector: {pkm_layers!r} (expected 'all', None, or a mapping)")
+
+    # mapping form (dict / OmegaConf DictConfig): {"encoder": <sel>, "decoder": <sel>}
+    return (
+        resolve(pkm_layers.get("encoder"), enc_ids),
+        resolve(pkm_layers.get("decoder"), dec_ids),
+    )
+
+
+class T5LayerPKM(nn.Module):
+    """A T5 feed-forward sub-layer whose MLP is replaced by a Product-Key Memory.
+
+    Mirrors the contract of ``transformers`` ``T5LayerFF``: it applies a layer
+    norm, runs the (memory) transformation, and adds the result back to the
+    input as a residual. This makes it a drop-in replacement for ``T5LayerFF``.
+    """
+
+    def __init__(self, config: T5Config, pkm_params: Dict[str, Any]) -> None:
+        super().__init__()
+        self.memory = HashingMemory(
+            input_dim=config.d_model,
+            output_dim=config.d_model,
+            **pkm_params,
+        )
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        forwarded_states = self.layer_norm(hidden_states)
+        forwarded_states = self.memory(forwarded_states)
+        hidden_states = hidden_states + self.dropout(forwarded_states)
+        return hidden_states
+
+
+class T5LayerFFWithPKM(nn.Module):
+    """A T5 feed-forward sub-layer running an FFN and a PKM in parallel.
+
+    The original feed-forward module and the Product-Key Memory both read the
+    same input ``hidden_states`` and their contributions are summed:
+
+        out = FFN_layer(h) + dropout(PKM(layer_norm(h)))
+
+    where ``FFN_layer(h) = h + dropout(FFN(ln(h)))`` is the unchanged T5
+    feed-forward sub-layer (so there is a single residual on ``h``). This is the
+    ``"add"`` counterpart to :class:`T5LayerPKM` (``"replace"``).
+    """
+
+    def __init__(
+        self, ffn: nn.Module, config: T5Config, pkm_params: Dict[str, Any]
+    ) -> None:
+        super().__init__()
+        self.ffn = ffn
+        self.memory = HashingMemory(
+            input_dim=config.d_model,
+            output_dim=config.d_model,
+            **pkm_params,
+        )
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        ffn_out = self.ffn(hidden_states)
+        memory_out = self.memory(self.layer_norm(hidden_states))
+        return ffn_out + self.dropout(memory_out)
 
 
 # TODO (clark): this is a T5 specific implementation

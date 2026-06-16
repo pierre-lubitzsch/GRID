@@ -777,7 +777,7 @@ Submitted batch job 9465564
 # poison clone_append 0.05: 9439578 -> recall@5 ~ 0.04306, ndcg@10 ~ 0.03607, ASI@10 ~ 0.00060, SH@10 ~ 0.00595
 # poison clone_append 0.1: 9439576 -> recall@5 ~ 0.04101, ndcg@10 ~ 0.03392, ASI@10 ~ 0.01913, SH@10 ~ 0.15745
 # poison segment 0.01: 9420383 -> recall@5 ~ 0.04695, ndcg@10 ~ 0.03866 (higher metrics than clean? only noise...)
-# poison segment 0.05: 9439577 -> recall@5 ~ , ndcg@10 ~ , ASI@10 ~ , SH@10 ~ 
+# poison segment 0.05: 9439577 -> recall@5 ~ 0.04677, ndcg@10 ~ 0.03768, ASI@10 ~ 0.00216, SH@10 ~ 0.02139
 # poison segment 0.1: 9439575 -> recall@5 ~ 0.04704, ndcg@10 ~ 0.03838, ASI@10 ~ 0.00279, SH@10 ~ 0.02761
 
 

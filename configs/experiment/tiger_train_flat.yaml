@@ -244,6 +244,36 @@ model:
   num_user_bins: null
   codebooks: ${data_loading.train_dataloader_config.dataloader.dataset_config.semantic_id_map.sequence_data}
   mlp_layers: 2
+  # Product-Key Memory (PKM) layers on selected T5 feed-forward sub-layers.
+  # pkm_layers selects which FFNs to target:
+  #   null                                  -> no PKM
+  #   all                                   -> every FFN in encoder and decoder
+  #   {encoder: <sel>, decoder: <sel>}      -> per-subtree, each <sel> is
+  #                                            null | all | [block_ids]
+  # pkm_mode controls how the PKM relates to the FFN:
+  #   replace -> swap the FFN for a PKM
+  #   add     -> keep the FFN and run a PKM in parallel on the same input,
+  #              summing their outputs
+  # NOTE: in 'replace' mode the targeted layers are excluded from the
+  # mlp_layers bloating above. The value store holds pkm_params.n_keys ** 2
+  # vectors of size d_model, so n_keys is the dominant capacity/parameter knob.
+  pkm_layers:
+    encoder: null
+    decoder: [0, 1]
+  pkm_mode: replace
+  pkm_params:
+    # Product-key dim = d_model (=k_dim): two sub-keys of d_model/2 each are
+    # concatenated into one product key of size d_model. Value dim is fixed to
+    # d_model by the layer wrapper.
+    k_dim: ${model.huggingface_model.config.d_model}
+    heads: 4            # independent reading heads (outputs summed)
+    knn: 32             # memory slots read per head
+    n_keys: 512         # sub-keys per half -> n_keys**2 total values
+    query_batchnorm: false
+    input_dropout: 0.0
+    query_dropout: 0.0
+    value_dropout: 0.0
+    sparse: false
 callbacks:
   model_checkpoint:
     _target_: lightning.pytorch.callbacks.ModelCheckpoint
