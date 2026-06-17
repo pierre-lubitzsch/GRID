@@ -5,11 +5,14 @@ out for TIGER's actual module names.
 
 from __future__ import annotations
 
-from typing import List
+import logging
+from typing import Dict, List, Tuple
 
 import torch
 from torch import nn
 
+
+log = logging.getLogger(__name__)
 
 _VALID_POLICIES = ("all", "sid_embeddings", "encoder_only", "tiger")
 
@@ -89,6 +92,117 @@ def select_target_params(model: nn.Module, policy: str = "all") -> List[nn.Param
             f"check the model layout."
         )
     return params
+
+
+def select_adaptive_code_params(
+    model: nn.Module,
+    *,
+    stable_codes: int,
+    update_backbone: bool = False,
+) -> Tuple[List[nn.Parameter], Dict[int, torch.Tensor]]:
+    """Restrict updates to the *adaptive* (fine-grained) tail of the semantic ID.
+
+    The Stable-Adaptive Semantic ID design: an RQ item id
+    ``[c_0, ..., c_{H-1}]`` is split at ``stable_codes`` into a stable (coarse,
+    frozen) segment ``[c_0, ..., c_{stable_codes-1}]`` and an adaptive (fine,
+    trainable) segment ``[c_{stable_codes}, ..., c_{H-1}]``. Unlearning then
+    moves only the adaptive segment, localizing deletions.
+
+    Trainable surface returned:
+      * ``item_sid_embedding_table_encoder`` — included as a whole tensor, but
+        with a row mask zeroing the stable hierarchies' rows
+        ``[0, stable_codes * K)`` so only adaptive rows
+        ``[stable_codes * K, H * K)`` receive updates (the table is laid out as
+        ``H`` contiguous ``K``-row hierarchy blocks).
+      * Per-hierarchy decoder heads ``decoder.decoder_mlp[stable_codes:]``.
+      * The shared transformer backbone (encoder + decoder T5 stack) only when
+        ``update_backbone`` is True (no mask).
+
+    Parameters
+    ----------
+    stable_codes
+        Number of leading (coarse) hierarchies to freeze. Must satisfy
+        ``1 <= stable_codes < num_hierarchies`` (at least one adaptive code).
+    update_backbone
+        If True, also update the shared transformer backbone.
+
+    Returns
+    -------
+    (params, grad_masks)
+        ``params`` is the non-empty list handed to the optimizer. ``grad_masks``
+        maps ``id(param) -> float mask`` (same shape as the param) for params
+        that need a partial-gradient mask applied to ``.grad`` before the
+        optimizer step; params absent from the dict are updated in full.
+    """
+    num_hierarchies = getattr(model, "num_hierarchies", None)
+    codebook_size = getattr(model, "num_embeddings_per_hierarchy", None)
+    if num_hierarchies is None or codebook_size is None:
+        raise TypeError(
+            "select_adaptive_code_params requires a SemanticIDEncoderDecoder with "
+            "num_hierarchies / num_embeddings_per_hierarchy attributes"
+        )
+    num_hierarchies = int(num_hierarchies)
+    codebook_size = int(codebook_size)
+    stable_codes = int(stable_codes)
+    if not 1 <= stable_codes < num_hierarchies:
+        raise ValueError(
+            f"stable_codes={stable_codes} must satisfy 1 <= stable_codes < "
+            f"num_hierarchies={num_hierarchies} (need at least one adaptive code)"
+        )
+
+    params: List[nn.Parameter] = []
+    grad_masks: Dict[int, torch.Tensor] = {}
+    seen: set = set()
+
+    def _add(p: nn.Parameter) -> None:
+        if p.requires_grad and id(p) not in seen:
+            params.append(p)
+            seen.add(id(p))
+
+    # SID embedding table: whole tensor + adaptive-row mask.
+    sid_table = getattr(model, "item_sid_embedding_table_encoder", None)
+    if sid_table is None:
+        raise ValueError("model has no item_sid_embedding_table_encoder")
+    weight = sid_table.weight
+    expected_rows = num_hierarchies * codebook_size
+    if weight.shape[0] != expected_rows:
+        log.warning(
+            "SID table has %d rows but num_hierarchies*codebook_size=%d; the "
+            "adaptive row mask assumes a hierarchy-blocked layout",
+            weight.shape[0],
+            expected_rows,
+        )
+    mask = torch.zeros_like(weight)
+    mask[stable_codes * codebook_size :, :] = 1.0  # adaptive hierarchies only
+    _add(weight)
+    grad_masks[id(weight)] = mask
+
+    # Adaptive per-hierarchy decoder heads.
+    decoder = getattr(model, "decoder", None)
+    decoder_mlp = getattr(decoder, "decoder_mlp", None) if decoder is not None else None
+    if decoder_mlp is None:
+        raise ValueError("model.decoder has no decoder_mlp")
+    for h in range(stable_codes, num_hierarchies):
+        for p in decoder_mlp[h].parameters():
+            _add(p)
+
+    # Optionally the shared transformer backbone.
+    if update_backbone:
+        encoder = getattr(model, "encoder", None)
+        if encoder is not None:
+            for p in encoder.parameters():
+                _add(p)
+        backbone = getattr(decoder, "decoder", None)
+        if backbone is not None:
+            for p in backbone.parameters():
+                _add(p)
+
+    if not params:
+        raise ValueError(
+            "select_adaptive_code_params returned 0 trainable params; check the "
+            "model layout."
+        )
+    return params, grad_masks
 
 
 def named_target_params(

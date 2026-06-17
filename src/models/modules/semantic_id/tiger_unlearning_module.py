@@ -293,12 +293,16 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             lambda_forget=float(cfg.get("lambda_forget", 1.0)),
             lambda_sep=float(cfg.get("lambda_sep", 0.1)),
             forget_loss_level=str(cfg.get("forget_loss_level", "token")),
-            sep_temperature=float(cfg.get("sep_temperature", 0.07)),
+            sep_temperature=float(cfg.get("sep_temperature", 0.007)),
             deletion_spec=ctx["deletion_spec"],
             forget_item_ids=ctx["visible_forget_items"],
             neighbor_item_ids=ctx["neighborhood_centers"],
             sep_negative_item_ids=ctx["sep_negative_items"],
             local_repair_cfg=local_repair,
+            restrict_adaptive_codes=bool(cfg.get("adaptive_codes", False)),
+            stable_codes=int(cfg.get("stable_codes", 2)),
+            adaptive_update_backbone=bool(cfg.get("adaptive_update_backbone", False)),
+            adaptive_adapter=bool(cfg.get("adaptive_adapter", False)),
             device=device,
         )
         info["wall_seconds"] = time.time() - t0
@@ -606,18 +610,21 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
     ) -> Optional[Set[int]]:
         """Random retain-set item ids as sep-loss negatives (ablation).
 
-        Returns None unless ``sep_negatives=random_retain``. The pool is every
-        item id appearing in the retain shards minus forget/target items; the
-        sample size defaults to the size of the default neighbor negative set
+        Returns None unless ``sep_negatives=random_retain``, in which case the
+        sep-loss negatives default to the forget items ``I_f`` (slide form). The
+        pool is every item id appearing in the retain shards minus forget/target
+        items; the sample size defaults to ``default_count``
         (``sep_num_random_negatives`` overrides). The item pool is cached per
         resolved retain dir so symlinked sequential request dirs scan once.
         """
-        mode = str(unlearning_cfg.get("sep_negatives", "neighbors")).strip().lower()
-        if mode in ("", "neighbors"):
+        mode = str(unlearning_cfg.get("sep_negatives", "forget")).strip().lower()
+        # 'forget' (slide default, I_f only); 'neighbors' kept as a legacy alias
+        # for the same forget-only behavior (neighbors are no longer negatives).
+        if mode in ("", "forget", "neighbors"):
             return None
         if mode != "random_retain":
             raise ValueError(
-                f"sep_negatives must be 'neighbors' or 'random_retain', got {mode!r}"
+                f"sep_negatives must be 'forget' or 'random_retain', got {mode!r}"
             )
         pool_key = os.path.realpath(retain_dir)
         cache = getattr(self, "_retain_item_pool_cache", None)

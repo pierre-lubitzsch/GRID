@@ -11,6 +11,7 @@ from torch import nn
 
 from src.components.unlearning.hvp import batch_size, batch_to_device
 from src.components.unlearning.local_repair import apply_local_repair_losses
+from src.components.unlearning.target_params import select_adaptive_code_params
 
 log = logging.getLogger(__name__)
 TigerBatch = Any
@@ -27,12 +28,16 @@ def unified_unlearn(
     lambda_forget: float = 1.0,
     lambda_sep: float = 0.1,
     forget_loss_level: str = "token",
-    sep_temperature: float = 0.07,
+    sep_temperature: float = 0.007,
     deletion_spec: str = "session",
     forget_item_ids: Optional[Set[int]] = None,
     neighbor_item_ids: Optional[Set[int]] = None,
     sep_negative_item_ids: Optional[Set[int]] = None,
     local_repair_cfg: Optional[Dict[str, Any]] = None,
+    restrict_adaptive_codes: bool = False,
+    stable_codes: int = 2,
+    adaptive_update_backbone: bool = False,
+    adaptive_adapter: bool = False,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Optimize unified objective.
@@ -54,10 +59,10 @@ def unified_unlearn(
     forget sample and every retain sample contributes to the gradient the same
     number of times, regardless of how many batches each side has.
 
-    ``sep_negative_item_ids``, when set, fully replaces the sep-loss negative
-    set (normally ``neighbor_item_ids | forget_item_ids``) — used for the
-    random-retain-negatives ablation. Local repair still uses
-    ``neighbor_item_ids``.
+    The ``L_sep`` negatives are the forget items ``I_f`` only (slide form; no
+    neighbors). ``sep_negative_item_ids``, when set, fully replaces them with a
+    fixed set — used for the random-retain-negatives ablation. Local repair
+    still uses ``neighbor_item_ids``.
     """
     device = device or next(model.parameters()).device
     if not retain_batches:
@@ -103,7 +108,58 @@ def unified_unlearn(
         n_epochs if n_epochs is not None else "(unset)",
     )
 
-    params = [p for p in model.parameters() if p.requires_grad]
+    # Stable-Adaptive Semantic IDs: optionally confine the update to the
+    # adaptive (fine-grained) code positions. grad_masks holds per-parameter
+    # masks applied to .grad each step before opt.step().
+    if restrict_adaptive_codes and adaptive_adapter:
+        # Option 2 (per-item): freeze the shared table & heads (left out of the
+        # optimizer) and train only a per-item, per-adaptive-position offset.
+        # The offset gradient is masked to the deletion-relevant items
+        # (forget ∪ neighbors), so updates are genuinely item-local.
+        if getattr(model, "adaptive_item_offset", None) is None:
+            if not hasattr(model, "enable_adaptive_item_offset"):
+                raise TypeError(
+                    "adaptive_adapter=True requires a model exposing "
+                    "enable_adaptive_item_offset (SemanticIDEncoderDecoder)"
+                )
+            model.enable_adaptive_item_offset(int(stable_codes))
+        offset = model.adaptive_item_offset
+        params = [offset]
+        grad_masks = {}
+        adapter_items = set(forget_item_ids or []) | set(neighbor_item_ids or [])
+        n_rows = offset.shape[0]
+        valid_items = sorted(i for i in adapter_items if 0 <= int(i) < n_rows)
+        if valid_items:
+            row_mask = torch.zeros((n_rows, 1, 1), device=offset.device)
+            row_mask[torch.tensor(valid_items, device=offset.device)] = 1.0
+            grad_masks[id(offset)] = row_mask
+        log.info(
+            "[unified] per-item adaptive adapter ON: stable_codes=%d, "
+            "%d / %d offset rows trainable (others frozen via grad mask)",
+            int(stable_codes),
+            len(valid_items) if valid_items else n_rows,
+            n_rows,
+        )
+    elif restrict_adaptive_codes:
+        # Option 1 (shared): move the adaptive shared embedding rows + adaptive
+        # heads. grad_masks zeroes the stable embedding rows on .grad.
+        params, grad_masks = select_adaptive_code_params(
+            model,
+            stable_codes=int(stable_codes),
+            update_backbone=bool(adaptive_update_backbone),
+        )
+        log.info(
+            "[unified] adaptive-code restriction ON: stable_codes=%d "
+            "update_backbone=%s → %d param tensors (%d params), %d masked",
+            int(stable_codes),
+            bool(adaptive_update_backbone),
+            len(params),
+            int(sum(p.numel() for p in params)),
+            len(grad_masks),
+        )
+    else:
+        params = [p for p in model.parameters() if p.requires_grad]
+        grad_masks = {}
     opt = torch.optim.Adam(params, lr=float(lr))
     model.train()
 
@@ -115,15 +171,13 @@ def unified_unlearn(
     }
 
     forget_ids = set(forget_item_ids or [])
-    neighbor_ids = set(neighbor_item_ids or [])
+    neighbor_ids = set(neighbor_item_ids or [])  # used only for local-repair losses
+    # L_sep negatives (slide form): the forget items I_f only — no neighbors.
+    # The random_retain ablation replaces them with random retain item ids.
     if sep_negative_item_ids is not None:
-        # Ablation: random retain items as sep negatives instead of the
-        # directed forget/neighbor set.
-        sep_neighbor_ids: Set[int] = set(sep_negative_item_ids)
-        sep_forget_ids: Set[int] = set()
+        sep_negatives_set: Set[int] = set(sep_negative_item_ids)
     else:
-        sep_neighbor_ids = neighbor_ids
-        sep_forget_ids = forget_ids
+        sep_negatives_set = forget_ids
     sequence_forget = str(forget_loss_level).lower() == "sequence"
 
     for step in range(steps):
@@ -153,8 +207,7 @@ def unified_unlearn(
             l_retain = model._batch_loss_from_model_step(retain_batch)
             l_sep = model.compute_sep_loss(
                 retain_batch,
-                neighbor_item_ids=sep_neighbor_ids,
-                forget_item_ids=sep_forget_ids,
+                negative_item_ids=sep_negatives_set,
                 temperature=float(sep_temperature),
             )
             retain_side = l_retain + float(lambda_sep) * l_sep
@@ -168,6 +221,13 @@ def unified_unlearn(
             (retain_side / float(q_retain)).backward()
             l_retain_avg += float(l_retain.detach().cpu()) / float(q_retain)
             l_sep_avg += float(l_sep.detach().cpu()) / float(q_retain)
+
+        # Mask stable-code rows out of the embedding gradient before stepping.
+        if grad_masks:
+            for p in params:
+                m = grad_masks.get(id(p))
+                if m is not None and p.grad is not None:
+                    p.grad.mul_(m)
 
         opt.step()
 
@@ -205,12 +265,18 @@ def unified_unlearn(
         "q_forget": q_forget,
         "q_retain": q_retain,
         "lr": float(lr),
+        "restrict_adaptive_codes": bool(restrict_adaptive_codes),
+        "stable_codes": int(stable_codes) if restrict_adaptive_codes else None,
+        "adaptive_update_backbone": (
+            bool(adaptive_update_backbone) if restrict_adaptive_codes else None
+        ),
+        "adaptive_adapter": bool(restrict_adaptive_codes and adaptive_adapter),
         "lambda_forget": float(lambda_forget),
         "lambda_sep": float(lambda_sep),
         "sep_negatives": (
-            "random_retain" if sep_negative_item_ids is not None else "neighbors"
+            "random_retain" if sep_negative_item_ids is not None else "forget"
         ),
-        "n_sep_negatives": len(sep_neighbor_ids | sep_forget_ids),
+        "n_sep_negatives": len(sep_negatives_set),
         "forget_loss_level": str(forget_loss_level),
         "deletion_spec": str(deletion_spec),
         "mean_total_loss": _mean(totals["total"]),

@@ -270,11 +270,21 @@ if [ "${UNLEARN_RUN_POST_EVAL}" = "true" ]; then
     EVAL_OUT="${UNLEARN_OUTPUT_DIR}/eval"
     mkdir -p "${EVAL_OUT}"
     echo "[$(date -Is)] Post-unlearn eval on clean test: ${UNLEARN_EVAL_DATA_DIR}"
+    # Eval runs on the CLEAN dir, which has no forget_manifest.json. Point the
+    # spam metrics (SH@k / ASI@k) at the POISON dataset's manifest so the spam
+    # target set I_t is loaded; otherwise SH/ASI are silently skipped.
+    SPAM_MANIFEST_ARGS=()
+    if [ -f "${DATA_DIR}/forget_manifest.json" ]; then
+      SPAM_MANIFEST_ARGS+=("spam_forget_manifest='${DATA_DIR}/forget_manifest.json'")
+    else
+      echo "WARNING: ${DATA_DIR}/forget_manifest.json not found — SH/ASI will be skipped in eval"
+    fi
     python -u -m scripts.eval_ckpt_on_test \
       experiment=tiger_train_flat \
       data_dir="${UNLEARN_EVAL_DATA_DIR}" \
       "semantic_id_path='${SEMANTIC_ID_PATH}'" \
       "ckpt_path='${FINAL_CKPT}'" \
+      "${SPAM_MANIFEST_ARGS[@]}" \
       num_hierarchies=4 \
       seed="${UNLEARN_SEED}" \
       train=False test=True \

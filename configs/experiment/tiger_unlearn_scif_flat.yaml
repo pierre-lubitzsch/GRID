@@ -67,10 +67,12 @@ unlearning:
   forget_loss_level: token
   lambda_forget: 1.0
   lambda_sep: 0.1
-  sep_temperature: 0.07
-  # Sep-loss negatives: neighbors (default; forget/neighborhood-center items)
-  # | random_retain (ablation: randomly sampled retain-set item ids instead).
-  sep_negatives: neighbors
+  sep_temperature: 0.007
+  # L_sep negatives: forget (default; the slide's I_f forget items only — no
+  # neighbors) | random_retain (ablation: randomly sampled retain-set item ids).
+  # Positives are the retain user's own next item; r_u and item embeddings share
+  # the pooled-encoder representation space.
+  sep_negatives: forget
   # Count when sep_negatives=random_retain (null → match neighbor set size).
   sep_num_random_negatives: null
   unified_steps: 500
@@ -81,6 +83,26 @@ unlearning:
   # null → each algorithm uses its own per-algorithm default.
   n_epochs: null
   unified_lr: 1.0e-4
+  # Stable-Adaptive Semantic IDs (unlearning-aware ID design; wired for
+  # algorithm=unified). When adaptive_codes=true, the update is confined to the
+  # adaptive (fine-grained) tail of each item's RQ semantic ID: only the SID
+  # embedding rows and decoder heads for hierarchies [stable_codes,
+  # num_hierarchies) move. Stable (coarse) codes [0, stable_codes) are frozen,
+  # localizing deletions and protecting same-stable-code neighbors. For aligned
+  # neighborhood preservation set neighborhood_method=prefix and
+  # sid_prefix_length=stable_codes. adaptive_update_backbone additionally lets
+  # the shared transformer backbone move (less local, more forget capacity).
+  adaptive_codes: false
+  stable_codes: 2
+  adaptive_update_backbone: false
+  # adaptive_adapter (default false = "option 1"): move the *shared* adaptive
+  # code-value embedding rows + adaptive decoder heads. Set true for "option 2":
+  # freeze the shared table/heads and instead train a per-item, per-adaptive-
+  # position offset, masked to the forget∪neighbor items — genuinely item-local
+  # degrees of freedom. NOTE: option 2 adds an adaptive_item_offset parameter to
+  # the saved checkpoint; to eval it, build the eval model with
+  # +model.adaptive_item_offset_stable_codes=<stable_codes> so the param loads.
+  adaptive_adapter: false
   # Kookmin (gradient-guided reinitialization + scaled retain repair)
   kookmin_init_rate: 0.01
   kookmin_neg_grad_sample_size: 128
@@ -287,11 +309,12 @@ model:
   num_user_bins: null
   codebooks: ${data_loading.train_dataloader_config.dataloader.dataset_config.semantic_id_map.sequence_data}
   mlp_layers: 2
-  # Must mirror tiger_train_flat.yaml so the checkpoint schema stays identical.
-  # See that file for the meaning of pkm_layers / pkm_mode / pkm_params.
-  pkm_layers:
-    encoder: null
-    decoder: [0, 1]
+  # Must mirror tiger_train_flat.yaml so the loaded checkpoint schema matches.
+  # PKM is OFF by default (like training). To unlearn/eval a PKM-trained
+  # checkpoint, override to match how it was trained, e.g.
+  #   'model.pkm_layers={encoder:null,decoder:[0,1]}' model.pkm_mode=replace
+  # See tiger_train_flat.yaml for the meaning of pkm_layers / pkm_mode / pkm_params.
+  pkm_layers: null
   pkm_mode: replace
   pkm_params:
     k_dim: ${model.huggingface_model.config.d_model}

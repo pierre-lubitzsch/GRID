@@ -499,6 +499,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         should_add_sep_token: bool = True,
         prediction_key_name: str = "user_id",
         prediction_value_name: str = "semantic_ids",
+        adaptive_item_offset_stable_codes: Optional[int] = None,
         **kwargs,
     ) -> None:
         """
@@ -609,6 +610,18 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self.prediction_key_name = prediction_key_name
         self.prediction_value_name = prediction_value_name
         self.repair_adapter: Optional[nn.Parameter] = None
+        # Per-item adaptive-position offsets (Stable-Adaptive Semantic IDs,
+        # "option 2"). None unless explicitly enabled. When set, a zero-init,
+        # per-item, per-adaptive-hierarchy offset is added to the item
+        # embeddings at the adaptive positions [stable_codes, num_hierarchies),
+        # giving genuinely item-local degrees of freedom while the shared SID
+        # table stays frozen. Enabled at construction (for eval/load
+        # consistency) via adaptive_item_offset_stable_codes, or lazily during
+        # unlearning via enable_adaptive_item_offset().
+        self.adaptive_item_offset: Optional[nn.Parameter] = None
+        self._adaptive_stable_codes: Optional[int] = None
+        if adaptive_item_offset_stable_codes is not None:
+            self.enable_adaptive_item_offset(int(adaptive_item_offset_stable_codes))
 
     def set_decode_filter(
         self,
@@ -686,6 +699,98 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             sorted(dec_ids),
             pkm_params,
         )
+
+    def enable_adaptive_item_offset(self, stable_codes: int) -> None:
+        """Create per-item adaptive-position offsets (Stable-Adaptive IDs option 2).
+
+        Adds a zero-initialised, per-item, per-adaptive-hierarchy offset that is
+        injected into the item embeddings at the adaptive positions
+        ``[stable_codes, num_hierarchies)``. The shared SID table is untouched,
+        so these offsets are the only item-local degrees of freedom. Idempotent.
+
+        Also precomputes a vectorised inverse map (SID code tuple -> item id)
+        used to apply the offsets in the forward pass.
+        """
+        if self.adaptive_item_offset is not None:
+            return
+        if getattr(self, "codebooks", None) is None:
+            raise ValueError(
+                "enable_adaptive_item_offset requires codebooks (item -> SID map)"
+            )
+        num_hierarchies = int(self.num_hierarchies)
+        codebook_size = int(self.num_embeddings_per_hierarchy)
+        stable_codes = int(stable_codes)
+        if not 1 <= stable_codes < num_hierarchies:
+            raise ValueError(
+                f"stable_codes={stable_codes} must satisfy 1 <= stable_codes < "
+                f"num_hierarchies={num_hierarchies}"
+            )
+        num_items = int(self.codebooks.size(0))
+        num_adaptive = num_hierarchies - stable_codes
+        device = self.item_sid_embedding_table_encoder.weight.device
+        self._adaptive_stable_codes = stable_codes
+        self.adaptive_item_offset = nn.Parameter(
+            torch.zeros(num_items, num_adaptive, self.embedding_dim, device=device)
+        )
+
+        # Inverse map: encode each item's code tuple as a unique integer key and
+        # keep them sorted for vectorised lookup via searchsorted.
+        powers = codebook_size ** torch.arange(num_hierarchies, dtype=torch.long)
+        codebooks = self.codebooks.to(torch.long).cpu()  # (num_items, num_hierarchies)
+        keys_all = (codebooks * powers).sum(dim=1)  # (num_items,)
+        sorted_keys, order = torch.sort(keys_all)
+        self.register_buffer("_adaptive_code_powers", powers.to(device), persistent=False)
+        self.register_buffer("_adaptive_sorted_keys", sorted_keys.to(device), persistent=False)
+        self.register_buffer(
+            "_adaptive_sorted_item_ids", order.to(torch.long).to(device), persistent=False
+        )
+
+    def _codes_to_item_ids(self, codes_items: torch.Tensor) -> torch.Tensor:
+        """Map raw SID code tuples ``(..., num_hierarchies)`` to item ids.
+
+        Returns ``-1`` for tuples that are padded/out-of-range or absent from
+        the codebook.
+        """
+        codebook_size = int(self.num_embeddings_per_hierarchy)
+        powers = self._adaptive_code_powers
+        invalid = (codes_items < 0).any(dim=-1) | (codes_items >= codebook_size).any(dim=-1)
+        keys = (codes_items.clamp(min=0).to(torch.long) * powers).sum(dim=-1)
+        sorted_keys = self._adaptive_sorted_keys
+        pos = torch.searchsorted(sorted_keys, keys).clamp(max=sorted_keys.numel() - 1)
+        match = (sorted_keys[pos] == keys) & (~invalid)
+        return torch.where(
+            match, self._adaptive_sorted_item_ids[pos], torch.full_like(keys, -1)
+        )
+
+    def _inject_adaptive_offsets(
+        self, embeds: torch.Tensor, raw_codes: torch.Tensor
+    ) -> torch.Tensor:
+        """Add per-item offsets at the adaptive positions of each item block.
+
+        No-op unless the offset table is enabled and ``raw_codes`` is aligned to
+        full ``num_hierarchies``-token item blocks (so it is skipped during
+        incremental generation, where item identity is not yet determined).
+        """
+        if self.adaptive_item_offset is None:
+            return embeds
+        num_hierarchies = int(self.num_hierarchies)
+        if (
+            raw_codes.dim() != 2
+            or raw_codes.size(1) == 0
+            or raw_codes.size(1) % num_hierarchies != 0
+        ):
+            return embeds
+        stable = int(self._adaptive_stable_codes)
+        batch, seq_len = raw_codes.shape
+        n_items = seq_len // num_hierarchies
+        codes_items = raw_codes.view(batch, n_items, num_hierarchies)
+        item_ids = self._codes_to_item_ids(codes_items)  # (batch, n_items)
+        valid = (item_ids >= 0).unsqueeze(-1).unsqueeze(-1)
+        offs = self.adaptive_item_offset[item_ids.clamp(min=0)]  # (b, n, adaptive, d)
+        offs = offs * valid
+        emb_items = embeds.view(batch, n_items, num_hierarchies, embeds.size(-1)).clone()
+        emb_items[:, :, stable:, :] = emb_items[:, :, stable:, :] + offs
+        return emb_items.view(batch, seq_len, embeds.size(-1))
 
     def _batch_loss_from_model_step(
         self,
@@ -792,37 +897,123 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         emb = table(shifted)
         return emb.mean(dim=1)
 
+    def _item_encoder_representation(self, item_sid_rows: torch.Tensor) -> torch.Tensor:
+        """Pooled encoder output for each item, in the SAME representation space
+        as :meth:`_pooled_user_representation` (``r_u``).
+
+        Each item's semantic-id row is encoded as a length-1 history (no user
+        token), and the encoder output is masked-mean-pooled — exactly the
+        pooling used for ``r_u`` — so item and user representations are
+        comparable for the ``L_sep`` contrastive similarity.
+        """
+        device = next(self.parameters()).device
+        # SID rows must be integer indices (labels may arrive as float), and the
+        # attention mask must be integer too: encoder_forward_pass multiplies the
+        # SID indices by the mask, so a float mask would corrupt the dtype.
+        item_sid_rows = item_sid_rows.to(device).long()
+        if item_sid_rows.dim() == 1:
+            item_sid_rows = item_sid_rows.unsqueeze(0)
+        attn = torch.ones(
+            item_sid_rows.size(0), item_sid_rows.size(1), dtype=torch.long, device=device
+        )
+        enc_out, enc_mask = self.encoder_forward_pass(
+            attention_mask=attn, input_ids=item_sid_rows, user_id=None
+        )
+        mask = enc_mask.unsqueeze(-1).float()
+        return (enc_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+
     def compute_sep_loss(
         self,
         retain_batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
         *,
-        neighbor_item_ids: Set[int],
-        forget_item_ids: Set[int],
-        temperature: float = 0.07,
+        negative_item_ids: Set[int],
+        temperature: float = 0.007,
     ) -> torch.Tensor:
-        model_input, label_data = retain_batch
-        r_u = self._pooled_user_representation(model_input)
-        r_u = torch.nn.functional.normalize(r_u, dim=-1)
+        """Separation loss ``L_sep'`` (per-user, all-positives form).
 
-        fut_ids = None
-        for label in label_data.labels:
-            fut_ids = label_data.labels[label].reshape(model_input.mask.size(0), -1)
-        pos_sid = fut_ids
-        z_pos = self._item_sid_embedding(pos_sid)
-        z_pos = torch.nn.functional.normalize(z_pos, dim=-1)
+        Samples over retain users (one per batch row, visited once per epoch),
+        pools the per-item encoder representations of every item in a user's
+        history into a single user vector ``r_u``, and then pushes ``r_u``
+        toward each of that user's own (positive) history items ``i⁺`` and away
+        from the forget items ``I_f``:
 
-        neg_ids = list(neighbor_item_ids | forget_item_ids)
+            L_sep' = mean_{i⁺ ∈ history(u)}
+                -log( exp(sim(r_u, z_i⁺)/τ)
+                      / (exp(sim(r_u, z_i⁺)/τ)
+                         + Σ_{i_f ∈ I_f} exp(sim(r_u, z_i_f)/τ)) )
+
+        ``r_u`` is the average pooling of the per-item encoder representations of
+        the user's history items, and the positives ``z_i⁺`` and the forget
+        negatives ``z_i_f`` live in that SAME pooled-encoder space
+        (:meth:`_item_encoder_representation`). Negatives are exactly
+        ``negative_item_ids`` (the forget set ``I_f`` by default) — no neighbors
+        are added. The loss averages over a user's positive items and then over
+        the users in the batch.
+        """
+        model_input, _ = retain_batch
+        device = next(self.parameters()).device
+
+        neg_ids = list(negative_item_ids)
         if not neg_ids or self.codebooks is None:
-            return torch.zeros((), device=r_u.device)
-        neg_sids = self.codebooks[torch.tensor(neg_ids)].to(r_u.device)
-        z_neg = self._item_sid_embedding(neg_sids)
-        z_neg = torch.nn.functional.normalize(z_neg, dim=-1)
+            return torch.zeros((), device=device)
 
-        logits = torch.mm(r_u, z_neg.t()) / float(temperature)
-        pos_sim = (r_u * z_pos).sum(dim=-1, keepdim=True) / float(temperature)
-        all_logits = torch.cat([pos_sim, logits], dim=1)
-        labels = torch.zeros(r_u.size(0), dtype=torch.long, device=r_u.device)
-        return torch.nn.functional.cross_entropy(all_logits, labels)
+        # --- history item SID rows: [B, n_items, H] (raw codes) ---
+        # transformed_sequences uses the original feature name ("sequence_data"),
+        # not the mapped name ("input_ids"); try the raw key first.
+        input_ids = model_input.transformed_sequences.get("sequence_data")
+        if input_ids is None:
+            input_ids = model_input.transformed_sequences.get(
+                self.feature_to_model_input_map.get("sequence_data", "input_ids")
+            )
+        input_ids = input_ids.to(device).long()
+        mask = model_input.mask.to(device)
+
+        n_hier = int(self.num_hierarchies)
+        bsz, seq_len = input_ids.shape
+        if seq_len % n_hier != 0:
+            raise ValueError(
+                f"sequence length {seq_len} not divisible by num_hierarchies "
+                f"{n_hier}; cannot split history into items for L_sep"
+            )
+        n_items = seq_len // n_hier
+        item_sids = input_ids.view(bsz, n_items, n_hier)
+        # An item is a valid (non-padded) positive iff all its SID tokens attend.
+        item_valid = (
+            (mask.view(bsz, n_items, n_hier) > 0).sum(dim=-1) == n_hier
+        ).float()  # [B, n_items]
+
+        # --- per-item encoder representations z_i: [B, n_items, d] ---
+        z_items = torch.nn.functional.normalize(
+            self._item_encoder_representation(item_sids.reshape(bsz * n_items, n_hier)),
+            dim=-1,
+        ).view(bsz, n_items, -1)
+
+        # --- r_u: average pooling of the user's item representations: [B, d] ---
+        n_valid = item_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+        r_u = (z_items * item_valid.unsqueeze(-1)).sum(dim=1) / n_valid
+        r_u = torch.nn.functional.normalize(r_u, dim=-1)  # [B, d]
+
+        # --- forget negatives z_f: [N_neg, d] ---
+        neg_sids = self.codebooks[torch.tensor(neg_ids)].to(device)
+        z_neg = torch.nn.functional.normalize(
+            self._item_encoder_representation(neg_sids), dim=-1
+        )  # [N_neg, d]
+
+        tau = float(temperature)
+        # sim(r_u, z_i⁺) for every (user, history-item) pair, and sim against I_f.
+        pos_sim = (r_u.unsqueeze(1) * z_items).sum(dim=-1) / tau   # [B, n_items]
+        neg_logits = torch.mm(r_u, z_neg.t()) / tau               # [B, N_neg]
+        neg_lse = torch.logsumexp(neg_logits, dim=-1)             # [B]
+        # per-positive InfoNCE: -log( e^{pos} / (e^{pos} + Σ_f e^{neg}) )
+        denom_lse = torch.logaddexp(pos_sim, neg_lse.unsqueeze(1))  # [B, n_items]
+        per_pos = denom_lse - pos_sim                              # [B, n_items]
+
+        # Average over a user's valid positives, then over users with ≥1 positive.
+        per_user = (per_pos * item_valid).sum(dim=1) / item_valid.sum(dim=1).clamp(
+            min=1.0
+        )
+        has_pos = (item_valid.sum(dim=1) > 0).float()
+        return (per_user * has_pos).sum() / has_pos.sum().clamp(min=1.0)
 
     def compute_unified_loss(
         self,
@@ -832,7 +1023,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         lambda_forget: float = 1.0,
         lambda_sep: float = 0.1,
         forget_loss_level: str = "token",
-        sep_temperature: float = 0.07,
+        sep_temperature: float = 0.007,
         deletion_spec: str = "session",
         forget_item_ids: Optional[Set[int]] = None,
         neighbor_item_ids: Optional[Set[int]] = None,
@@ -846,8 +1037,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             l_forget = -self._batch_loss_from_model_step(forget_batch)
         l_sep = self.compute_sep_loss(
             retain_batch,
-            neighbor_item_ids=neighbor_item_ids or set(),
-            forget_item_ids=forget_item_ids or set(),
+            negative_item_ids=forget_item_ids or set(),
             temperature=sep_temperature,
         )
         total = l_retain + float(lambda_forget) * l_forget + float(lambda_sep) * l_sep
@@ -921,6 +1111,11 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         )
         inputs_embeds_for_encoder = self.get_embedding_table(table_name="encoder")(
             shifted_sids
+        )
+        # Per-item adaptive offsets (option 2); no-op unless enabled. Applied
+        # before sep-token injection so item blocks are still aligned to raw_codes.
+        inputs_embeds_for_encoder = self._inject_adaptive_offsets(
+            inputs_embeds_for_encoder, input_ids
         )
 
         if self.sep_token is not None:
@@ -1007,6 +1202,11 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             )
             inputs_embeds_for_decoder = self.get_embedding_table(table_name="decoder")(
                 shifted_future_sids
+            )
+            # Per-item adaptive offsets (option 2); no-op unless enabled. Skipped
+            # during incremental generation (future_ids not a full item block).
+            inputs_embeds_for_decoder = self._inject_adaptive_offsets(
+                inputs_embeds_for_decoder, future_ids
             )
 
             # we do not have valid kv cache
