@@ -5,7 +5,7 @@
   \centering
   \scriptsize
   \setlength{\tabcolsep}{4pt}
-  \caption{All Beauty (Amazon) TIGER results recorded in the workflow log: clean training, bandwagon/clone\_append/segment poisoning at 1/5/10\%, and unlearning (unified, seif, kookmin, fanchuan) from the bandwagon-1\% poisoned checkpoint. Setup abbreviations: $\lambda_f$/$\lambda_s$ = forget/sep loss weights; neigh/rand/forget = sep-loss negatives; NAU = neighborhood-aware retain sampling; ch = \texttt{n\_unlearning\_chunks}; p = \texttt{n\_batch\_passes}; ep = \texttt{n\_epochs}; PKM = product-key memory mode. $\Delta$NDCG@10 / $\Delta$SH@10 (unlearning rows only) = unlearned $-$ poisoned, relative to the bandwagon-1\% poisoned model (job 9096933: NDCG@10 0.03692, SH@10 0.00219). ``--'' = metric not computed for that run.}
+  \caption{All Beauty (Amazon) TIGER results recorded in the workflow log: clean training, bandwagon/clone\_append/segment poisoning at 1/5/10\%, and unlearning (unified, seif, kookmin, fanchuan) from the bandwagon-1\% poisoned checkpoint. Setup abbreviations: $\lambda_f$/$\lambda_s$ = forget/sep loss weights; neigh/rand/forget = sep-loss negatives; NAU = neighborhood-aware retain sampling; init = \texttt{kookmin\_init\_rate}; ch = \texttt{n\_unlearning\_chunks}; p = \texttt{n\_batch\_passes}; ep = \texttt{n\_epochs}; PKM = product-key memory mode. $\Delta$NDCG@10 / $\Delta$SH@10 (unlearning rows only) = unlearned $-$ poisoned, relative to the bandwagon-1\% poisoned model (job 9096933: NDCG@10 0.03692, SH@10 0.00219). ``--'' = metric not computed for that run.}
   \label{tab:beauty_all_results}
   \begin{tabular}{l l c l r r r r r r r}
     \hline
@@ -35,9 +35,9 @@
     \hline
     \multicolumn{11}{l}{\textit{Unlearning (from bandwagon-1\% ckpt)}} \\
     ch10 ep4 & bandwagon & 1 & fanchuan & 0.01618 & 0.01393 & $-0.02299$ & -- & -- & -- & 9360367 \\
-    ch10 ep4 & bandwagon & 1 & kookmin & 0.03269 & 0.02646 & $-0.01046$ & -- & -- & -- & 9360365 \\
-    ch10 ep4 & bandwagon & 1 & kookmin & 0.03430 & 0.02901 & $-0.00791$ & -- & -- & -- & 9364122 \\
-    ch10 ep4 & bandwagon & 1 & kookmin & 0.03627 & 0.03005 & $-0.00687$ & -- & -- & -- & 9364123 \\
+    init=0.01 ch10 ep4 & bandwagon & 1 & kookmin & 0.03269 & 0.02646 & $-0.01046$ & -- & -- & -- & 9360365 \\
+    init=0.001 ch10 ep4 & bandwagon & 1 & kookmin & 0.03430 & 0.02901 & $-0.00791$ & -- & -- & -- & 9364122 \\
+    init=0.0001 ch10 ep4 & bandwagon & 1 & kookmin & 0.03627 & 0.03005 & $-0.00687$ & -- & -- & -- & 9364123 \\
     ch10 ep4 & bandwagon & 1 & seif & 0.02826 & 0.02384 & $-0.01308$ & -- & -- & -- & 9361109 \\
     $\lambda_f$=0.1 $\lambda_s$=0.1 forget ch10 p4 & bandwagon & 1 & unified & 0.04391 & 0.03698 & $+0.00006$ & -- & -- & -- & 9175186 \\
     $\lambda_f$=0.0 $\lambda_s$=0.1 forget ch10 p4 & bandwagon & 1 & unified & 0.04467 & 0.03720 & $+0.00028$ & -- & -- & -- & 9175189 \\
