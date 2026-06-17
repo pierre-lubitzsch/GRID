@@ -5,65 +5,65 @@
   \centering
   \scriptsize
   \setlength{\tabcolsep}{4pt}
-  \caption{All Beauty (Amazon) TIGER results recorded in the workflow log: clean training, bandwagon/clone\_append/segment poisoning at 1/5/10\%, and unlearning (unified, seif, kookmin, fanchuan) from the bandwagon-1\% poisoned checkpoint. Setup abbreviations: $\lambda_f$/$\lambda_s$ = forget/sep loss weights; neigh/rand/forget = sep-loss negatives; NAU = neighborhood-aware retain sampling; ch = \texttt{n\_unlearning\_chunks}; p = \texttt{n\_batch\_passes}; ep = \texttt{n\_epochs}; PKM = product-key memory mode. ``--'' = metric not computed for that run.}
+  \caption{All Beauty (Amazon) TIGER results recorded in the workflow log: clean training, bandwagon/clone\_append/segment poisoning at 1/5/10\%, and unlearning (unified, seif, kookmin, fanchuan) from the bandwagon-1\% poisoned checkpoint. Setup abbreviations: $\lambda_f$/$\lambda_s$ = forget/sep loss weights; neigh/rand/forget = sep-loss negatives; NAU = neighborhood-aware retain sampling; ch = \texttt{n\_unlearning\_chunks}; p = \texttt{n\_batch\_passes}; ep = \texttt{n\_epochs}; PKM = product-key memory mode. $\Delta$NDCG@10 / $\Delta$SH@10 (unlearning rows only) = unlearned $-$ poisoned, relative to the bandwagon-1\% poisoned model (job 9096933: NDCG@10 0.03692, SH@10 0.00219). ``--'' = metric not computed for that run.}
   \label{tab:beauty_all_results}
-  \begin{tabular}{l l c l r r r r r}
+  \begin{tabular}{l l c l r r r r r r r}
     \hline
-    Setup & Method & \% & Algo & Job & Recall@5 & NDCG@10 & ASI@10 & SH@10 \\
+    Setup & Method & \% & Algo & Recall@5 & NDCG@10 & $\Delta$NDCG@10 & ASI@10 & SH@10 & $\Delta$SH@10 & Job \\
     \hline
-    \multicolumn{9}{l}{\textit{Clean training}} \\
-    standard & -- & -- & -- & 9096928 & 0.04525 & 0.03763 & -- & -- \\
-    PKM(replace) & -- & -- & -- & 9576516 & 0.04400 & 0.03645 & -- & -- \\
-    PKM(add) & -- & -- & -- & 9576518 & 0.04440 & 0.03679 & -- & -- \\
+    \multicolumn{11}{l}{\textit{Clean training}} \\
+    standard & -- & -- & -- & 0.04525 & 0.03763 & -- & -- & -- & -- & 9096928 \\
+    PKM(replace) & -- & -- & -- & 0.04400 & 0.03645 & -- & -- & -- & -- & 9576516 \\
+    PKM(add) & -- & -- & -- & 0.04440 & 0.03679 & -- & -- & -- & -- & 9576518 \\
     \hline
-    \multicolumn{9}{l}{\textit{Poison training}} \\
-    standard & bandwagon & 1 & -- & 9096933 & 0.04440 & 0.03692 & 0.00022 & 0.00219 \\
-    PKM(replace) & bandwagon & 1 & -- & 9588103 & 0.04208 & 0.03521 & 0.00034 & 0.00336 \\
-    PKM(add) & bandwagon & 1 & -- & 9588105 & 0.04346 & 0.03612 & 0.00040 & 0.00403 \\
-    standard & bandwagon & 10 & -- & 9590272 & 0.04431 & 0.03531 & 0.01133 & 0.10013 \\
-    PKM(replace) & bandwagon & 10 & -- & 9590274 & 0.04284 & 0.03522 & 0.00146 & 0.01432 \\
-    PKM(add) & bandwagon & 10 & -- & 9590275 & 0.04373 & 0.03700 & 0.00444 & 0.04134 \\
-    standard & clone\_append & 1 & -- & 9391639 & 0.04472 & 0.03595 & 0.00168 & 0.01633 \\
-    standard & clone\_append & 5 & -- & 9439578 & 0.04306 & 0.03607 & 0.00060 & 0.00595 \\
-    standard & clone\_append & 10 & -- & 9439576 & 0.04101 & 0.03392 & 0.01913 & 0.15745 \\
-    standard & clone\_append & 10 & -- & 9590269 & 0.04364 & 0.03551 & 0.00961 & 0.08232 \\
-    PKM(replace) & clone\_append & 10 & -- & 9590270 & 0.04297 & 0.03617 & 0.01330 & 0.10680 \\
-    PKM(add) & clone\_append & 10 & -- & 9590271 & 0.04409 & 0.03570 & 0.00458 & 0.03897 \\
-    standard & segment & 1 & -- & 9420383 & 0.04695 & 0.03866 & -- & -- \\
-    standard & segment & 5 & -- & 9439577 & 0.04677 & 0.03768 & 0.00216 & 0.02139 \\
-    standard & segment & 10 & -- & 9439575 & 0.04704 & 0.03838 & 0.00279 & 0.02761 \\
+    \multicolumn{11}{l}{\textit{Poison training}} \\
+    standard & bandwagon & 1 & -- & 0.04440 & 0.03692 & -- & 0.00022 & 0.00219 & -- & 9096933 \\
+    PKM(replace) & bandwagon & 1 & -- & 0.04208 & 0.03521 & -- & 0.00034 & 0.00336 & -- & 9588103 \\
+    PKM(add) & bandwagon & 1 & -- & 0.04346 & 0.03612 & -- & 0.00040 & 0.00403 & -- & 9588105 \\
+    standard & bandwagon & 10 & -- & 0.04431 & 0.03531 & -- & 0.01133 & 0.10013 & -- & 9590272 \\
+    PKM(replace) & bandwagon & 10 & -- & 0.04284 & 0.03522 & -- & 0.00146 & 0.01432 & -- & 9590274 \\
+    PKM(add) & bandwagon & 10 & -- & 0.04373 & 0.03700 & -- & 0.00444 & 0.04134 & -- & 9590275 \\
+    standard & clone\_append & 1 & -- & 0.04472 & 0.03595 & -- & 0.00168 & 0.01633 & -- & 9391639 \\
+    standard & clone\_append & 5 & -- & 0.04306 & 0.03607 & -- & 0.00060 & 0.00595 & -- & 9439578 \\
+    standard & clone\_append & 10 & -- & 0.04101 & 0.03392 & -- & 0.01913 & 0.15745 & -- & 9439576 \\
+    standard & clone\_append & 10 & -- & 0.04364 & 0.03551 & -- & 0.00961 & 0.08232 & -- & 9590269 \\
+    PKM(replace) & clone\_append & 10 & -- & 0.04297 & 0.03617 & -- & 0.01330 & 0.10680 & -- & 9590270 \\
+    PKM(add) & clone\_append & 10 & -- & 0.04409 & 0.03570 & -- & 0.00458 & 0.03897 & -- & 9590271 \\
+    standard & segment & 1 & -- & 0.04695 & 0.03866 & -- & -- & -- & -- & 9420383 \\
+    standard & segment & 5 & -- & 0.04677 & 0.03768 & -- & 0.00216 & 0.02139 & -- & 9439577 \\
+    standard & segment & 10 & -- & 0.04704 & 0.03838 & -- & 0.00279 & 0.02761 & -- & 9439575 \\
     \hline
-    \multicolumn{9}{l}{\textit{Unlearning (from bandwagon-1\% ckpt)}} \\
-    ch10 ep4 & bandwagon & 1 & fanchuan & 9360367 & 0.01618 & 0.01393 & -- & -- \\
-    ch10 ep4 & bandwagon & 1 & kookmin & 9360365 & 0.03269 & 0.02646 & -- & -- \\
-    ch10 ep4 & bandwagon & 1 & kookmin & 9364122 & 0.03430 & 0.02901 & -- & -- \\
-    ch10 ep4 & bandwagon & 1 & kookmin & 9364123 & 0.03627 & 0.03005 & -- & -- \\
-    ch10 ep4 & bandwagon & 1 & seif & 9361109 & 0.02826 & 0.02384 & -- & -- \\
-    $\lambda_f$=0.1 $\lambda_s$=0.1 forget ch10 p4 & bandwagon & 1 & unified & 9175186 & 0.04391 & 0.03698 & -- & -- \\
-    $\lambda_f$=0.0 $\lambda_s$=0.1 forget ch10 p4 & bandwagon & 1 & unified & 9175189 & 0.04467 & 0.03720 & -- & -- \\
-    $\lambda_f$=0.0 $\lambda_s$=0.0 forget ch10 p4 & bandwagon & 1 & unified & 9175190 & 0.04458 & 0.03715 & -- & -- \\
-    $\lambda_f$=0.0 $\lambda_s$=1.0 forget ch10 p4 & bandwagon & 1 & unified & 9175196 & 0.04494 & 0.03716 & -- & -- \\
-    $\lambda_f$=0.0 $\lambda_s$=1.0 rand ch10 p4 & bandwagon & 1 & unified & 9184450 & 0.04490 & 0.03746 & -- & -- \\
-    $\lambda_f$=0.0 $\lambda_s$=1.0 neigh ch10 p4 & bandwagon & 1 & unified & 9205848 & 0.04494 & 0.03716 & -- & -- \\
-    $\lambda_f$=0.0 $\lambda_s$=10.0 neigh ch10 p4 & bandwagon & 1 & unified & 9205850 & 0.04467 & 0.03718 & -- & -- \\
-    $\lambda_f$=0.01 $\lambda_s$=1.0 neigh ch10 p4 & bandwagon & 1 & unified & 9205854 & 0.04499 & 0.03716 & -- & -- \\
-    $\lambda_f$=0.001 $\lambda_s$=1.0 neigh ch10 p4 & bandwagon & 1 & unified & 9205858 & 0.04507 & 0.03720 & -- & -- \\
-    $\lambda_f$=0.01 $\lambda_s$=0.0 neigh ch10 p4 & bandwagon & 1 & unified & 9205865 & 0.04436 & 0.03715 & -- & -- \\
-    $\lambda_f$=0.001 $\lambda_s$=0.0 neigh ch10 p4 & bandwagon & 1 & unified & 9205866 & 0.04449 & 0.03698 & -- & -- \\
-    $\lambda_f$=0.0 $\lambda_s$=10.0 rand ch10 p4 & bandwagon & 1 & unified & 9206033 & 0.04472 & 0.03709 & -- & -- \\
-    $\lambda_f$=0.01 $\lambda_s$=1.0 rand ch10 p4 & bandwagon & 1 & unified & 9206038 & 0.04530 & 0.03767 & -- & -- \\
-    $\lambda_f$=0.001 $\lambda_s$=1.0 rand ch10 p4 & bandwagon & 1 & unified & 9206039 & 0.04507 & 0.03760 & -- & -- \\
-    $\lambda_f$=0.01 $\lambda_s$=10.0 neigh ch10 p4 & bandwagon & 1 & unified & 9206045 & 0.04476 & 0.03710 & -- & -- \\
-    $\lambda_f$=0.001 $\lambda_s$=10.0 neigh ch10 p4 & bandwagon & 1 & unified & 9206056 & 0.04422 & 0.03709 & -- & -- \\
-    $\lambda_f$=0.0001 $\lambda_s$=1.0 neigh ch10 p4 & bandwagon & 1 & unified & 9206057 & 0.04476 & 0.03719 & -- & -- \\
-    $\lambda_f$=0.001 $\lambda_s$=1.0 neigh NAU ch10 p4 & bandwagon & 1 & unified & 9206865 & 0.04288 & 0.03611 & -- & -- \\
-    $\lambda_f$=0.001 $\lambda_s$=1.0 rand NAU ch10 p4 & bandwagon & 1 & unified & 9206867 & 0.04320 & 0.03612 & -- & -- \\
-    $\lambda_f$=0.01 $\lambda_s$=1.0 neigh NAU ch10 p4 & bandwagon & 1 & unified & 9208028 & 0.04302 & 0.03604 & -- & -- \\
-    $\lambda_f$=0.1 $\lambda_s$=1.0 neigh NAU ch10 p4 & bandwagon & 1 & unified & 9208122 & 0.04275 & 0.03568 & -- & -- \\
-    $\lambda_f$=0.0 $\lambda_s$=0.0 forget adaptive ch10 ep4 & bandwagon & 1 & unified & 9588986 & 0.04422 & 0.03697 & 0.00027 & 0.00268 \\
-    $\lambda_f$=0.0 $\lambda_s$=1.0 forget adaptive ch10 ep4 & bandwagon & 1 & unified & 9588987 & 0.04418 & 0.03691 & 0.00027 & 0.00264 \\
-    $\lambda_f$=0.0 $\lambda_s$=0.1 forget adaptive ch10 ep4 & bandwagon & 1 & unified & 9588988 & 0.04414 & 0.03689 & 0.00027 & 0.00264 \\
-    $\lambda_f$=0.001 $\lambda_s$=1.0 neigh adaptive ch10 ep4 & bandwagon & 1 & unified & 9589454 & 0.04418 & 0.03691 & 0.00027 & 0.00264 \\
+    \multicolumn{11}{l}{\textit{Unlearning (from bandwagon-1\% ckpt)}} \\
+    ch10 ep4 & bandwagon & 1 & fanchuan & 0.01618 & 0.01393 & $-0.02299$ & -- & -- & -- & 9360367 \\
+    ch10 ep4 & bandwagon & 1 & kookmin & 0.03269 & 0.02646 & $-0.01046$ & -- & -- & -- & 9360365 \\
+    ch10 ep4 & bandwagon & 1 & kookmin & 0.03430 & 0.02901 & $-0.00791$ & -- & -- & -- & 9364122 \\
+    ch10 ep4 & bandwagon & 1 & kookmin & 0.03627 & 0.03005 & $-0.00687$ & -- & -- & -- & 9364123 \\
+    ch10 ep4 & bandwagon & 1 & seif & 0.02826 & 0.02384 & $-0.01308$ & -- & -- & -- & 9361109 \\
+    $\lambda_f$=0.1 $\lambda_s$=0.1 forget ch10 p4 & bandwagon & 1 & unified & 0.04391 & 0.03698 & $+0.00006$ & -- & -- & -- & 9175186 \\
+    $\lambda_f$=0.0 $\lambda_s$=0.1 forget ch10 p4 & bandwagon & 1 & unified & 0.04467 & 0.03720 & $+0.00028$ & -- & -- & -- & 9175189 \\
+    $\lambda_f$=0.0 $\lambda_s$=0.0 forget ch10 p4 & bandwagon & 1 & unified & 0.04458 & 0.03715 & $+0.00023$ & -- & -- & -- & 9175190 \\
+    $\lambda_f$=0.0 $\lambda_s$=1.0 forget ch10 p4 & bandwagon & 1 & unified & 0.04494 & 0.03716 & $+0.00024$ & -- & -- & -- & 9175196 \\
+    $\lambda_f$=0.0 $\lambda_s$=1.0 rand ch10 p4 & bandwagon & 1 & unified & 0.04490 & 0.03746 & $+0.00054$ & -- & -- & -- & 9184450 \\
+    $\lambda_f$=0.0 $\lambda_s$=1.0 neigh ch10 p4 & bandwagon & 1 & unified & 0.04494 & 0.03716 & $+0.00024$ & -- & -- & -- & 9205848 \\
+    $\lambda_f$=0.0 $\lambda_s$=10.0 neigh ch10 p4 & bandwagon & 1 & unified & 0.04467 & 0.03718 & $+0.00026$ & -- & -- & -- & 9205850 \\
+    $\lambda_f$=0.01 $\lambda_s$=1.0 neigh ch10 p4 & bandwagon & 1 & unified & 0.04499 & 0.03716 & $+0.00024$ & -- & -- & -- & 9205854 \\
+    $\lambda_f$=0.001 $\lambda_s$=1.0 neigh ch10 p4 & bandwagon & 1 & unified & 0.04507 & 0.03720 & $+0.00028$ & -- & -- & -- & 9205858 \\
+    $\lambda_f$=0.01 $\lambda_s$=0.0 neigh ch10 p4 & bandwagon & 1 & unified & 0.04436 & 0.03715 & $+0.00023$ & -- & -- & -- & 9205865 \\
+    $\lambda_f$=0.001 $\lambda_s$=0.0 neigh ch10 p4 & bandwagon & 1 & unified & 0.04449 & 0.03698 & $+0.00006$ & -- & -- & -- & 9205866 \\
+    $\lambda_f$=0.0 $\lambda_s$=10.0 rand ch10 p4 & bandwagon & 1 & unified & 0.04472 & 0.03709 & $+0.00017$ & -- & -- & -- & 9206033 \\
+    $\lambda_f$=0.01 $\lambda_s$=1.0 rand ch10 p4 & bandwagon & 1 & unified & 0.04530 & 0.03767 & $+0.00075$ & -- & -- & -- & 9206038 \\
+    $\lambda_f$=0.001 $\lambda_s$=1.0 rand ch10 p4 & bandwagon & 1 & unified & 0.04507 & 0.03760 & $+0.00068$ & -- & -- & -- & 9206039 \\
+    $\lambda_f$=0.01 $\lambda_s$=10.0 neigh ch10 p4 & bandwagon & 1 & unified & 0.04476 & 0.03710 & $+0.00018$ & -- & -- & -- & 9206045 \\
+    $\lambda_f$=0.001 $\lambda_s$=10.0 neigh ch10 p4 & bandwagon & 1 & unified & 0.04422 & 0.03709 & $+0.00017$ & -- & -- & -- & 9206056 \\
+    $\lambda_f$=0.0001 $\lambda_s$=1.0 neigh ch10 p4 & bandwagon & 1 & unified & 0.04476 & 0.03719 & $+0.00027$ & -- & -- & -- & 9206057 \\
+    $\lambda_f$=0.001 $\lambda_s$=1.0 neigh NAU ch10 p4 & bandwagon & 1 & unified & 0.04288 & 0.03611 & $-0.00081$ & -- & -- & -- & 9206865 \\
+    $\lambda_f$=0.001 $\lambda_s$=1.0 rand NAU ch10 p4 & bandwagon & 1 & unified & 0.04320 & 0.03612 & $-0.00080$ & -- & -- & -- & 9206867 \\
+    $\lambda_f$=0.01 $\lambda_s$=1.0 neigh NAU ch10 p4 & bandwagon & 1 & unified & 0.04302 & 0.03604 & $-0.00088$ & -- & -- & -- & 9208028 \\
+    $\lambda_f$=0.1 $\lambda_s$=1.0 neigh NAU ch10 p4 & bandwagon & 1 & unified & 0.04275 & 0.03568 & $-0.00124$ & -- & -- & -- & 9208122 \\
+    $\lambda_f$=0.0 $\lambda_s$=0.0 forget adaptive ch10 ep4 & bandwagon & 1 & unified & 0.04422 & 0.03697 & $+0.00005$ & 0.00027 & 0.00268 & $+0.00049$ & 9588986 \\
+    $\lambda_f$=0.0 $\lambda_s$=1.0 forget adaptive ch10 ep4 & bandwagon & 1 & unified & 0.04418 & 0.03691 & $-0.00001$ & 0.00027 & 0.00264 & $+0.00045$ & 9588987 \\
+    $\lambda_f$=0.0 $\lambda_s$=0.1 forget adaptive ch10 ep4 & bandwagon & 1 & unified & 0.04414 & 0.03689 & $-0.00003$ & 0.00027 & 0.00264 & $+0.00045$ & 9588988 \\
+    $\lambda_f$=0.001 $\lambda_s$=1.0 neigh adaptive ch10 ep4 & bandwagon & 1 & unified & 0.04418 & 0.03691 & $-0.00001$ & 0.00027 & 0.00264 & $+0.00045$ & 9589454 \\
     \hline
   \end{tabular}
 \end{table}
