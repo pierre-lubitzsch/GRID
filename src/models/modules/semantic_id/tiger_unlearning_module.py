@@ -293,11 +293,12 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             lambda_forget=float(cfg.get("lambda_forget", 1.0)),
             lambda_sep=float(cfg.get("lambda_sep", 0.1)),
             forget_loss_level=str(cfg.get("forget_loss_level", "token")),
-            sep_temperature=float(cfg.get("sep_temperature", 0.007)),
+            sep_temperature=float(cfg.get("sep_temperature", 0.07)),
             deletion_spec=ctx["deletion_spec"],
             forget_item_ids=ctx["visible_forget_items"],
             neighbor_item_ids=ctx["neighborhood_centers"],
             sep_negative_item_ids=ctx["sep_negative_items"],
+            sep_negatives_mode=str(cfg.get("sep_negatives", "forget")),
             local_repair_cfg=local_repair,
             restrict_adaptive_codes=bool(cfg.get("adaptive_codes", False)),
             stable_codes=int(cfg.get("stable_codes", 2)),
@@ -574,6 +575,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             retain_dir=retain_dir,
             exclude_items=visible_forget | target_items,
             default_count=len(visible_forget),
+            target_items=target_items,
             seed=int(seed),
         )
 
@@ -606,25 +608,46 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         retain_dir: str,
         exclude_items: Set[int],
         default_count: int,
+        target_items: Optional[Set[int]] = None,
         seed: int,
     ) -> Optional[Set[int]]:
-        """Random retain-set item ids as sep-loss negatives (ablation).
+        """Resolve the sep-loss negative item ids from ``sep_negatives``.
 
-        Returns None unless ``sep_negatives=random_retain``, in which case the
-        sep-loss negatives default to the forget items ``I_f`` (slide form). The
-        pool is every item id appearing in the retain shards minus forget/target
-        items; the sample size defaults to ``default_count``
-        (``sep_num_random_negatives`` overrides). The item pool is cached per
-        resolved retain dir so symlinked sequential request dirs scan once.
+        Modes:
+
+        * ``forget`` (default) / ``neighbors`` (legacy alias) → returns ``None``;
+          the caller then uses all visible forget items ``I_f`` as negatives
+          (every distinct item in the forget shards under ``deletion_spec=session``).
+        * ``forget_target_only`` → returns exactly the manifest ``target_items``
+          (the ``n_target`` spam targets), independent of ``deletion_spec``.
+        * ``random_retain`` → random retain-set item ids (ablation): every item
+          id in the retain shards minus forget/target items, sampled to
+          ``default_count`` (``sep_num_random_negatives`` overrides). The item
+          pool is cached per resolved retain dir so symlinked sequential request
+          dirs scan once.
         """
         mode = str(unlearning_cfg.get("sep_negatives", "forget")).strip().lower()
         # 'forget' (slide default, I_f only); 'neighbors' kept as a legacy alias
         # for the same forget-only behavior (neighbors are no longer negatives).
         if mode in ("", "forget", "neighbors"):
             return None
+        if mode == "forget_target_only":
+            targets = set(target_items or [])
+            if not targets:
+                raise ValueError(
+                    "sep_negatives='forget_target_only' requires target_items in "
+                    "the forget manifest (none found)"
+                )
+            log.info(
+                "[sep_negatives] forget_target_only: using %d target item(s) as "
+                "sep-loss negatives",
+                len(targets),
+            )
+            return targets
         if mode != "random_retain":
             raise ValueError(
-                f"sep_negatives must be 'forget' or 'random_retain', got {mode!r}"
+                "sep_negatives must be 'forget', 'forget_target_only', or "
+                f"'random_retain', got {mode!r}"
             )
         pool_key = os.path.realpath(retain_dir)
         cache = getattr(self, "_retain_item_pool_cache", None)

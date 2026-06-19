@@ -67,11 +67,13 @@ unlearning:
   forget_loss_level: token
   lambda_forget: 1.0
   lambda_sep: 0.1
-  sep_temperature: 0.007
-  # L_sep negatives: forget (default; the slide's I_f forget items only — no
-  # neighbors) | random_retain (ablation: randomly sampled retain-set item ids).
-  # Positives are the retain user's own next item; r_u and item embeddings share
-  # the pooled-encoder representation space.
+  sep_temperature: 0.07
+  # L_sep negatives: forget (default; all visible I_f forget-shard items — under
+  # deletion_spec=session that is every distinct item in the spam sessions) |
+  # forget_target_only (only the n_target spam target items, regardless of
+  # deletion_spec) | random_retain (ablation: randomly sampled retain-set ids).
+  # r_u (avg-pooled history item reps) and item embeddings share the
+  # pooled-encoder representation space.
   sep_negatives: forget
   # Count when sep_negatives=random_retain (null → match neighbor set size).
   sep_num_random_negatives: null

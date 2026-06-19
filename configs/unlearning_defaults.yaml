@@ -60,10 +60,12 @@ unlearning:
   forget_loss_level: token  # token | sequence
   lambda_forget: 1.0
   lambda_sep: 0.1
-  sep_temperature: 0.007
-  # L_sep negatives: forget (default; the slide's I_f forget items only — no
-  # neighbors) | random_retain (ablation: randomly sampled retain-set item ids,
-  # to measure how much the directed forget negatives help).
+  sep_temperature: 0.07
+  # L_sep negatives: forget (default; all visible I_f forget-shard items — under
+  # deletion_spec=session this is every distinct item in the spam sessions, not
+  # just the targets) | forget_target_only (only the n_target spam target items,
+  # regardless of deletion_spec) | random_retain (ablation: randomly sampled
+  # retain-set item ids, to measure how much the directed forget negatives help).
   sep_negatives: forget
   # Number of random negatives when sep_negatives=random_retain
   # (null → match the size of the default neighbor negative set).

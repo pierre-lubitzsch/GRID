@@ -590,6 +590,57 @@ def _build_clone_append_sequence(
     return seq
 
 
+def _build_clone_flood_sequence(
+    pool: List[List[int]],
+    target: int,
+    rng: np.random.Generator,
+    context_len: int,
+    target_set: set,
+) -> List[int]:
+    """Long, target-FREE real context with a SINGLE ``target`` at the tail.
+
+    Why this is the strongest attack per fixed poison-user budget on TIGER
+    -------------------------------------------------------------------------
+    The training collate (``collate_with_sid_causal_duplicate``) expands every
+    stored sequence into *all* contiguous sub-sequences, and ``NextKTokenMasking``
+    supervises the **last item of each sub-sequence** as the label. So a length-L
+    item sequence yields one ``(prefix -> last_item)`` training pair for every
+    prefix length 1..L-1. Placing the target as the final item therefore turns a
+    single spam user into ``L-1`` distinct ``(real-prefix -> target)`` supervised
+    examples -- the exact signal that makes the model emit the target at
+    generation for *arbitrary* real eval prefixes (high SH@k / ASI@k).
+
+    To maximise that count under a fixed 1%-of-users budget we:
+
+    * build a LONG context by concatenating several reservoir-sampled real
+      sequences (Amazon sequences are short, ~8 items, so one is not enough),
+    * STRIP any target items from the context so every prefix is target-free
+      (a clean ``real-prefix -> target`` signal that transfers to eval prefixes),
+    * keep the most recent ``context_len`` items (the decoder trims to the tail,
+      ``pad_or_trim_sequence``), then append the single ``target`` last.
+
+    ``context_len`` should be ``sequence_length / num_hierarchies - 1`` (29 for
+    the default 120-token / 4-hierarchy config): the full sub-sequence then fits
+    in the token budget and the target sits at the supervised tail of all
+    ``context_len`` clean prefixes. Longer contexts only trim back to this tail.
+    """
+    context_len = max(1, int(context_len))
+    ctx: List[int] = []
+    # Concatenate random real sequences (target-free) until we have enough
+    # recent context. Bounded so a degenerate all-target pool cannot loop.
+    for _ in range(4 * context_len + 8):
+        if len(ctx) >= context_len:
+            break
+        base = pool[int(rng.integers(0, len(pool)))]
+        ctx.extend(int(x) for x in base if int(x) not in target_set)
+    ctx = ctx[-context_len:]
+    if not ctx:
+        # Degenerate fallback (e.g. pool entirely targets): a 1-item context.
+        ctx = [int(target)]
+    ctx.append(int(target))
+    return ctx
+
+
 # ---------------------------------------------------------------------------
 # TFRecord writing
 # ---------------------------------------------------------------------------
@@ -722,8 +773,10 @@ def main(
     semantic_id_path: Optional[str] = None,
     segment_prefix_len: int = 2,
     segment_size: int = 200,
+    clone_context_len: int = 29,
+    clone_pool_size: int = 8192,
 ) -> str:
-    if method not in ("bandwagon", "segment", "clone_append"):
+    if method not in ("bandwagon", "segment", "clone_append", "clone_flood"):
         raise ValueError(f"Unknown method={method!r}")
     np.random.seed(seed)
     random.seed(seed)
@@ -871,6 +924,16 @@ def main(
         if not clone_pool:
             raise ValueError("clone_append found no real sequences to clone.")
         print(f"[clone_append] cloned-sequence pool size={len(clone_pool)}")
+    elif method == "clone_flood":
+        pool_k = max(int(clone_pool_size), sessions_to_add)
+        print(
+            f"[clone_flood] reservoir-sampling {pool_k} real sequences to source "
+            f"target-free context (context_len={clone_context_len}) ..."
+        )
+        clone_pool = _reservoir_sample_sequences(clean_shards, pool_k, rng)
+        if not clone_pool:
+            raise ValueError("clone_flood found no real sequences to clone.")
+        print(f"[clone_flood] context-sequence pool size={len(clone_pool)}")
 
     max_len = int(seq_lengths.max())
 
@@ -882,6 +945,14 @@ def main(
             base_seq = clone_pool[int(rng.integers(0, len(clone_pool)))]
             seq = _build_clone_append_sequence(
                 base_seq, target_items, rng, p_two_targets, max_len
+            )
+        elif method == "clone_flood":
+            # Round-robin the target across spam users for balanced coverage:
+            # with the fixed 1%-user budget split evenly, each of the
+            # n_target_items gets the maximum, equal reinforcement.
+            t = target_items[i % len(target_items)]
+            seq = _build_clone_flood_sequence(
+                clone_pool, t, rng, clone_context_len, target_set
             )
         elif method == "segment":
             t = int(rng.choice(target_items))
@@ -959,6 +1030,26 @@ def main(
     print(f"[bandwagon] Copying sibling dirs ({', '.join(SIBLING_SUBDIRS)}) ...")
     _copy_sibling_subdirs(data_dir, out_dir)
 
+    # Split isolation: the target boost must live ONLY in training. evaluation/
+    # and testing/ are copied verbatim from the clean source, so they must
+    # contain no injected spam shards and no spam user IDs. Verify explicitly.
+    for sub in ("evaluation", "testing"):
+        sub_dir = os.path.join(out_dir, sub)
+        if not os.path.isdir(sub_dir):
+            continue
+        stray = [f for f in os.listdir(sub_dir) if f.startswith("data_spam_")]
+        if stray:
+            raise RuntimeError(
+                f"Split leak: injected spam shards found under {sub_dir}: {stray}. "
+                "The boost must only appear in training/."
+            )
+    print(
+        "[bandwagon] Split isolation OK: spam appears only in training/; "
+        "evaluation/ and testing/ are verbatim clean copies "
+        f"(spam user IDs {max_user_id + 1}..{max_user_id + len(spam_user_ids)} "
+        "are absent from the eval/test splits)."
+    )
+
     manifest = {
         "spam_user_ids": spam_user_ids,
         "target_items": target_items,
@@ -966,7 +1057,12 @@ def main(
         "attack_type": attack,
         "target_strategy": target_strategy,
         "placement": (
-            "append_last" if method == "clone_append" else placement
+            "append_last"
+            if method == "clone_append"
+            else "append_last_flood" if method == "clone_flood" else placement
+        ),
+        "clone_context_len": (
+            int(clone_context_len) if method == "clone_flood" else None
         ),
         "segment_by": segment_by if method == "segment" else None,
         "segment_prefix_len": (
@@ -1032,14 +1128,41 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--method",
-        choices=("bandwagon", "segment", "clone_append"),
+        choices=("bandwagon", "segment", "clone_append", "clone_flood"),
         default="bandwagon",
         help=(
             "Poisoning method. 'bandwagon' (default): fake users mixing filler "
             "items (--attack pool) with targets. 'segment': fillers drawn from "
             "each target's semantic neighbourhood (--segment_by) — realistic "
             "niche-targeted spam. 'clone_append': clone real sequences and "
-            "append the target at the tail — models hijacked/bot accounts."
+            "append the target at the tail — models hijacked/bot accounts. "
+            "'clone_flood': long target-FREE real context (concatenated real "
+            "sequences) with ONE target at the supervised tail, target "
+            "round-robined across spam users. Maximises the number of clean "
+            "(real-prefix -> target) labels per spam user given TIGER's "
+            "contiguous-subsequence augmentation, so it is the strongest attack "
+            "at a fixed low poison ratio."
+        ),
+    )
+    p.add_argument(
+        "--clone_context_len",
+        type=int,
+        default=29,
+        help=(
+            "method=clone_flood only: number of target-free real context items "
+            "before the tail target. Set to sequence_length/num_hierarchies - 1 "
+            "(=29 for the default 120-token, 4-hierarchy config) so the full "
+            "spam sequence fits the token budget and the target is the "
+            "supervised label of all context_len clean prefixes."
+        ),
+    )
+    p.add_argument(
+        "--clone_pool_size",
+        type=int,
+        default=8192,
+        help=(
+            "method=clone_flood only: reservoir-sample size of real sequences "
+            "used as the context source (clamped up to n_spam_users)."
         ),
     )
     p.add_argument(
@@ -1179,4 +1302,6 @@ if __name__ == "__main__":
         semantic_id_path=args.semantic_id_path,
         segment_prefix_len=args.segment_prefix_len,
         segment_size=args.segment_size,
+        clone_context_len=args.clone_context_len,
+        clone_pool_size=args.clone_pool_size,
     )

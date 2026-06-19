@@ -927,7 +927,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         retain_batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
         *,
         negative_item_ids: Set[int],
-        temperature: float = 0.007,
+        temperature: float = 0.07,
     ) -> torch.Tensor:
         """Separation loss ``L_sep'`` (per-user, all-positives form).
 
@@ -967,6 +967,15 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             )
         input_ids = input_ids.to(device).long()
         mask = model_input.mask.to(device)
+        # Zero padded positions to an in-range code: _item_encoder_representation
+        # encodes each item with an all-ones attention mask, so it does NOT apply
+        # the usual ``* attention_mask`` that zeroes padded SID codes before the
+        # per-hierarchy offset is added. Without this, padded tokens (whose raw
+        # value can exceed the codebook size) overflow the embedding table and
+        # trigger a CUDA index assert. Padded items are excluded from r_u and the
+        # loss via ``item_valid`` below, so forcing them to code 0 is harmless.
+        keep = (mask > 0).long()
+        input_ids = input_ids * keep
 
         n_hier = int(self.num_hierarchies)
         bsz, seq_len = input_ids.shape
@@ -1023,7 +1032,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         lambda_forget: float = 1.0,
         lambda_sep: float = 0.1,
         forget_loss_level: str = "token",
-        sep_temperature: float = 0.007,
+        sep_temperature: float = 0.07,
         deletion_spec: str = "session",
         forget_item_ids: Optional[Set[int]] = None,
         neighbor_item_ids: Optional[Set[int]] = None,

@@ -28,11 +28,12 @@ def unified_unlearn(
     lambda_forget: float = 1.0,
     lambda_sep: float = 0.1,
     forget_loss_level: str = "token",
-    sep_temperature: float = 0.007,
+    sep_temperature: float = 0.07,
     deletion_spec: str = "session",
     forget_item_ids: Optional[Set[int]] = None,
     neighbor_item_ids: Optional[Set[int]] = None,
     sep_negative_item_ids: Optional[Set[int]] = None,
+    sep_negatives_mode: str = "forget",
     local_repair_cfg: Optional[Dict[str, Any]] = None,
     restrict_adaptive_codes: bool = False,
     stable_codes: int = 2,
@@ -59,10 +60,12 @@ def unified_unlearn(
     forget sample and every retain sample contributes to the gradient the same
     number of times, regardless of how many batches each side has.
 
-    The ``L_sep`` negatives are the forget items ``I_f`` only (slide form; no
+    The ``L_sep`` negatives default to the forget items ``I_f`` (slide form; no
     neighbors). ``sep_negative_item_ids``, when set, fully replaces them with a
-    fixed set — used for the random-retain-negatives ablation. Local repair
-    still uses ``neighbor_item_ids``.
+    fixed set — the ``forget_target_only`` mode (just the ``n_target`` spam
+    targets) and the random-retain ablation both flow through it.
+    ``sep_negatives_mode`` is the originating mode string, recorded for
+    metadata only. Local repair still uses ``neighbor_item_ids``.
     """
     device = device or next(model.parameters()).device
     if not retain_batches:
@@ -273,9 +276,7 @@ def unified_unlearn(
         "adaptive_adapter": bool(restrict_adaptive_codes and adaptive_adapter),
         "lambda_forget": float(lambda_forget),
         "lambda_sep": float(lambda_sep),
-        "sep_negatives": (
-            "random_retain" if sep_negative_item_ids is not None else "forget"
-        ),
+        "sep_negatives": str(sep_negatives_mode),
         "n_sep_negatives": len(sep_negatives_set),
         "forget_loss_level": str(forget_loss_level),
         "deletion_spec": str(deletion_spec),
