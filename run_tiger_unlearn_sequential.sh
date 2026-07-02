@@ -88,6 +88,16 @@ else
 fi
 EXTRA_OVERRIDES=("$@")
 
+# Model-only Hydra overrides to ALSO apply at post-unlearn eval time (the eval
+# uses experiment=tiger_train_flat, which has no `unlearning` group, so the
+# unlearn EXTRA_OVERRIDES can't be reused wholesale). Needed for PKM / adaptive-
+# offset checkpoints, e.g.:
+#   EVAL_EXTRA_OVERRIDES="model.pkm_layers={encoder:null,decoder:[0,1]} model.pkm_mode=replace"
+EVAL_MODEL_OVERRIDES=()
+if [ -n "${EVAL_EXTRA_OVERRIDES:-}" ]; then
+  read -r -a EVAL_MODEL_OVERRIDES <<< "${EVAL_EXTRA_OVERRIDES}"
+fi
+
 if [ -z "${CKPT_PATH}" ] || [ -z "${DATASET_OR_DIR}" ]; then
   echo "Missing required argument(s)."
   echo "Usage: sbatch run_tiger_unlearn_sequential.sh <ckpt_path> <dataset|data_dir> \\"
@@ -172,6 +182,11 @@ _PCT_LABEL="$(python3 -c "r=${POISONING_RATIO}; print(f'pct{int(round(r*100))}')
 # Tag the poison method (empty for bandwagon) so unlearn runs are self-describing.
 POISON_METHOD="${POISON_METHOD:-bandwagon}"
 if [ "${POISON_METHOD}" = "bandwagon" ]; then _MTOK=""; else _MTOK="_${POISON_METHOD}"; fi
+# clone_inject with >1 injection per session: encode the count (matches the
+# dataset token from resolve_grid_dataset.sh) so unlearn run tags distinguish K.
+if [ "${POISON_METHOD}" = "clone_inject" ] && [ "${CLONE_INJECT_COUNT:-1}" != "1" ]; then
+  _MTOK="${_MTOK}x${CLONE_INJECT_COUNT}"
+fi
 UNLEARN_RUN_TAG="${UNLEARN_RUN_TAG:-${_DATASET_SLUG}${_MTOK}_${_PCT_LABEL}_n${N_TARGET_ITEMS}_${ALGORITHM}}"
 UNLEARN_OUTPUT_DIR="$(unlearn_build_output_dir "${GRID_DIR}" "${REQUEST_BATCH_SIZE}")"
 unlearn_allocate_output_dir "${UNLEARN_OUTPUT_DIR}"
@@ -205,6 +220,26 @@ fi
 if [ ! -d "${DATA_DIR}/training_forget" ] || [ ! -d "${DATA_DIR}/training_retain" ]; then
   echo "data_dir must contain training_forget/ and training_retain/ subdirs."
   echo "Run 'python -m src.data.unlearning.split_forget_retain --data_dir ${DATA_DIR} --forget_manifest ${DATA_DIR}/forget_manifest.json' first."
+  exit 1
+fi
+
+# Runtime checkpoint resolution: if CKPT_PATH is a DIRECTORY (a training run dir
+# or its checkpoints/ subdir), pick the latest *.ckpt now. This lets unlearning
+# jobs be submitted with a --dependency on a still-training model and pick up the
+# FINAL checkpoint — whose filename/step isn't known at submit time — once the
+# dependency fires. A direct .ckpt path is used as-is.
+if [ -d "${CKPT_PATH}" ]; then
+  _CKPT_DIR="${CKPT_PATH%/}"
+  [ -d "${_CKPT_DIR}/checkpoints" ] && _CKPT_DIR="${_CKPT_DIR}/checkpoints"
+  _RESOLVED="$(ls -t "${_CKPT_DIR}"/*.ckpt 2>/dev/null | head -n1 || true)"
+  if [ -z "${_RESOLVED}" ]; then
+    echo "No .ckpt found under ${CKPT_PATH} (looked in ${_CKPT_DIR})."
+    exit 1
+  fi
+  echo "Resolved ckpt dir ${CKPT_PATH} -> ${_RESOLVED} (latest by mtime)"
+  CKPT_PATH="${_RESOLVED}"
+elif [ ! -f "${CKPT_PATH}" ]; then
+  echo "ckpt_path not found (neither a .ckpt file nor a run dir): ${CKPT_PATH}"
   exit 1
 fi
 
@@ -295,6 +330,7 @@ if [ "${UNLEARN_RUN_POST_EVAL}" = "true" ]; then
       trainer.deterministic=true \
       callbacks.model_checkpoint=null \
       callbacks.early_stopping=null \
+      ${EVAL_MODEL_OVERRIDES[@]+"${EVAL_MODEL_OVERRIDES[@]}"} \
       hydra.run.dir="${EVAL_OUT}"
     echo "[$(date -Is)] Post-unlearn eval finished"
     echo "Metrics: ${EVAL_OUT}/csv/version_0/metrics.csv"

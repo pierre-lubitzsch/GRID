@@ -44,6 +44,23 @@ unlearning:
   eval_mode: true
   rows_per_shard: 4096
 
+  # --- RQ-ID position-wise intervention (scif; parameter restriction) ---
+  # Confine the SCIF update to selected RQ semantic-ID code positions. This is
+  # the more general sibling of adaptive_codes (which only freezes a contiguous
+  # *prefix*): update_positions accepts ANY subset of code positions.
+  #   null / "all"  -> no restriction (uses target_params over the whole model)
+  #   [0]           -> c1 only         [2,3] -> [c3,c4]      [0,1] -> [c1,c2]
+  #   [c1,c2]       -> same as [0,1]   (cN names are 1-based; bare ints 0-based)
+  # When set, ONLY those positions' params move: decoder head decoder_mlp[h] +
+  # SID embedding rows [h*K,(h+1)*K). The shared transformer backbone stays
+  # frozen unless update_positions_backbone=true.
+  update_positions: null
+  update_positions_backbone: false
+
+  # --- RQ-ID diagnostics (python -m src.diagnose_rq_ids) ---
+  # both | positions | code_sharing. Read-only; no weight update.
+  diagnostics_mode: both
+
   # Fine-tune baseline
   finetune_steps: 500
   finetune_lr: 0.001

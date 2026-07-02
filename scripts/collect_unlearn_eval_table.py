@@ -30,6 +30,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from scripts.compute_relative_utility import (
+    _print_pgr_ur_table,
     _print_table,
     compute_relative_utility,
 )
@@ -249,8 +250,13 @@ def collect(
         runs_for_table.append(("poisoned", poisoned_csv))
     runs_for_table.extend((r.label, r.metrics_csv) for r in records)
 
-    results = compute_relative_utility(reference_csv=reference_csv, runs=runs_for_table)
+    # poisoned_csv is the pre-unlearn starting point -> enables PGR@k. It is also
+    # kept as a display row in runs_for_table; PGR is skipped for that row.
+    results = compute_relative_utility(
+        reference_csv=reference_csv, runs=runs_for_table, poison_csv=poisoned_csv
+    )
     _print_table(results)
+    _print_pgr_ur_table(results)
 
     payload: Dict[str, object] = {
         "created_at": datetime.utcnow().isoformat() + "Z",

@@ -99,6 +99,8 @@ def scif_unlearn(
     cg_tol: float = 1e-5,
     cg_damping: float = 0.01,
     target_params_policy: str = "tiger",
+    params: Optional[Sequence[nn.Parameter]] = None,
+    grad_masks: Optional[Dict[int, torch.Tensor]] = None,
     cg_solution_max_norm: Optional[float] = None,
     update_max_norm: Optional[float] = 1.0,
     eval_mode: bool = True,
@@ -131,7 +133,18 @@ def scif_unlearn(
         Conjugate-Gradient knobs (see :func:`cg_inv_hvp`).
     target_params_policy
         ``"all"`` / ``"sid_embeddings"`` / ``"encoder_only"``. See
-        :func:`select_target_params`.
+        :func:`select_target_params`. Ignored when ``params`` is given.
+    params
+        Optional precomputed list of parameters to update (e.g. the
+        position-restricted set from
+        :func:`select_code_position_params`). When ``None`` (default), the set
+        is resolved from ``target_params_policy``.
+    grad_masks
+        Optional ``id(param) -> float mask`` map. For each listed param the
+        per-element update ``-tau * x`` is multiplied by the mask before norm
+        clipping and application, so only the unmasked slots actually move
+        (used for the position-wise / adaptive-code interventions). Params
+        absent from the map are updated in full.
     cg_solution_max_norm
         If set, the CG solution ``x`` is joint L2-clipped before scaling by
         ``tau`` (rarely needed; prefer ``update_max_norm``).
@@ -175,12 +188,17 @@ def scif_unlearn(
     else:
         model.train()
 
-    params = select_target_params(model, policy=target_params_policy)
+    if params is None:
+        params = select_target_params(model, policy=target_params_policy)
+    else:
+        params = list(params)
+    grad_masks = grad_masks or {}
     log.info(
-        "[scif] policy=%s touches %d tensors with %d total params",
-        target_params_policy,
+        "[scif] policy=%s touches %d tensors with %d total params (%d grad-masked)",
+        target_params_policy if grad_masks is None or not grad_masks else "custom",
         len(params),
         int(sum(p.numel() for p in params)),
+        len(grad_masks),
     )
 
     # --- 1. Forget pass: subtract per-batch grads, averaged over retain_count
@@ -239,13 +257,22 @@ def scif_unlearn(
     tau = 1.0 / float(retain_size)
     update_before: List[torch.Tensor] = []
     n_param_skipped = 0
+    n_param_masked = 0
     with torch.no_grad():
-        for xi in x:
+        for p, xi in zip(params, x):
             if torch.isnan(xi).any() or torch.isinf(xi).any():
                 n_param_skipped += 1
                 update_before.append(torch.zeros_like(xi))
             else:
-                update_before.append((-tau) * xi)
+                du = (-tau) * xi
+                mask = grad_masks.get(id(p))
+                if mask is not None:
+                    # Restrict the update to the unmasked slots (e.g. the
+                    # selected RQ-code positions' embedding rows). Done before
+                    # norm clipping so the clip reflects only what actually moves.
+                    du = du * mask.to(device=du.device, dtype=du.dtype)
+                    n_param_masked += 1
+                update_before.append(du)
 
     update_norm_before_clip = flat_norm(update_before)
     log.info(
@@ -293,6 +320,7 @@ def scif_unlearn(
         "n_param_tensors_total": int(len(params)),
         "n_param_tensors_updated": int(n_param_updates),
         "n_param_tensors_skipped_nan": int(n_param_skipped),
+        "n_param_tensors_grad_masked": int(n_param_masked),
         "tau": tau,
         "grad_norm": float(grad_norm),
         "parameter_update_norm_before_clip": float(update_norm_before_clip),

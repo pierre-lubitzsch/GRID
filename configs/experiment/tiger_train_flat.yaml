@@ -276,6 +276,14 @@ model:
     query_dropout: 0.0
     value_dropout: 0.0
     sparse: false
+  # Optional separate optimizer param group for the PKM parameters (memory
+  # keys/values + query net). null (default) => PKM shares the single global
+  # optimizer group. Set a dict of per-group optimizer kwargs to give PKM its
+  # own lr / weight_decay, e.g. to try a higher-lr SGD-style update on the
+  # memory: 'model.pkm_param_group={lr:0.05,weight_decay:0.0}'. The optimizer
+  # *class* is the shared one from optim.optimizer (override _target_ to SGD to
+  # try SGD): both groups use that class, PKM just gets these overrides.
+  pkm_param_group: null
 callbacks:
   model_checkpoint:
     _target_: lightning.pytorch.callbacks.ModelCheckpoint
@@ -382,6 +390,9 @@ eval:
         _partial_: true
       ASI:
         _target_: src.components.eval_metrics.AvgSpamItems
+        _partial_: true
+      TPM:
+        _target_: src.components.eval_metrics.TargetProbMass
         _partial_: true
     forget_manifest_path: ${spam_forget_manifest}
     semantic_id_path: ${semantic_id_path}

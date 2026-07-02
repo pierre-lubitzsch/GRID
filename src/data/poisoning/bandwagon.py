@@ -279,6 +279,12 @@ def _select_target_items(
         pool = bottom
     elif strategy == "popular":
         pool = items_by_pop[: max(1, int(n * 0.05))]
+    elif strategy in ("mid", "average"):
+        # Middle-popularity bin: skip the top 30%, take the next 40% (matches the
+        # 'average' bin in _popularity_bins). A realistic "ordinary item" target.
+        lo = int(n * 0.3)
+        hi = lo + max(1, int(n * 0.4))
+        pool = items_by_pop[lo:hi]
     elif strategy == "random":
         pool = items_by_pop
     else:
@@ -625,20 +631,108 @@ def _build_clone_flood_sequence(
     ``context_len`` clean prefixes. Longer contexts only trim back to this tail.
     """
     context_len = max(1, int(context_len))
-    ctx: List[int] = []
-    # Concatenate random real sequences (target-free) until we have enough
-    # recent context. Bounded so a degenerate all-target pool cannot loop.
-    for _ in range(4 * context_len + 8):
-        if len(ctx) >= context_len:
-            break
-        base = pool[int(rng.integers(0, len(pool)))]
-        ctx.extend(int(x) for x in base if int(x) not in target_set)
-    ctx = ctx[-context_len:]
+    ctx = _sample_target_free_context(pool, rng, context_len, target_set)
     if not ctx:
         # Degenerate fallback (e.g. pool entirely targets): a 1-item context.
         ctx = [int(target)]
     ctx.append(int(target))
     return ctx
+
+
+def _sample_target_free_context(
+    pool: List[List[int]],
+    rng: np.random.Generator,
+    context_len: int,
+    target_set: set,
+) -> List[int]:
+    """Concatenate reservoir-sampled real sequences, strip any target items, and
+    keep the most recent ``context_len`` items.
+
+    Shared context builder for ``clone_flood`` and ``clone_inject``: every item
+    is a genuine (non-target) click, so each ``(prefix -> target)`` label the
+    attack creates is a clean real-prefix signal that transfers to eval prefixes.
+    Bounded loop so a degenerate all-target pool cannot spin forever.
+    """
+    context_len = max(1, int(context_len))
+    ctx: List[int] = []
+    for _ in range(4 * context_len + 8):
+        if len(ctx) >= context_len:
+            break
+        base = pool[int(rng.integers(0, len(pool)))]
+        ctx.extend(int(x) for x in base if int(x) not in target_set)
+    return ctx[-context_len:]
+
+
+def _build_clone_inject_sequence(
+    pool: List[List[int]],
+    target: int,
+    rng: np.random.Generator,
+    context_len: int,
+    target_set: set,
+    n_inject: int = 1,
+) -> List[int]:
+    """Long target-FREE real context with ``n_inject`` copies of ``target``
+    injected at distinct random NON-FIRST positions (the variant of
+    ``clone_flood`` that does not append). ``n_inject=1`` (default) reproduces
+    the original single-injection behaviour.
+
+    The context is built exactly like :func:`_build_clone_flood_sequence`
+    (concatenate reservoir-sampled real sequences, strip targets), but instead of
+    appending one target at the tail, ``n_inject`` copies of the (round-robined)
+    target are scattered at distinct random positions, none of them position 0.
+
+    Two guarantees every injected position must satisfy
+    ---------------------------------------------------
+    The decoder trims each sequence to the most-recent ``sequence_length``
+    tokens (``pad_or_trim_sequence`` keeps the TAIL), and the training collate
+    (``collate_with_sid_causal_duplicate``) only forms contiguous sub-sequences
+    of length >= 2 with ``NextKTokenMasking`` supervising the LAST item of each.
+    So for an injected target to be learned it must, *after trimming*:
+
+    * NOT be trimmed away (else it never appears as a training label), and
+    * NOT be the first item of the retained window (item 0 is pure context and
+      can never be a ``(prefix -> target)`` label).
+
+    We keep the TOTAL length fixed at the ``context_len + 1`` window regardless of
+    ``n_inject`` by spending ``n_inject`` of the window's slots on targets and the
+    remaining ``context_len + 1 - n_inject`` on real context. With
+    ``context_len = sequence_length/num_hierarchies - 1`` (29 for the default
+    120-token / 4-hierarchy config) the whole sequence fits the token budget
+    exactly, so trimming removes nothing and the raw slot index equals the
+    post-trim index. Slot 0 is always a real context item, so every injected
+    target is non-first and never trimmed; more injections = more
+    ``(real-prefix -> target)`` labels per spam user (the tradeoff vs longer
+    target-free context).
+    """
+    context_len = max(1, int(context_len))
+    window = context_len + 1  # fixed total length (matches clone_flood's window)
+    # Need >= 1 real slot so position 0 is context (=> targets are never first).
+    k = max(1, min(int(n_inject), window - 1))
+    n_ctx = window - k
+    ctx = _sample_target_free_context(pool, rng, n_ctx, target_set)
+    if not ctx:
+        # Degenerate fallback (pool entirely targets): no non-first slot exists,
+        # so the target is the only item we can emit.
+        return [int(target)]
+    if k == 1:
+        # Backward-compatible single-injection path: same context sampling AND
+        # the original ``rng.integers`` insertion, so the RNG stream (and thus
+        # the generated dataset for a given seed) is BIT-IDENTICAL to the
+        # pre-n_inject version. n_inject=1 is the default, so existing
+        # clone_inject datasets reproduce exactly.
+        pos = int(rng.integers(1, len(ctx) + 1))
+        return ctx[:pos] + [int(target)] + ctx[pos:]
+    final_len = len(ctx) + k
+    # Guard against a short context: keep >= 1 non-target slot (slot 0).
+    k = min(k, final_len - 1)
+    # Distinct target slots drawn from positions 1..final_len-1 (never slot 0).
+    chosen = rng.choice(final_len - 1, size=k, replace=False) + 1
+    target_slots = {int(s) for s in chosen.tolist()}
+    seq: List[int] = []
+    ctx_iter = iter(ctx)
+    for pos in range(final_len):
+        seq.append(int(target) if pos in target_slots else int(next(ctx_iter)))
+    return seq
 
 
 # ---------------------------------------------------------------------------
@@ -718,15 +812,37 @@ def method_suffix(method: str) -> str:
     return "" if method == "bandwagon" else f"_{method}"
 
 
+def strategy_suffix(target_strategy: str) -> str:
+    """Naming token for the target-selection strategy. Empty for ``unpopular``
+    (the historical default) so existing datasets/runs keep their names; other
+    strategies insert ``_tgt<strategy>`` (e.g. ``_tgtmid``, ``_tgtpopular``) so
+    the three popularity variants of the same (method, n, seed, pct) don't
+    collide on one directory."""
+    return "" if target_strategy == "unpopular" else f"_tgt{target_strategy}"
+
+
 def _default_out_dir(
-    data_dir: str, seed: int, ratio: float, n_targets: int, method: str = "bandwagon"
+    data_dir: str,
+    seed: int,
+    ratio: float,
+    n_targets: int,
+    method: str = "bandwagon",
+    clone_inject_count: int = 1,
+    target_strategy: str = "unpopular",
 ) -> str:
     parent = os.path.dirname(os.path.abspath(data_dir.rstrip("/"))) or "."
     base = os.path.basename(os.path.abspath(data_dir.rstrip("/")))
     pct = int(round(ratio * 100))
+    mtok = method_suffix(method)
+    # clone_inject with >1 injection gets a distinct name (e.g. _clone_injectx3)
+    # so different injection counts don't overwrite each other; count=1 keeps the
+    # plain _clone_inject name (backward-compatible, like bandwagon's empty token).
+    if method == "clone_inject" and int(clone_inject_count) > 1:
+        mtok = f"{mtok}x{int(clone_inject_count)}"
+    stok = strategy_suffix(target_strategy)
     return os.path.join(
         parent,
-        f"{base}_spam{method_suffix(method)}_seed{seed}_pct{pct}_n{n_targets}",
+        f"{base}_spam{mtok}{stok}_seed{seed}_pct{pct}_n{n_targets}",
     )
 
 
@@ -775,8 +891,15 @@ def main(
     segment_size: int = 200,
     clone_context_len: int = 29,
     clone_pool_size: int = 8192,
+    clone_inject_count: int = 1,
 ) -> str:
-    if method not in ("bandwagon", "segment", "clone_append", "clone_flood"):
+    if method not in (
+        "bandwagon",
+        "segment",
+        "clone_append",
+        "clone_flood",
+        "clone_inject",
+    ):
         raise ValueError(f"Unknown method={method!r}")
     np.random.seed(seed)
     random.seed(seed)
@@ -924,16 +1047,16 @@ def main(
         if not clone_pool:
             raise ValueError("clone_append found no real sequences to clone.")
         print(f"[clone_append] cloned-sequence pool size={len(clone_pool)}")
-    elif method == "clone_flood":
+    elif method in ("clone_flood", "clone_inject"):
         pool_k = max(int(clone_pool_size), sessions_to_add)
         print(
-            f"[clone_flood] reservoir-sampling {pool_k} real sequences to source "
+            f"[{method}] reservoir-sampling {pool_k} real sequences to source "
             f"target-free context (context_len={clone_context_len}) ..."
         )
         clone_pool = _reservoir_sample_sequences(clean_shards, pool_k, rng)
         if not clone_pool:
-            raise ValueError("clone_flood found no real sequences to clone.")
-        print(f"[clone_flood] context-sequence pool size={len(clone_pool)}")
+            raise ValueError(f"{method} found no real sequences to clone.")
+        print(f"[{method}] context-sequence pool size={len(clone_pool)}")
 
     max_len = int(seq_lengths.max())
 
@@ -953,6 +1076,15 @@ def main(
             t = target_items[i % len(target_items)]
             seq = _build_clone_flood_sequence(
                 clone_pool, t, rng, clone_context_len, target_set
+            )
+        elif method == "clone_inject":
+            # Same long target-free real context as clone_flood, but the single
+            # target is injected at a random non-first / never-trimmed position
+            # instead of the tail. Target round-robined for balanced coverage.
+            t = target_items[i % len(target_items)]
+            seq = _build_clone_inject_sequence(
+                clone_pool, t, rng, clone_context_len, target_set,
+                n_inject=clone_inject_count,
             )
         elif method == "segment":
             t = int(rng.choice(target_items))
@@ -1004,6 +1136,8 @@ def main(
             ratio=poisoning_ratio,
             n_targets=n_target_items,
             method=method,
+            clone_inject_count=clone_inject_count,
+            target_strategy=target_strategy,
         )
     out_training_dir = os.path.join(out_dir, TRAINING_SUBDIR)
     if os.path.exists(out_dir):
@@ -1059,10 +1193,19 @@ def main(
         "placement": (
             "append_last"
             if method == "clone_append"
-            else "append_last_flood" if method == "clone_flood" else placement
+            else "append_last_flood"
+            if method == "clone_flood"
+            else "inject_random_nonfirst"
+            if method == "clone_inject"
+            else placement
         ),
         "clone_context_len": (
-            int(clone_context_len) if method == "clone_flood" else None
+            int(clone_context_len)
+            if method in ("clone_flood", "clone_inject")
+            else None
+        ),
+        "clone_inject_count": (
+            int(clone_inject_count) if method == "clone_inject" else None
         ),
         "segment_by": segment_by if method == "segment" else None,
         "segment_prefix_len": (
@@ -1128,7 +1271,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--method",
-        choices=("bandwagon", "segment", "clone_append", "clone_flood"),
+        choices=(
+            "bandwagon",
+            "segment",
+            "clone_append",
+            "clone_flood",
+            "clone_inject",
+        ),
         default="bandwagon",
         help=(
             "Poisoning method. 'bandwagon' (default): fake users mixing filler "
@@ -1141,7 +1290,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "round-robined across spam users. Maximises the number of clean "
             "(real-prefix -> target) labels per spam user given TIGER's "
             "contiguous-subsequence augmentation, so it is the strongest attack "
-            "at a fixed low poison ratio."
+            "at a fixed low poison ratio. 'clone_inject': like clone_flood but "
+            "the single target is injected at a RANDOM position rather than the "
+            "tail — chosen so it is never trimmed away and never the first item "
+            "of the (untrimmed) window, so it still yields clean "
+            "(real-prefix -> target) labels while reading as mid-session spam."
         ),
     )
     p.add_argument(
@@ -1149,11 +1302,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=29,
         help=(
-            "method=clone_flood only: number of target-free real context items "
-            "before the tail target. Set to sequence_length/num_hierarchies - 1 "
-            "(=29 for the default 120-token, 4-hierarchy config) so the full "
-            "spam sequence fits the token budget and the target is the "
-            "supervised label of all context_len clean prefixes."
+            "method=clone_flood/clone_inject only: number of target-free real "
+            "context items the spam sequence is built from. Set to "
+            "sequence_length/num_hierarchies - 1 (=29 for the default 120-token, "
+            "4-hierarchy config) so the full spam sequence (context_len + 1 "
+            "target = the window) fits the token budget and is never trimmed. "
+            "For clone_flood the target is the supervised tail of all "
+            "context_len clean prefixes; for clone_inject it is inserted at a "
+            "random non-first position within the same untrimmed window."
+        ),
+    )
+    p.add_argument(
+        "--clone_inject_count",
+        type=int,
+        default=1,
+        help=(
+            "method=clone_inject only: how many copies of the (round-robined) "
+            "target to inject per spam session, at distinct random NON-FIRST "
+            "positions. Default 1. The total session length stays fixed at the "
+            "clone_context_len + 1 window (more injections trade real context for "
+            "more target labels). >1 names the dataset _clone_injectx<count> so "
+            "counts don't collide."
         ),
     )
     p.add_argument(
@@ -1161,8 +1330,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=8192,
         help=(
-            "method=clone_flood only: reservoir-sample size of real sequences "
-            "used as the context source (clamped up to n_spam_users)."
+            "method=clone_flood/clone_inject only: reservoir-sample size of "
+            "real sequences used as the context source (clamped up to "
+            "n_spam_users)."
         ),
     )
     p.add_argument(
@@ -1214,8 +1384,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--target_strategy",
-        choices=("unpopular", "popular", "random"),
+        choices=("unpopular", "mid", "popular", "random"),
         default="unpopular",
+        help=(
+            "Which items to target. 'unpopular' (bottom 20%, default), 'mid' "
+            "(middle 40%, an ordinary item), 'popular' (top 5%), 'random' (any)."
+        ),
     )
     p.add_argument("--poisoning_ratio", type=float, default=0.01)
     p.add_argument("--n_target_items", type=int, default=10)
@@ -1304,4 +1478,5 @@ if __name__ == "__main__":
         segment_size=args.segment_size,
         clone_context_len=args.clone_context_len,
         clone_pool_size=args.clone_pool_size,
+        clone_inject_count=args.clone_inject_count,
     )

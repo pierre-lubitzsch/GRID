@@ -87,9 +87,26 @@ def _ratio(num: float, den: float) -> Optional[float]:
     return num / den
 
 
+def _pgr(sh_poison: float, sh_unlearn: float, sh_clean: float) -> Optional[float]:
+    """Poisoning gap removed: (SH_poison - SH_unlearn) / (SH_poison - SH_clean).
+
+    1.0 = unlearning pushed spam exposure all the way down to the clean model;
+    0.0 = no change from the poisoned model; <0 = made it worse; >1 = overshot
+    below the clean baseline. ``None`` if any input is NaN or the poison gap
+    (SH_poison - SH_clean) is zero (no attack-induced exposure to remove).
+    """
+    if any(math.isnan(x) for x in (sh_poison, sh_unlearn, sh_clean)):
+        return None
+    gap = sh_poison - sh_clean
+    if gap == 0:
+        return None
+    return (sh_poison - sh_unlearn) / gap
+
+
 def compute_relative_utility(
     reference_csv: str,
     runs: List[Tuple[str, str]],
+    poison_csv: Optional[str] = None,
 ) -> Dict[str, Dict[str, Optional[float]]]:
     """Read every CSV in ``runs`` plus ``reference_csv`` and emit ratios.
 
@@ -97,26 +114,71 @@ def compute_relative_utility(
     ----------
     reference_csv
         Path to the metrics.csv produced by the clean / retrained reference
-        ckpt.
+        ckpt (the SH_clean / U_clean baseline).
     runs
         List of ``(label, csv_path)`` tuples. The label is used as the key
         in the output dict.
+    poison_csv
+        Optional metrics.csv for the poisoned (pre-unlearn) checkpoint — the
+        starting point of every unlearning run. When given, each run also gets:
+        * ``utility_retention`` (UR): ``ndcg@k_run / ndcg@k_clean`` for each k.
+        * ``pgr`` (PGR@k): poisoning gap removed on SH@k, computed for the
+          *unlearning* runs only (skipped for the poison baseline row itself
+          and the clean reference).
+        UR is emitted whenever a reference is present; it does not need
+        ``poison_csv``, but PGR does.
     """
     reference_metrics = _read_test_metrics(reference_csv)
+    poison_metrics = _read_test_metrics(poison_csv) if poison_csv else None
+    poison_abspath = os.path.abspath(poison_csv) if poison_csv else None
     results: Dict[str, Dict[str, Optional[float]]] = {
         "_reference_path": reference_csv,  # type: ignore[dict-item]
         "_reference_metrics": reference_metrics,  # type: ignore[dict-item]
     }
+    if poison_metrics is not None:
+        results["_poison_path"] = poison_csv  # type: ignore[assignment]
+        results["_poison_metrics"] = poison_metrics  # type: ignore[assignment]
     for label, csv_path in runs:
         run_metrics = _read_test_metrics(csv_path)
         ratios: Dict[str, Optional[float]] = {}
         common = sorted(set(reference_metrics).intersection(run_metrics))
         for metric in common:
             ratios[metric] = _ratio(run_metrics[metric], reference_metrics[metric])
+
+        # Utility retention (UR) = U_unlearn / U_clean on ndcg@k (k in 5, 10).
+        utility_retention: Dict[str, Optional[float]] = {}
+        for metric in common:
+            if metric.startswith("test/ndcg@"):
+                utility_retention[metric] = _ratio(
+                    run_metrics[metric], reference_metrics[metric]
+                )
+
+        # Poisoning gap removed (PGR@k) on SH@k — unlearning runs only, so skip
+        # the poison baseline row itself (its PGR is trivially 0).
+        pgr: Dict[str, Optional[float]] = {}
+        is_poison_row = (
+            poison_abspath is not None
+            and os.path.abspath(csv_path) == poison_abspath
+        )
+        if poison_metrics is not None and not is_poison_row:
+            for metric in run_metrics:
+                if not metric.startswith("test/SH@"):
+                    continue
+                if metric not in poison_metrics or metric not in reference_metrics:
+                    continue
+                k = metric.split("@", 1)[1]
+                pgr[f"PGR@{k}"] = _pgr(
+                    poison_metrics[metric],
+                    run_metrics[metric],
+                    reference_metrics[metric],
+                )
+
         results[label] = {  # type: ignore[assignment]
             "csv_path": csv_path,
             "metrics": run_metrics,
             "relative_utility": ratios,
+            "utility_retention": utility_retention,
+            "pgr": pgr,
         }
     return results
 
@@ -140,6 +202,46 @@ def _print_table(results: Dict[str, Dict[str, Optional[float]]]) -> None:
         rows.append(row)
     widths = [max(len(r[i]) for r in [header] + rows) for i in range(len(header))]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*header))
+    print(fmt.format(*("-" * w for w in widths)))
+    for row in rows:
+        print(fmt.format(*row))
+
+
+def _print_pgr_ur_table(results: Dict[str, Dict[str, Optional[float]]]) -> None:
+    """Print per-run PGR@k (poisoning gap removed) and UR (utility retention).
+
+    PGR columns appear only when a poison baseline was provided; UR (ndcg@k
+    ratio vs clean) is always shown. Runs with no PGR (e.g. the poison row) show
+    ``n/a``.
+    """
+    labels = [k for k in results if not k.startswith("_")]
+    if not labels:
+        return
+    # Collect the union of PGR@k and UR ndcg@k keys across runs, sorted by k.
+    pgr_keys: set = set()
+    ur_keys: set = set()
+    for lab in labels:
+        pgr_keys.update(results[lab].get("pgr", {}).keys())
+        ur_keys.update(results[lab].get("utility_retention", {}).keys())
+    pgr_cols = sorted(pgr_keys, key=lambda s: int(s.split("@")[1]))
+    ur_cols = sorted(ur_keys, key=lambda s: int(s.split("@")[1]))
+    if not pgr_cols and not ur_cols:
+        return
+    ur_hdr = [f"UR({c.replace('test/', '')})" for c in ur_cols]
+    header = ["run"] + pgr_cols + ur_hdr
+    rows: List[List[str]] = []
+    for lab in labels:
+        pgr = results[lab].get("pgr", {})
+        ur = results[lab].get("utility_retention", {})
+        row = [lab]
+        row += [_fmt(pgr.get(c), is_ratio=True) for c in pgr_cols]
+        row += [_fmt(ur.get(c), is_ratio=True) for c in ur_cols]
+        rows.append(row)
+    widths = [max(len(r[i]) for r in [header] + rows) for i in range(len(header))]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print("\nPoisoning gap removed (PGR@k, higher=more spam removed) "
+          "& utility retention (UR=ndcg_run/ndcg_clean):")
     print(fmt.format(*header))
     print(fmt.format(*("-" * w for w in widths)))
     for row in rows:
@@ -202,6 +304,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Labels for --extra paths, in the same order; repeatable.",
     )
     p.add_argument(
+        "--poisoned",
+        default=None,
+        help=(
+            "Optional metrics.csv for the poisoned (pre-unlearn) checkpoint, the "
+            "starting point of the unlearning runs. Enables PGR@k (poisoning gap "
+            "removed on SH@k) for every other run."
+        ),
+    )
+    p.add_argument(
         "--out_json",
         default=None,
         help="Optional path to dump the full results dict as JSON.",
@@ -250,8 +361,11 @@ def main() -> None:
         runs = [(args.label_unlearned, args.unlearned)]
         runs.extend(_resolve_extras(args.extra, args.label_extra))
 
-    results = compute_relative_utility(reference_csv=args.reference, runs=runs)
+    results = compute_relative_utility(
+        reference_csv=args.reference, runs=runs, poison_csv=args.poisoned
+    )
     _print_table(results)
+    _print_pgr_ur_table(results)
 
     if args.out_json:
         os.makedirs(os.path.dirname(os.path.abspath(args.out_json)) or ".", exist_ok=True)

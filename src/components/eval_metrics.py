@@ -214,6 +214,38 @@ class AvgSpamItems(CustomSpamMetric):
         self.total_values += is_spam_label.numel()  # denom: |U| (all examples)
 
 
+class TargetProbMass(CustomSpamMetric):
+    """TPM: mean over queries of the generation probability mass on targets I_t.
+
+        TPM = (1/|Q|) * Σ_q  Σ_{i∈I_t} p(s_i | q)
+
+    For each query it sums the *linear* marginal sequence probability of every
+    generated candidate whose semantic ID is a target item, then averages over
+    all queries. ``marginal_probs`` is already a linear probability in [0, 1]
+    (the beam's product-of-per-hierarchy-softmax score in
+    ``tiger_generation_model.generate``), so no exponentiation is needed.
+
+    Unlike SH@k / ASI@k this is NOT top-k truncated and NOT restricted to
+    non-target-labelled examples — it is the remaining probability the model
+    would generate for the spam IDs over the whole query set. ``top_k`` is
+    accepted for the shared registration machinery but ignored, so TPM@5 and
+    TPM@10 are identical (read either).
+    """
+
+    def update(
+        self,
+        preds: torch.Tensor,
+        is_spam_cand: torch.Tensor,
+        is_spam_label: torch.Tensor,
+    ) -> None:
+        # preds: (B, C) linear marginal prob of each generated candidate.
+        # is_spam_cand: (B, C) bool — candidate's full SID matches a target item.
+        # is_spam_label is unused (TPM is over all queries q ∈ Q).
+        mass = (preds * is_spam_cand.to(preds.dtype)).sum(dim=1)  # (B,)
+        self.metric_values += mass.sum().item()
+        self.total_values += int(preds.size(0))  # denom: |Q| (all queries)
+
+
 ## Evaluators
 
 class Evaluator:

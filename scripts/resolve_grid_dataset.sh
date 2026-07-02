@@ -35,7 +35,19 @@ resolve_grid_dataset() {
   _n="${N_TARGET_ITEMS:-10}"
   _method="${POISON_METHOD:-bandwagon}"
   if [ "${_method}" = "bandwagon" ]; then _mtok=""; else _mtok="_${_method}"; fi
-  _sfx="_spam${_mtok}_seed${_seed}_pct${_pct}_n${_n}"
+  # clone_inject with >1 injection per session gets a distinct token
+  # (_clone_injectx<count>) so different injection counts don't share a dir;
+  # count=1 (default) keeps the plain _clone_inject name.
+  if [ "${_method}" = "clone_inject" ] && [ "${CLONE_INJECT_COUNT:-1}" != "1" ]; then
+    _mtok="${_mtok}x${CLONE_INJECT_COUNT}"
+  fi
+  # Target-selection strategy token: empty for 'unpopular' (default, backward
+  # compatible); 'mid'/'popular'/'random' insert _tgt<strategy> so the three
+  # popularity variants of one (method,n,seed,pct) live in separate dirs.
+  local _strat _stok
+  _strat="${TARGET_STRATEGY:-unpopular}"
+  if [ "${_strat}" = "unpopular" ]; then _stok=""; else _stok="_tgt${_strat}"; fi
+  _sfx="_spam${_mtok}${_stok}_seed${_seed}_pct${_pct}_n${_n}"
 
   case "${name}" in
     beauty)

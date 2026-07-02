@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from copy import deepcopy
 from functools import partial
@@ -32,6 +33,10 @@ from src.components.unlearning.neighborhood_sampler import (
 from src.components.unlearning.neg_train import neg_train_unlearn
 from src.components.unlearning.scif import scif_unlearn
 from src.components.unlearning.seif import seif_unlearn
+from src.components.unlearning.target_params import (
+    select_code_position_params,
+    select_target_params,
+)
 from src.components.unlearning.unified import unified_unlearn
 from src.data.loading.utils import assign_files_to_workers
 from src.data.unlearning.deletion_spec import (
@@ -219,6 +224,30 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             cg_solution_max_norm = unlearning_cfg.get("max_norm")
         update_max_norm = unlearning_cfg.get("update_max_norm", 1.0)
 
+        # Position-wise intervention: optionally confine the update to selected
+        # RQ-code positions' parameters (decoder heads + SID embedding rows).
+        positions = _resolve_update_positions(
+            unlearning_cfg.get("update_positions"),
+            int(num_hierarchies or self.num_hierarchies),
+        )
+        scif_params = None
+        scif_grad_masks = None
+        if positions is not None:
+            scif_params, scif_grad_masks = select_code_position_params(
+                self,
+                positions=positions,
+                update_backbone=bool(
+                    unlearning_cfg.get("update_positions_backbone", False)
+                ),
+            )
+            log.info(
+                "[scif] position-wise intervention: update_positions=%s "
+                "(backbone=%s) -> %d param tensors",
+                positions,
+                bool(unlearning_cfg.get("update_positions_backbone", False)),
+                len(scif_params),
+            )
+
         info = scif_unlearn(
             model=self,
             forget_batches=forget_batches,
@@ -230,6 +259,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             cg_tol=float(unlearning_cfg.get("cg_tol", 1e-5)),
             cg_damping=float(unlearning_cfg.get("damping", 0.01)),
             target_params_policy=str(unlearning_cfg.get("target_params", "all")),
+            params=scif_params,
+            grad_masks=scif_grad_masks,
             cg_solution_max_norm=cg_solution_max_norm,
             update_max_norm=update_max_norm,
             eval_mode=bool(unlearning_cfg.get("eval_mode", True)),
@@ -238,7 +269,104 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         info["wall_seconds"] = time.time() - t0
         info.update(ctx["meta"])
         info["algorithm"] = "scif"
+        info["update_positions"] = positions
+        info["update_positions_backbone"] = (
+            bool(unlearning_cfg.get("update_positions_backbone", False))
+            if positions is not None
+            else None
+        )
         return info
+
+    def diagnose_rq_ids(
+        self,
+        *,
+        unlearning_cfg: Dict[str, Any],
+        train_dataloader_config: "SequenceDataloaderConfig",
+        data_dir: str,
+        forget_subdir: str,
+        retain_subdir: str,
+        retain_subset_dir: str,
+        semantic_id_path: Optional[str],
+        forget_size_hint: Optional[int] = None,
+        seed: int = 2,
+        num_hierarchies: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        forget_manifest_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """RQ-ID diagnosis (read-only; no weight update).
+
+        Runs the position-wise gradient signal analysis and/or the static
+        code-sharing analysis selected by ``unlearning_cfg['diagnostics_mode']``
+        (``both`` | ``positions`` | ``code_sharing``) and returns a combined
+        report dict. ``positions`` reuses ``_prepare_unlearning_context`` to
+        build the same forget/retain batches the unlearning algorithms use.
+        """
+        device = device or next(self.parameters()).device
+        H = int(num_hierarchies or self.num_hierarchies)
+        mode = str(unlearning_cfg.get("diagnostics_mode", "both")).strip().lower()
+        if mode not in ("both", "positions", "code_sharing"):
+            raise ValueError(
+                f"diagnostics_mode={mode!r} must be both|positions|code_sharing"
+            )
+
+        manifest_path = forget_manifest_path or resolve_forget_manifest_path(data_dir)
+        diag: Dict[str, Any] = {
+            "num_hierarchies": H,
+            "diagnostics_mode": mode,
+            "data_dir": os.path.abspath(data_dir),
+            "forget_manifest_path": manifest_path,
+            "semantic_id_path": (
+                os.path.abspath(semantic_id_path) if semantic_id_path else None
+            ),
+        }
+
+        if mode in ("positions", "both"):
+            from src.components.unlearning.position_diagnostics import (
+                per_position_gradient_report,
+            )
+
+            ctx = self._prepare_unlearning_context(
+                unlearning_cfg=unlearning_cfg,
+                train_dataloader_config=train_dataloader_config,
+                data_dir=data_dir,
+                forget_subdir=forget_subdir,
+                retain_subdir=retain_subdir,
+                retain_subset_dir=retain_subset_dir,
+                semantic_id_path=semantic_id_path,
+                forget_size_hint=forget_size_hint,
+                seed=seed,
+                num_hierarchies=num_hierarchies,
+                device=device,
+                forget_manifest_path=forget_manifest_path,
+            )
+            params = select_target_params(
+                self, policy=str(unlearning_cfg.get("target_params", "tiger"))
+            )
+            diag["position_gradients"] = per_position_gradient_report(
+                self,
+                ctx["forget_batches"],
+                ctx["retain_batches"],
+                params,
+                num_hierarchies=H,
+                eval_mode=bool(unlearning_cfg.get("eval_mode", True)),
+            )
+            diag["target_items"] = ctx["meta"]["target_items"]
+            diag["forget_size"] = ctx["forget_size_for_scif"]
+
+        if mode in ("code_sharing", "both"):
+            from src.components.unlearning.code_sharing import code_sharing_report
+
+            if not semantic_id_path:
+                raise ValueError(
+                    "code-sharing analysis requires semantic_id_path (the RQ-ID "
+                    "tensor) to be set"
+                )
+            targets = load_target_items(load_forget_manifest(manifest_path))
+            diag["code_sharing"] = code_sharing_report(
+                semantic_id_path, sorted(targets), num_hierarchies=H
+            )
+
+        return diag
 
     def _run_finetune(self, **kwargs: Any) -> Dict[str, Any]:
         ctx = self._prepare_unlearning_context(**kwargs)
@@ -673,6 +801,55 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             default_count,
         )
         return sampled
+
+
+def _resolve_update_positions(
+    value: Any, num_hierarchies: int
+) -> Optional[List[int]]:
+    """Parse the ``unlearning.update_positions`` knob into 0-based hierarchy ids.
+
+    Accepts:
+      * ``None`` / ``"all"`` / ``"null"`` / ``"none"`` / ``""`` -> ``None`` (no
+        restriction).
+      * a list of 0-based indices, e.g. ``[0, 1]`` (== c1, c2).
+      * a list / comma string of code names, e.g. ``["c1", "c2"]`` or
+        ``"c1,c2"`` (1-based names mapped to 0-based indices).
+      * a comma/space string of indices, e.g. ``"2,3"``.
+
+    Returns a sorted list of distinct indices, or ``None`` when the selection is
+    empty or equals the full set ``{0..H-1}`` (both mean "update everything").
+    Do not mix bare numbers and ``cN`` names in one list (numbers are 0-based,
+    ``cN`` is 1-based).
+    """
+    if value is None:
+        return None
+    items: Any = value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("", "all", "null", "none"):
+            return None
+        items = [tok for tok in re.split(r"[,\s]+", s.strip("[]() ")) if tok]
+    idxs: List[int] = []
+    for it in items:
+        if isinstance(it, str):
+            tok = it.strip().lower()
+            if tok.startswith("c"):
+                idxs.append(int(tok[1:]) - 1)  # c1 -> 0
+            else:
+                idxs.append(int(tok))
+        else:
+            idxs.append(int(it))
+    idxs = sorted(set(idxs))
+    if not idxs:
+        return None
+    for h in idxs:
+        if not 0 <= h < num_hierarchies:
+            raise ValueError(
+                f"update_positions index {h} out of range [0, {num_hierarchies})"
+            )
+    if len(idxs) == num_hierarchies:
+        return None  # full set == no restriction
+    return idxs
 
 
 def _list_shards_safe(directory: str) -> List[str]:

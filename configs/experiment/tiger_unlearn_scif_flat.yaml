@@ -58,6 +58,23 @@ unlearning:
   target_params: tiger
   eval_mode: true
   rows_per_shard: 4096
+
+  # --- RQ-ID position-wise intervention (scif; parameter restriction) ---
+  # Confine the SCIF update to selected RQ semantic-ID code positions (the
+  # general sibling of adaptive_codes, which only freezes a contiguous prefix).
+  #   null / "all"  -> no restriction (uses target_params over the whole model)
+  #   [0]           -> c1 only         [2,3] -> [c3,c4]      [0,1] -> [c1,c2]
+  #   [c1,c2]       -> same as [0,1]   (cN names are 1-based; bare ints 0-based)
+  # When set, ONLY those positions' params move: decoder head decoder_mlp[h] +
+  # SID embedding rows [h*K,(h+1)*K); backbone frozen unless
+  # update_positions_backbone=true.
+  update_positions: null
+  update_positions_backbone: false
+
+  # --- RQ-ID diagnostics (python -m src.diagnose_rq_ids) ---
+  # both | positions | code_sharing. Read-only; no weight update.
+  diagnostics_mode: both
+
   finetune_steps: 500
   finetune_lr: 0.001
   neg_train_steps: 200
@@ -414,6 +431,9 @@ eval:
         _partial_: true
       ASI:
         _target_: src.components.eval_metrics.AvgSpamItems
+        _partial_: true
+      TPM:
+        _target_: src.components.eval_metrics.TargetProbMass
         _partial_: true
     forget_manifest_path: ${spam_forget_manifest}
     semantic_id_path: ${semantic_id_path}

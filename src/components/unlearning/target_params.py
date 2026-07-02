@@ -205,6 +205,133 @@ def select_adaptive_code_params(
     return params, grad_masks
 
 
+def select_code_position_params(
+    model: nn.Module,
+    *,
+    positions: List[int],
+    update_backbone: bool = False,
+) -> Tuple[List[nn.Parameter], Dict[int, torch.Tensor]]:
+    """Confine updates to an *arbitrary subset* of RQ semantic-ID code positions.
+
+    Generalizes :func:`select_adaptive_code_params` (which only freezes a
+    contiguous *prefix* of codes) to any subset ``positions ⊆ {0, .., H-1}`` of
+    hierarchy indices. This is the "position-wise intervention" knob for the
+    RQ-ID diagnosis: it lets the SCIF update touch ONLY the parameters that are
+    specific to the selected code positions, so we can test whether any single
+    code level (``c1``, ``c4``, …) or pair (``[c1,c2]``, ``[c3,c4]``) provides a
+    local unlearning interface.
+
+    Trainable surface returned for ``positions = S``:
+      * ``item_sid_embedding_table_encoder`` — included as a whole tensor, with a
+        row mask that is 1 only on the hierarchy blocks ``[h*K, (h+1)*K)`` for
+        ``h in S`` (the table is laid out as ``H`` contiguous ``K``-row blocks)
+        and 0 elsewhere, so only those hierarchies' input embeddings move.
+      * Per-hierarchy decoder heads ``decoder.decoder_mlp[h]`` for ``h in S``
+        (the output projection that maps the decoder state to position ``h``'s
+        code logits — TIGER's only genuinely position-specific output weights).
+      * The shared transformer backbone (encoder + decoder T5 stack) only when
+        ``update_backbone`` is True (no mask).
+
+    Because ``decoder_mlp[h]`` participates only in hierarchy ``h``'s loss term
+    (``model_step`` sums independent per-hierarchy CE heads), restricting the
+    updated parameters to position ``h`` also restricts the *learning signal*
+    that reaches those heads to position ``h`` — the update is local in both the
+    parameter and the gradient sense.
+
+    Parameters
+    ----------
+    positions
+        Iterable of 0-based hierarchy indices to update. Must be a non-empty
+        subset of ``range(num_hierarchies)``.
+    update_backbone
+        If True, also update the shared transformer backbone (un-masked).
+
+    Returns
+    -------
+    (params, grad_masks)
+        ``params`` is the non-empty list handed to the optimizer / SCIF.
+        ``grad_masks`` maps ``id(param) -> float mask`` (same shape as the
+        param) for params that need a partial-gradient/-update mask applied;
+        params absent from the dict are updated in full. Mirrors the contract of
+        :func:`select_adaptive_code_params` so the same downstream masking code
+        applies.
+    """
+    num_hierarchies = getattr(model, "num_hierarchies", None)
+    codebook_size = getattr(model, "num_embeddings_per_hierarchy", None)
+    if num_hierarchies is None or codebook_size is None:
+        raise TypeError(
+            "select_code_position_params requires a SemanticIDEncoderDecoder with "
+            "num_hierarchies / num_embeddings_per_hierarchy attributes"
+        )
+    num_hierarchies = int(num_hierarchies)
+    codebook_size = int(codebook_size)
+    positions = sorted({int(p) for p in positions})
+    if not positions:
+        raise ValueError(
+            "positions must be a non-empty subset of range(num_hierarchies)"
+        )
+    for p in positions:
+        if not 0 <= p < num_hierarchies:
+            raise ValueError(
+                f"position index {p} out of range [0, {num_hierarchies})"
+            )
+
+    params: List[nn.Parameter] = []
+    grad_masks: Dict[int, torch.Tensor] = {}
+    seen: set = set()
+
+    def _add(p: nn.Parameter) -> None:
+        if p.requires_grad and id(p) not in seen:
+            params.append(p)
+            seen.add(id(p))
+
+    # SID embedding table: whole tensor + per-position row mask.
+    sid_table = getattr(model, "item_sid_embedding_table_encoder", None)
+    if sid_table is None:
+        raise ValueError("model has no item_sid_embedding_table_encoder")
+    weight = sid_table.weight
+    expected_rows = num_hierarchies * codebook_size
+    if weight.shape[0] != expected_rows:
+        log.warning(
+            "SID table has %d rows but num_hierarchies*codebook_size=%d; the "
+            "per-position row mask assumes a hierarchy-blocked layout",
+            weight.shape[0],
+            expected_rows,
+        )
+    mask = torch.zeros_like(weight)
+    for h in positions:
+        mask[h * codebook_size : (h + 1) * codebook_size, :] = 1.0
+    _add(weight)
+    grad_masks[id(weight)] = mask
+
+    # Per-hierarchy decoder heads for the selected positions.
+    decoder = getattr(model, "decoder", None)
+    decoder_mlp = getattr(decoder, "decoder_mlp", None) if decoder is not None else None
+    if decoder_mlp is None:
+        raise ValueError("model.decoder has no decoder_mlp")
+    for h in positions:
+        for p in decoder_mlp[h].parameters():
+            _add(p)
+
+    # Optionally the shared transformer backbone.
+    if update_backbone:
+        encoder = getattr(model, "encoder", None)
+        if encoder is not None:
+            for p in encoder.parameters():
+                _add(p)
+        backbone = getattr(decoder, "decoder", None)
+        if backbone is not None:
+            for p in backbone.parameters():
+                _add(p)
+
+    if not params:
+        raise ValueError(
+            "select_code_position_params returned 0 trainable params; check the "
+            "model layout."
+        )
+    return params, grad_masks
+
+
 def named_target_params(
     model: nn.Module, policy: str = "all"
 ) -> List[tuple]:

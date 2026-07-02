@@ -495,6 +495,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         pkm_layers: Optional[Union[str, Dict[str, Any]]] = None,
         pkm_params: Optional[Dict[str, Any]] = None,
         pkm_mode: str = "replace",
+        pkm_param_group: Optional[Dict[str, Any]] = None,
         should_check_prefix: bool = False,
         should_add_sep_token: bool = True,
         prediction_key_name: str = "user_id",
@@ -566,6 +567,13 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         # Replace selected T5 feed-forward sub-layers with Product-Key Memory
         # layers. Runs before the mlp_layers bloating below so that PKM-selected
         # layers stay PKM and only the remaining FFNs get bloated.
+        # Optimizer overrides (lr / weight_decay / ...) for the PKM parameters'
+        # own param group; None => PKM params share the single global optimizer
+        # group (default). The optimizer *class* is still the shared one from the
+        # config (override to SGD via optim.optimizer._target_); this only splits
+        # out the PKM params so they can take their own lr/weight_decay etc.
+        self._pkm_param_group = dict(pkm_param_group) if pkm_param_group else None
+
         if pkm_layers is not None:
             self._install_pkm_layers(pkm_layers, dict(pkm_params or {}), pkm_mode)
 
@@ -633,6 +641,60 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self.forbidden_sids = forbidden_sids
         self.filter_mode = filter_mode
         self.user_forbidden_items = user_forbidden_items
+
+    def _pkm_parameters(self) -> List[torch.nn.Parameter]:
+        """All trainable parameters that live inside installed PKM (HashingMemory)
+        layers — the memory keys/values and the query network."""
+        pkm_params: List[torch.nn.Parameter] = []
+        for module in self.modules():
+            if isinstance(module, HashingMemory):
+                pkm_params.extend(p for p in module.parameters() if p.requires_grad)
+        return pkm_params
+
+    def configure_optimizers(self) -> Dict[str, Any]:
+        """Like the base implementation, but when ``pkm_param_group`` is set AND
+        the model has PKM layers, put the PKM parameters into their own optimizer
+        param group with the given overrides (e.g. ``{lr: 0.01, weight_decay: 0}``)
+        while every other parameter keeps the config defaults. Same optimizer
+        *class* for both groups (override to SGD via ``optim.optimizer._target_``).
+        Falls back to the base single-group behaviour otherwise.
+        """
+        if not self._pkm_param_group:
+            return super().configure_optimizers()
+
+        pkm_params = self._pkm_parameters()
+        if not pkm_params:
+            # pkm_param_group requested but no PKM layers installed — no-op split.
+            return super().configure_optimizers()
+
+        pkm_ids = {id(p) for p in pkm_params}
+        rest = [
+            p
+            for p in self.parameters()
+            if p.requires_grad and id(p) not in pkm_ids
+        ]
+        param_groups = [
+            {"params": rest},
+            {"params": pkm_params, **self._pkm_param_group},
+        ]
+        optimizer = self.optimizer(params=param_groups)
+        print(
+            f"[configure_optimizers] PKM param group active: "
+            f"{len(pkm_params)} PKM tensors with overrides {self._pkm_param_group}; "
+            f"{len(rest)} other tensors on config defaults."
+        )
+        if self.scheduler is not None:
+            scheduler = self.scheduler(optimizer=optimizer)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val/loss",
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+        return {"optimizer": optimizer}
 
     def _install_pkm_layers(
         self,
@@ -1475,6 +1537,43 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 target=fut_ids[:, hierarchy].long(),
             )
         return model_output, loss
+
+    def per_hierarchy_losses(
+        self,
+        model_input: SequentialModelInputData,
+        label_data: SequentialModuleLabelData,
+    ) -> List[torch.Tensor]:
+        """Return the per-hierarchy CE losses ``[L_0, ..., L_{H-1}]`` (unsummed).
+
+        Same forward / label handling as :meth:`model_step` (whose scalar loss
+        is exactly ``sum`` of these), but keeps each RQ-code position's loss term
+        separate. Used by the RQ-ID position diagnostics to attribute gradient
+        signal to individual semantic-ID positions: ``decoder_mlp[h]`` feeds only
+        ``L_h``, so ``grad(L_h, params)`` isolates position ``h``'s contribution.
+        """
+        fut_ids = None
+        for label in label_data.labels:
+            fut_ids = label_data.labels[label].reshape(model_input.mask.size(0), -1)
+        model_output = self.forward(
+            attention_mask_encoder=model_input.mask,
+            future_ids=fut_ids,
+            **{
+                self.feature_to_model_input_map.get(k, k): v
+                for k, v in model_input.transformed_sequences.items()
+            },
+        )
+        # drop the trailing position that pairs with the prepended bos token
+        model_output = model_output[:, :-1]
+        losses: List[torch.Tensor] = []
+        for hierarchy in range(self.num_hierarchies):
+            logits = self.decoder.decoder_mlp[hierarchy](model_output[:, hierarchy])
+            losses.append(
+                self.loss_function(
+                    input=logits,
+                    target=fut_ids[:, hierarchy].long(),
+                )
+            )
+        return losses
 
 
 class SemanticIDDecoderModule(torch.nn.Module):
