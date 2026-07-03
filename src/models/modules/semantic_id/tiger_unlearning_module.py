@@ -27,6 +27,8 @@ from src.components.unlearning.hvp import batch_size as tiger_batch_size
 from src.components.unlearning.kookmin import kookmin_unlearn
 from src.components.unlearning.neighborhood_sampler import (
     build_retain_subset,
+    build_sorted_sid_index,
+    closest_prefix_neighbors,
     collect_items_in_shards,
     load_codebook,
 )
@@ -409,6 +411,23 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         t0 = time.time()
         local_repair = cfg.get("local_repair") or {}
         n_epochs_cfg = cfg.get("n_epochs")
+
+        # Coherence loss L_n (TRACER Eq. 9): precompute, per forget batch, the
+        # prefix-neighbour semantic ids of each sample's target item.
+        lambda_neighborhood = float(cfg.get("lambda_n", 0.0))
+        coherence_neighbors = None
+        if lambda_neighborhood != 0.0:
+            coherence_neighbors = self._build_coherence_neighbors(
+                forget_batches=ctx["forget_batches"],
+                semantic_id_path=kwargs.get("semantic_id_path"),
+                num_hierarchies=kwargs.get("num_hierarchies"),
+                neighborhood_count=int(cfg.get("neighborhood_count", 4)),
+                neighborhood_prefix_length=int(
+                    cfg.get("neighborhood_prefix_length", 2)
+                ),
+                exclude_items=ctx["visible_forget_items"],
+            )
+
         info = unified_unlearn(
             self,
             ctx["forget_batches"],
@@ -418,8 +437,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 int(n_epochs_cfg) if n_epochs_cfg is not None else None
             ),
             lr=float(cfg.get("unified_lr", 1e-4)),
-            lambda_forget=float(cfg.get("lambda_forget", 1.0)),
-            lambda_sep=float(cfg.get("lambda_sep", 0.1)),
+            lambda_forget=float(cfg.get("lambda_f", 1.0)),
+            lambda_sep=float(cfg.get("lambda_s", 0.1)),
+            lambda_neighborhood=lambda_neighborhood,
+            coherence_neighbors=coherence_neighbors,
             forget_loss_level=str(cfg.get("forget_loss_level", "token")),
             sep_temperature=float(cfg.get("sep_temperature", 0.07)),
             deletion_spec=ctx["deletion_spec"],
@@ -437,6 +458,104 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         info["wall_seconds"] = time.time() - t0
         info.update(ctx["meta"])
         return info
+
+    def _build_coherence_neighbors(
+        self,
+        *,
+        forget_batches: List[Any],
+        semantic_id_path: Optional[str],
+        num_hierarchies: Optional[int],
+        neighborhood_count: int,
+        neighborhood_prefix_length: int,
+        exclude_items: Set[int],
+    ) -> List[Optional[Any]]:
+        """Per-forget-batch neighbour semantic ids for the coherence loss.
+
+        For every forget sample ``(H_f, i_T)`` we resolve the target item ``i_T``
+        from its label semantic id, then look up the ``neighborhood_count``
+        closest catalog items by shared SID prefix (length ``>=
+        neighborhood_prefix_length``), excluding forget items. Returns a list
+        aligned to ``forget_batches``; each element is
+        ``(neighbor_sids[B, C, H], neighbor_mask[B, C])`` or ``None`` when a
+        batch has no eligible neighbours anywhere.
+        """
+        if not semantic_id_path:
+            raise ValueError(
+                "lambda_n > 0 (coherence loss) requires semantic_id_path "
+                "(merged_predictions_tensor.pt) to define SID neighbours."
+            )
+        codebook = load_codebook(semantic_id_path, num_hierarchies=num_hierarchies)
+        num_items, H = int(codebook.shape[0]), int(codebook.shape[1])
+        count = int(neighborhood_count)
+
+        # SID tuple -> item id (bijective; the dedup digit makes codes unique).
+        sid_to_item: Dict[tuple, int] = {
+            tuple(int(x) for x in codebook[i].tolist()): i for i in range(num_items)
+        }
+        sorted_ids = build_sorted_sid_index(codebook)
+        sorted_sids = codebook.numpy()[sorted_ids]
+        exclude = {int(x) for x in (exclude_items or set())}
+
+        # item id -> neighbour SID rows [k, H] (cached; forget targets repeat).
+        neighbor_cache: Dict[int, List[List[int]]] = {}
+
+        def _neighbor_rows(item_id: int) -> List[List[int]]:
+            if item_id not in neighbor_cache:
+                nbr_ids = closest_prefix_neighbors(
+                    codebook,
+                    item_id,
+                    count,
+                    neighborhood_prefix_length,
+                    sorted_ids=sorted_ids,
+                    sorted_sids=sorted_sids,
+                    exclude_ids=exclude,
+                )
+                neighbor_cache[item_id] = [
+                    [int(x) for x in codebook[n].tolist()] for n in nbr_ids
+                ]
+            return neighbor_cache[item_id]
+
+        out: List[Optional[Any]] = []
+        n_samples = 0
+        n_with_neighbors = 0
+        n_targets_missing = 0
+        for model_input, label_data in forget_batches:
+            bsz = int(model_input.mask.size(0))
+            fut_ids = None
+            for label in label_data.labels:
+                fut_ids = label_data.labels[label].reshape(bsz, -1)
+            neighbor_sids = torch.zeros((bsz, count, H), dtype=torch.long)
+            neighbor_mask = torch.zeros((bsz, count), dtype=torch.float32)
+            for row in range(bsz):
+                n_samples += 1
+                sid_tuple = tuple(int(x) for x in fut_ids[row, :H].tolist())
+                item_id = sid_to_item.get(sid_tuple)
+                if item_id is None:
+                    n_targets_missing += 1
+                    continue
+                rows = _neighbor_rows(item_id)
+                if rows:
+                    n_with_neighbors += 1
+                for c, sid_row in enumerate(rows[:count]):
+                    neighbor_sids[row, c] = torch.tensor(sid_row, dtype=torch.long)
+                    neighbor_mask[row, c] = 1.0
+            out.append(
+                (neighbor_sids, neighbor_mask)
+                if float(neighbor_mask.sum()) > 0
+                else None
+            )
+
+        log.info(
+            "[unified] coherence L_n: %d/%d forget samples have >=1 prefix "
+            "neighbour (count=%d, min_prefix_length=%d, %d targets not found in "
+            "codebook)",
+            n_with_neighbors,
+            n_samples,
+            count,
+            int(neighborhood_prefix_length),
+            n_targets_missing,
+        )
+        return out
 
     def _run_kookmin(self, **kwargs: Any) -> Dict[str, Any]:
         ctx = self._prepare_unlearning_context(**kwargs)

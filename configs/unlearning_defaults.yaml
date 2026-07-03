@@ -74,9 +74,16 @@ unlearning:
   filter_mode: global  # global | user_dependent
 
   # Unified objective (Step 3)
+  # L = L_R + lambda_f*L_F + lambda_s*L_sep + lambda_n*L_n
   forget_loss_level: token  # token | sequence
-  lambda_forget: 1.0
-  lambda_sep: 0.1
+  lambda_f: 1.0
+  lambda_s: 0.1
+  # Coherence loss L_n (TRACER Eq. 9), prefix-neighbour variant; off by default.
+  # Teacher-forces i_T's closest catalog neighbours (shared SID prefix length
+  # >= neighborhood_prefix_length, forget items excluded) on the forget history.
+  lambda_n: 0.0
+  neighborhood_count: 4
+  neighborhood_prefix_length: 2
   sep_temperature: 0.07
   # L_sep negatives: forget (default; all visible I_f forget-shard items — under
   # deletion_spec=session this is every distinct item in the spam sessions, not

@@ -27,6 +27,8 @@ def unified_unlearn(
     lr: float = 1e-4,
     lambda_forget: float = 1.0,
     lambda_sep: float = 0.1,
+    lambda_neighborhood: float = 0.0,
+    coherence_neighbors: Optional[Sequence[Any]] = None,
     forget_loss_level: str = "token",
     sep_temperature: float = 0.07,
     deletion_spec: str = "session",
@@ -66,6 +68,15 @@ def unified_unlearn(
     targets) and the random-retain ablation both flow through it.
     ``sep_negatives_mode`` is the originating mode string, recorded for
     metadata only. Local repair still uses ``neighbor_item_ids``.
+
+    When ``lambda_neighborhood > 0``, the TRACER coherence term ``L_n`` is added
+    to the forget side of each step: for each forget sample the model is scored
+    (teacher-forced) on the semantic-id codes of its target's prefix-neighbours,
+    conditioned on the forget history, and this negative-log-prob is minimised so
+    suppressed mass flows to coherent neighbours. ``coherence_neighbors`` is a
+    per-forget-batch sequence aligned to ``forget_batches``; each element is
+    ``(neighbor_sids[B, C, H], neighbor_mask[B, C])`` (or ``None`` when a batch
+    has no eligible neighbours) as produced by the caller from the codebook.
     """
     device = device or next(model.parameters()).device
     if not retain_batches:
@@ -171,7 +182,15 @@ def unified_unlearn(
         "retain": [],
         "forget": [],
         "sep": [],
+        "coh": [],
     }
+
+    use_coherence = float(lambda_neighborhood) != 0.0 and coherence_neighbors is not None
+    n_coherence_batches = (
+        sum(1 for cn in coherence_neighbors if cn is not None)
+        if coherence_neighbors is not None
+        else 0
+    )
 
     forget_ids = set(forget_item_ids or [])
     neighbor_ids = set(neighbor_item_ids or [])  # used only for local-repair losses
@@ -188,6 +207,7 @@ def unified_unlearn(
 
         # --- Forget side: q_forget mini-batches, each scaled by 1/q_forget ---
         l_forget_avg = 0.0
+        l_coh_avg = 0.0
         for j in range(q_forget):
             idx = (step * q_forget + j) % n_forget
             forget_batch = batch_to_device(forget_batches[idx], device)
@@ -198,6 +218,19 @@ def unified_unlearn(
             forget_term = (float(lambda_forget) * l_forget) / float(q_forget)
             forget_term.backward()
             l_forget_avg += float(l_forget.detach().cpu()) / float(q_forget)
+
+            # --- Coherence term L_n (TRACER Eq. 9), on the same forget batch ---
+            if use_coherence:
+                cn = coherence_neighbors[idx]
+                if cn is not None:
+                    neighbor_sids, neighbor_mask = cn
+                    l_coh = model.compute_coherence_loss(
+                        forget_batch, neighbor_sids, neighbor_mask
+                    )
+                    if l_coh.requires_grad:
+                        coh_term = (float(lambda_neighborhood) * l_coh) / float(q_forget)
+                        coh_term.backward()
+                    l_coh_avg += float(l_coh.detach().cpu()) / float(q_forget)
 
         # --- Retain side: q_retain mini-batches, each scaled by 1/q_retain ---
         l_retain_avg = 0.0
@@ -238,21 +271,25 @@ def unified_unlearn(
             l_retain_avg
             + float(lambda_forget) * l_forget_avg
             + float(lambda_sep) * l_sep_avg
+            + float(lambda_neighborhood) * l_coh_avg
         )
         totals["total"].append(total_avg)
         totals["retain"].append(l_retain_avg)
         totals["forget"].append(l_forget_avg)
         totals["sep"].append(l_sep_avg)
+        totals["coh"].append(l_coh_avg)
 
         if step % max(1, steps // 10) == 0:
             log.info(
-                "[unified] step=%d/%d total=%.4f retain=%.4f forget=%.4f sep=%.4f",
+                "[unified] step=%d/%d total=%.4f retain=%.4f forget=%.4f "
+                "sep=%.4f coh=%.4f",
                 step,
                 steps,
                 total_avg,
                 l_retain_avg,
                 l_forget_avg,
                 l_sep_avg,
+                l_coh_avg,
             )
 
         del last_retain_batch  # free reference
@@ -276,6 +313,9 @@ def unified_unlearn(
         "adaptive_adapter": bool(restrict_adaptive_codes and adaptive_adapter),
         "lambda_forget": float(lambda_forget),
         "lambda_sep": float(lambda_sep),
+        "lambda_neighborhood": float(lambda_neighborhood),
+        "coherence_enabled": bool(use_coherence),
+        "n_coherence_batches": int(n_coherence_batches),
         "sep_negatives": str(sep_negatives_mode),
         "n_sep_negatives": len(sep_negatives_set),
         "forget_loss_level": str(forget_loss_level),
@@ -284,6 +324,7 @@ def unified_unlearn(
         "mean_retain_loss": _mean(totals["retain"]),
         "mean_forget_loss": _mean(totals["forget"]),
         "mean_sep_loss": _mean(totals["sep"]),
+        "mean_coh_loss": _mean(totals["coh"]),
         "n_forget_batches": n_forget,
         "n_retain_batches": n_retain,
         "n_forget_rows": sum(batch_size(b) for b in forget_batches),

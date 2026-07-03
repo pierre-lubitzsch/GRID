@@ -82,8 +82,18 @@ unlearning:
   neg_retain_every: 5
   filter_mode: global
   forget_loss_level: token
-  lambda_forget: 1.0
-  lambda_sep: 0.1
+  # Unified objective weights: L = L_R + lambda_f*L_F + lambda_s*L_sep + lambda_n*L_n
+  lambda_f: 1.0
+  lambda_s: 0.1
+  # Coherence loss L_n (TRACER Eq. 9), prefix-neighbour variant. Off by default
+  # (lambda_n=0). For each forget sample (H_f, i_T) the model is teacher-forced
+  # on the semantic ids of i_T's closest catalog neighbours (by shared SID
+  # prefix, length >= neighborhood_prefix_length, forget items excluded),
+  # conditioned on the forget history, boosting coherent nearby items.
+  # (algorithm=unified only.)
+  lambda_n: 0.0
+  neighborhood_count: 4
+  neighborhood_prefix_length: 2
   sep_temperature: 0.07
   # L_sep negatives: forget (default; all visible I_f forget-shard items — under
   # deletion_spec=session that is every distinct item in the spam sessions) |

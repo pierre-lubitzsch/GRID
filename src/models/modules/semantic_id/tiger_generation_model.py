@@ -887,6 +887,93 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             log_probs.append(log_p.gather(1, target.unsqueeze(1)).squeeze(1))
         return torch.stack(log_probs, dim=1).sum(dim=1).mean()
 
+    def _teacher_forced_log_prob(
+        self,
+        model_input: SequentialModelInputData,
+        future_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-sample ``Σ_ℓ log p_θ(s_ℓ | 𝒯(history), s_{<ℓ})`` for ``future_ids``.
+
+        Like :meth:`_sequence_log_prob` but (a) the target semantic-id codes are
+        supplied explicitly (any item, not just the batch label) and (b) the
+        result is kept per-sample (shape ``[B]``) rather than averaged. Used by
+        the coherence loss to score arbitrary neighbour items against a given
+        history.
+
+        ``future_ids`` are raw per-hierarchy codes of shape ``[B, num_hierarchies]``.
+        """
+        future_ids = future_ids.to(model_input.mask.device).long()
+        model_output = self.forward(
+            attention_mask_encoder=model_input.mask,
+            future_ids=future_ids,
+            **{
+                self.feature_to_model_input_map.get(k, k): v
+                for k, v in model_input.transformed_sequences.items()
+            },
+        )
+        # drop the trailing position that pairs with the prepended bos token
+        model_output = model_output[:, :-1]
+        log_prob = model_output.new_zeros(future_ids.size(0))
+        for hierarchy in range(self.num_hierarchies):
+            logits = self.decoder.decoder_mlp[hierarchy](model_output[:, hierarchy])
+            log_p = torch.nn.functional.log_softmax(logits, dim=-1)
+            target = future_ids[:, hierarchy]
+            log_prob = log_prob + log_p.gather(1, target.unsqueeze(1)).squeeze(1)
+        return log_prob
+
+    def compute_coherence_loss(
+        self,
+        forget_batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
+        neighbor_sids: torch.Tensor,
+        neighbor_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Coherence loss ``L_n`` (TRACER Eq. 9), prefix-neighbour variant.
+
+            L_n = -1/K Σ_{(H_f, i_T) ∈ batch} Σ_{i_p ∈ P(i_T)}
+                        Σ_ℓ log p_θ(s^p_ℓ | 𝒯(H_f), s^p_{<ℓ})
+
+        For each forget sample, the model is conditioned on the *forget history*
+        ``H_f`` and scored (teacher-forced) on the semantic-id codes of each
+        neighbour ``i_p`` of the forget target ``i_T``. Minimising ``L_n`` boosts
+        generation of the target's semantic neighbours from the forget context,
+        so suppressed probability mass flows to coherent nearby items instead of
+        degenerating.
+
+        Parameters
+        ----------
+        forget_batch:
+            The ``(model_input, label_data)`` forget batch; only ``model_input``
+            (the history ``H_f``) is used here.
+        neighbor_sids:
+            ``[B, C, num_hierarchies]`` raw per-hierarchy codes of each sample's
+            neighbours (``C = neighborhood_count``). Padding slots may hold any
+            in-range code; they are excluded via ``neighbor_mask``.
+        neighbor_mask:
+            ``[B, C]`` (0/1) marking valid neighbour slots. Samples/slots without
+            an eligible neighbour are masked out and do not contribute to ``K``.
+
+        Returns the scalar ``L_n``; ``0`` when no valid neighbour exists.
+        """
+        model_input, _ = forget_batch
+        device = model_input.mask.device
+        neighbor_sids = neighbor_sids.to(device).long()
+        neighbor_mask = neighbor_mask.to(device).float()
+
+        n_valid = neighbor_mask.sum()
+        if float(n_valid) == 0.0:
+            return torch.zeros((), device=device)
+
+        n_slots = neighbor_sids.size(1)
+        total = torch.zeros((), device=device)
+        for c in range(n_slots):
+            slot_mask = neighbor_mask[:, c]
+            if float(slot_mask.sum()) == 0.0:
+                continue
+            log_prob = self._teacher_forced_log_prob(model_input, neighbor_sids[:, c])
+            total = total + (log_prob * slot_mask).sum()
+        # -1/K with K = number of valid (sample, neighbour) terms.
+        return -total / n_valid.clamp(min=1.0)
+
     def compute_uniform_kl_loss(
         self,
         model_input: SequentialModelInputData,

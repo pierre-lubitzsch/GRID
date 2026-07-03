@@ -642,6 +642,78 @@ def bucket_items_by_distance(
     ]
 
 
+def closest_prefix_neighbors(
+    codebook: torch.Tensor,
+    item_id: int,
+    count: int,
+    min_prefix_length: int,
+    *,
+    sorted_ids: Optional[np.ndarray] = None,
+    sorted_sids: Optional[np.ndarray] = None,
+    exclude_ids: Optional[Set[int]] = None,
+) -> List[int]:
+    """Return up to ``count`` catalog items closest to ``item_id`` by SID prefix.
+
+    "Closeness" is the length of the shared semantic-ID prefix: an item sharing
+    a longer prefix with ``item_id`` is closer. Only items whose shared prefix
+    with ``item_id`` has length ``>= min_prefix_length`` are eligible. Ties
+    within a shared-prefix level are broken by ascending SID (L1) distance.
+
+    The forget set (and ``item_id`` itself) should be passed via ``exclude_ids``
+    so returned neighbours are guaranteed not to be forgotten items.
+
+    This is the ``P(i_T)`` neighbourhood set of the TRACER coherence loss, but
+    with neighbours defined by RQ-code prefix proximity (this repo's codebook
+    machinery) rather than by pre-quantization embedding similarity.
+
+    ``sorted_ids`` / ``sorted_sids`` are the shared SID-sorted index and may be
+    precomputed once (via :func:`build_sorted_sid_index`) and reused across many
+    calls; they are derived from ``codebook`` when omitted.
+    """
+    num_items, num_hierarchies = codebook.shape
+    if not (0 <= int(item_id) < num_items):
+        return []
+    count = int(count)
+    if count <= 0:
+        return []
+    min_prefix_length = int(min_prefix_length)
+    if min_prefix_length <= 0 or min_prefix_length > num_hierarchies:
+        raise ValueError(
+            f"min_prefix_length must be in [1, {num_hierarchies}], "
+            f"got {min_prefix_length}"
+        )
+
+    if sorted_ids is None or sorted_sids is None:
+        sorted_ids = build_sorted_sid_index(codebook)
+        sorted_sids = codebook.numpy()[sorted_ids]
+
+    excluded = set(exclude_ids or set())
+    excluded.add(int(item_id))
+
+    neighbors: List[int] = []
+    seen: Set[int] = set()
+    # Longest shared prefix first (closest), relaxing down to min_prefix_length.
+    # Because a longer-prefix bucket is a subset of a shorter-prefix one,
+    # skipping already-taken ids keeps each item at its longest shared prefix.
+    for prefix_len in range(num_hierarchies, min_prefix_length - 1, -1):
+        bucket = bucket_items_by_distance(
+            sorted_ids,
+            sorted_sids,
+            codebook,
+            int(item_id),
+            prefix_len,
+            exclude_ids=excluded | seen,
+        )
+        for cand in bucket:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            neighbors.append(cand)
+            if len(neighbors) >= count:
+                return neighbors
+    return neighbors
+
+
 def select_retain_rows_progressive(
     all_rows: List[bytes],
     item_to_row_indices: Dict[int, List[int]],
