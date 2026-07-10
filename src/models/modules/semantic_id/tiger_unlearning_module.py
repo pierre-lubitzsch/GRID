@@ -453,6 +453,16 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             stable_codes=int(cfg.get("stable_codes", 2)),
             adaptive_update_backbone=bool(cfg.get("adaptive_update_backbone", False)),
             adaptive_adapter=bool(cfg.get("adaptive_adapter", False)),
+            # Position-wise intervention (same unlearning.update_positions knob
+            # as SCIF): confine the unified update to an arbitrary subset of RQ
+            # code positions, e.g. [0] = only c1 moves. Overrides adaptive_codes.
+            update_positions=_resolve_update_positions(
+                cfg.get("update_positions"),
+                num_hierarchies=int(self.num_hierarchies),
+            ),
+            update_positions_backbone=bool(
+                cfg.get("update_positions_backbone", False)
+            ),
             device=device,
         )
         info["wall_seconds"] = time.time() - t0

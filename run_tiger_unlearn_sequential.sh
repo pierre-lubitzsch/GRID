@@ -228,6 +228,22 @@ fi
 # jobs be submitted with a --dependency on a still-training model and pick up the
 # FINAL checkpoint — whose filename/step isn't known at submit time — once the
 # dependency fires. A direct .ckpt path is used as-is.
+#
+# 'job:<slurm_jobid>' form: resolve the TRAINING RUN DIR from the job id at
+# RUNTIME (logs/train/runs/*/*job<ID>_*). Needed when the unlearn job is
+# submitted with --dependency on a train job that is still PENDING — its run
+# dir (timestamped) does not exist yet at submit time, so no dir path can be
+# passed. Once afterok fires the dir exists and the glob resolves.
+if [[ "${CKPT_PATH}" == job:* ]]; then
+  _TRAIN_JID="${CKPT_PATH#job:}"
+  _JOB_RUN_DIR="$(ls -1d logs/train/runs/*/*job${_TRAIN_JID}_* 2>/dev/null | head -1)"
+  if [ -z "${_JOB_RUN_DIR}" ]; then
+    echo "No training run dir found for job id ${_TRAIN_JID} (glob logs/train/runs/*/*job${_TRAIN_JID}_*)."
+    exit 1
+  fi
+  echo "Resolved ${CKPT_PATH} -> ${_JOB_RUN_DIR}"
+  CKPT_PATH="${_JOB_RUN_DIR}"
+fi
 if [ -d "${CKPT_PATH}" ]; then
   _CKPT_DIR="${CKPT_PATH%/}"
   [ -d "${_CKPT_DIR}/checkpoints" ] && _CKPT_DIR="${_CKPT_DIR}/checkpoints"
@@ -271,13 +287,27 @@ if [ "${#EXTRA_OVERRIDES[@]}" -gt 0 ]; then
   echo "Extra Hydra overrides: ${EXTRA_OVERRIDES[*]}"
 fi
 
+# Semantic-ID length of the model being unlearned (must match how the ckpt was
+# trained; the SID tensor must have this many hierarchies). Longer-ID models
+# (NUM_HIER=8/16) additionally need the matching sequence_length: the config
+# default is 120 codes which is NOT a multiple of 16 — pass UNLEARN_SEQ_LEN
+# (e.g. 30*L to mirror HISTORY_ITEMS=30 training) or the item-block reshape
+# fails. Aggregation-trained ckpts also need model.item_token_aggregation=...
+# as a trailing override AND in EVAL_EXTRA_OVERRIDES.
+NUM_HIER="${NUM_HIER:-4}"
+SEQ_OVR=()
+if [ -n "${UNLEARN_SEQ_LEN:-}" ]; then
+  SEQ_OVR=("sequence_length=${UNLEARN_SEQ_LEN}")
+fi
+
 # Hydra: quote values that contain '=' (Lightning checkpoint filenames).
 python -u -m src.unlearn_sequential \
   experiment="${EXPERIMENT}" \
   data_dir="${DATA_DIR}" \
   "semantic_id_path='${SEMANTIC_ID_PATH}'" \
   "ckpt_path='${CKPT_PATH}'" \
-  num_hierarchies=4 \
+  num_hierarchies="${NUM_HIER}" \
+  ${SEQ_OVR[@]+"${SEQ_OVR[@]}"} \
   seed="${UNLEARN_SEED}" \
   unlearning.algorithm="${ALGORITHM}" \
   unlearning.neighborhood_aware=${NEIGHBORHOOD_AWARE} \
@@ -320,7 +350,8 @@ if [ "${UNLEARN_RUN_POST_EVAL}" = "true" ]; then
       "semantic_id_path='${SEMANTIC_ID_PATH}'" \
       "ckpt_path='${FINAL_CKPT}'" \
       "${SPAM_MANIFEST_ARGS[@]}" \
-      num_hierarchies=4 \
+      num_hierarchies="${NUM_HIER}" \
+      ${SEQ_OVR[@]+"${SEQ_OVR[@]}"} \
       seed="${UNLEARN_SEED}" \
       train=False test=True \
       trainer.devices=1 \

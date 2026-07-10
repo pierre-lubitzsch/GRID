@@ -11,7 +11,10 @@ from torch import nn
 
 from src.components.unlearning.hvp import batch_size, batch_to_device
 from src.components.unlearning.local_repair import apply_local_repair_losses
-from src.components.unlearning.target_params import select_adaptive_code_params
+from src.components.unlearning.target_params import (
+    select_adaptive_code_params,
+    select_code_position_params,
+)
 
 log = logging.getLogger(__name__)
 TigerBatch = Any
@@ -41,6 +44,8 @@ def unified_unlearn(
     stable_codes: int = 2,
     adaptive_update_backbone: bool = False,
     adaptive_adapter: bool = False,
+    update_positions: Optional[List[int]] = None,
+    update_positions_backbone: bool = False,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Optimize unified objective.
@@ -125,7 +130,27 @@ def unified_unlearn(
     # Stable-Adaptive Semantic IDs: optionally confine the update to the
     # adaptive (fine-grained) code positions. grad_masks holds per-parameter
     # masks applied to .grad each step before opt.step().
-    if restrict_adaptive_codes and adaptive_adapter:
+    if update_positions:
+        # Position-wise intervention (same knob as SCIF's
+        # unlearning.update_positions, generalizing adaptive_codes to ANY
+        # subset of code positions — e.g. [0] = only the coarsest code c1
+        # moves, all other positions + backbone frozen). Takes precedence over
+        # the adaptive_codes prefix modes.
+        params, grad_masks = select_code_position_params(
+            model,
+            positions=list(update_positions),
+            update_backbone=bool(update_positions_backbone),
+        )
+        log.info(
+            "[unified] position-wise restriction ON: update_positions=%s "
+            "update_backbone=%s → %d param tensors (%d params), %d masked",
+            list(update_positions),
+            bool(update_positions_backbone),
+            len(params),
+            int(sum(p.numel() for p in params)),
+            len(grad_masks),
+        )
+    elif restrict_adaptive_codes and adaptive_adapter:
         # Option 2 (per-item): freeze the shared table & heads (left out of the
         # optimizer) and train only a per-item, per-adaptive-position offset.
         # The offset gradient is masked to the deletion-relevant items
@@ -306,6 +331,10 @@ def unified_unlearn(
         "q_retain": q_retain,
         "lr": float(lr),
         "restrict_adaptive_codes": bool(restrict_adaptive_codes),
+        "update_positions": list(update_positions) if update_positions else None,
+        "update_positions_backbone": (
+            bool(update_positions_backbone) if update_positions else None
+        ),
         "stable_codes": int(stable_codes) if restrict_adaptive_codes else None,
         "adaptive_update_backbone": (
             bool(adaptive_update_backbone) if restrict_adaptive_codes else None

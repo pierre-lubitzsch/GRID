@@ -243,6 +243,24 @@ model:
   num_hierarchies: ${num_hierarchies}
   num_user_bins: null
   codebooks: ${data_loading.train_dataloader_config.dataloader.dataset_config.semantic_id_map.sequence_data}
+  # Input-side item-token aggregation ("Longer IDs for finer-grained
+  # neighborhoods", Jul 3). For long RQ IDs (num_hierarchies in {8, 16}) the
+  # encoder would otherwise see num_hierarchies token positions per history item.
+  # When enabled, each item's token embeddings are merged into ONE encoder input
+  # vector (the decoder still generates the full num_hierarchies-token ID).
+  #   null / none  -> OFF: per-token + separator-token layout (original TIGER)
+  #   mean         -> option 1: mean pooling -> ONE vector per item
+  #   attentive    -> option 2: ACERec Attentive Token Merger (arXiv 2602.13573):
+  #                   learnable positional embeddings + k learnable latent queries
+  #                   + cross-attention + MLP f_out -> k latent tokens per item
+  #                   (compression num_hierarchies -> k; default k=4). The paper's
+  #                   per-item Intent Token is OFF by default (it is a prediction
+  #                   anchor in ACERec's decoder; redundant under TIGER's separate
+  #                   autoregressive decoder). Set intent_token:true for parity.
+  # For attentive, pass a mapping to tune it, e.g. via Hydra:
+  #   'model.item_token_aggregation={type:attentive,num_query_tokens:4,num_heads:8,dropout:0.0,mlp_ratio:4,positional_embedding:true,intent_token:false,content_adaptive_queries:false}'
+  # NOTE: eval/unlearn configs must mirror this so the checkpoint schema matches.
+  item_token_aggregation: null
   mlp_layers: 2
   # Product-Key Memory (PKM) layers on selected T5 feed-forward sub-layers.
   # pkm_layers selects which FFNs to target:

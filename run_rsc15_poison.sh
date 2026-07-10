@@ -90,7 +90,10 @@ BW_ARGS=(
   --out_dir "${OUT_DIR}"
   --method "${POISON_METHOD}"
   --attack bandwagon
-  --target_strategy unpopular
+  # Target-popularity strategy (unpopular default; mid/popular for the
+  # bandwagon-strategy comparison). resolve_grid_dataset.sh already inserts the
+  # matching _tgt<strategy> token into OUT_DIR when TARGET_STRATEGY is set.
+  --target_strategy "${TARGET_STRATEGY:-unpopular}"
   --poisoning_ratio "${POISONING_RATIO}"
   --n_target_items "${N_TARGET_ITEMS}"
   --placement sprinkled

@@ -125,6 +125,20 @@ fi
 case "$(printf '%s' "${PKM_MODE:-}" | tr '[:upper:]' '[:lower:]')" in
   add|replace) RUN_LABEL="${RUN_LABEL}_pkm$(printf '%s' "${PKM_MODE}" | tr '[:upper:]' '[:lower:]')" ;;
 esac
+# Tag longer-ID length (L!=4) and item-token aggregation so run dirs self-describe.
+if [ -n "${NUM_HIER:-}" ] && [ "${NUM_HIER}" != "4" ]; then
+  RUN_LABEL="${RUN_LABEL}_L${NUM_HIER}"
+fi
+# Tag the item-history budget when pinned (distinguishes e.g. L8 @15 items
+# [config default 120 codes] from L8 @30 items [sequence_length=240]).
+if [ -n "${HISTORY_ITEMS:-}" ]; then
+  RUN_LABEL="${RUN_LABEL}_h${HISTORY_ITEMS}"
+fi
+case "$(printf '%s' "${ITEM_TOKEN_AGG:-}" | tr '[:upper:]' '[:lower:]')" in
+  ""|none|null|off|false) : ;;
+  mean)                    RUN_LABEL="${RUN_LABEL}_aggmean" ;;
+  *attentive*|*attention*|*merger*) RUN_LABEL="${RUN_LABEL}_aggattn" ;;
+esac
 # Optional free-form label suffix (e.g. "_det_seed7") so multi-seed / variant
 # sweeps produce self-describing, non-colliding run dirs.
 RUN_LABEL="${RUN_LABEL}${RUN_LABEL_SUFFIX:-}"
@@ -203,6 +217,47 @@ if [ -n "${PKM_PARAM_GROUP:-}" ]; then
   echo "PKM param group override: model.pkm_param_group=${PKM_PARAM_GROUP}"
 fi
 
+# Semantic-ID length (num_hierarchies). Default 4 (3 RKMeans codebooks + 1 dedup
+# digit). "Longer IDs for finer-grained neighborhoods" (Jul 3): set NUM_HIER=8
+# or 16 for longer RQ IDs (codebook size stays fixed via vocab_size=256). The
+# semantic_id_path tensor MUST have this many hierarchies.
+NUM_HIER="${NUM_HIER:-4}"
+
+# History length in ITEMS. The config's sequence_length is a raw-code (token)
+# budget that must be a multiple of NUM_HIER (each item = NUM_HIER codes; the
+# item-block reshape in the encoder fails otherwise — this is what broke L=16
+# with the default sequence_length=120, 120/16=7.5). HISTORY_ITEMS pins the
+# number of history items independently of L via
+#   sequence_length = HISTORY_ITEMS x NUM_HIER
+# so different-L runs are comparable. Unset -> config default (120 codes, i.e.
+# 30 items at L=4, 15 at L=8; INVALID at L=16 — set HISTORY_ITEMS for L=16).
+if [ -n "${HISTORY_ITEMS:-}" ]; then
+  SEQ_LEN=$(( HISTORY_ITEMS * NUM_HIER ))
+  EXTRA_OVERRIDES+=("sequence_length=${SEQ_LEN}")
+  echo "History budget: ${HISTORY_ITEMS} items x L=${NUM_HIER} -> sequence_length=${SEQ_LEN}"
+fi
+
+# Input-side item-token aggregation ("Longer IDs" options 1 & 2). Collapses each
+# history item's num_hierarchies token embeddings into one encoder input vector
+# so the encoder sequence stays short for long IDs.
+#   unset / none / off / null / ""  -> OFF (per-token + separator layout)
+#   mean                            -> option 1: mean pooling (1 vector/item)
+#   attentive                       -> option 2: ACERec Attentive Token Merger
+#                                      (k latents/item, k=4; intent token off)
+#   {type:attentive,num_query_tokens:4,num_heads:8}  -> attentive w/ params
+# Tune the attentive merger further via ITEM_TOKEN_AGG='{type:attentive,...}'
+# (num_query_tokens, num_heads, dropout, mlp_ratio, positional_embedding,
+#  intent_token, content_adaptive_queries).
+ITEM_TOKEN_AGG_LC="$(printf '%s' "${ITEM_TOKEN_AGG:-}" | tr '[:upper:]' '[:lower:]')"
+case "${ITEM_TOKEN_AGG_LC}" in
+  ""|none|null|off|false)
+    : ;;  # aggregation off — config default (null) applies
+  *)
+    EXTRA_OVERRIDES+=("model.item_token_aggregation=${ITEM_TOKEN_AGG}")
+    echo "Item-token aggregation: model.item_token_aggregation=${ITEM_TOKEN_AGG}"
+    ;;
+esac
+
 echo "[$(date -Is)] Starting tiger train (tiger_train_flat) dataset=${DATASET} variant=${VARIANT}"
 echo "Using data_dir=${DATA_DIR}"
 echo "Using semantic_id_path=${SEMANTIC_ID_PATH}"
@@ -215,7 +270,7 @@ python -u -m src.train \
   experiment=tiger_train_flat \
   data_dir="${DATA_DIR}" \
   "semantic_id_path='${SEMANTIC_ID_PATH}'" \
-  num_hierarchies=4 \
+  num_hierarchies="${NUM_HIER}" \
   hydra.run.dir="${HYDRA_RUN_DIR}" \
   ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"} \
   "${@:6}"

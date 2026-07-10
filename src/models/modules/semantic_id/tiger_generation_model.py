@@ -17,6 +17,7 @@ from src.data.loading.components.interfaces import (
 from src.models.components.interfaces import OneKeyPerPredictionOutput
 from src.models.components.network_blocks.mlp import MLP
 from src.models.components.network_blocks.product_key_memory import HashingMemory
+from src.models.components.network_blocks.token_merger import build_item_token_merger
 from src.models.modules.huggingface.transformer_base_module import TransformerBaseModule
 from src.utils.utils import (
     delete_module,
@@ -498,6 +499,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         pkm_param_group: Optional[Dict[str, Any]] = None,
         should_check_prefix: bool = False,
         should_add_sep_token: bool = True,
+        item_token_aggregation: Optional[Union[str, Dict[str, Any]]] = None,
         prediction_key_name: str = "user_id",
         prediction_value_name: str = "semantic_ids",
         adaptive_item_offset_stable_codes: Optional[int] = None,
@@ -608,10 +610,29 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             else None
         )
 
-        # separation token for the encoder to differentiate between items
+        # Input-side item-token aggregation ("Longer IDs" Jul 3, options 1 & 2).
+        # OFF by default (None) -> the encoder keeps one token position per SID
+        # hierarchy plus separator tokens (original behaviour). When enabled, each
+        # history item's num_hierarchies token embeddings are merged into a single
+        # compact encoder input vector, so the encoder sequence is one position
+        # per item -- keeping it short for long RQ IDs (L in {8, 16}). The decoder
+        # still generates the full num_hierarchies-token semantic ID.
+        #   "mean"        -> mean pooling, 1 vector/item (option 1)
+        #   "attentive"   -> ACERec Attentive Token Merger, k latents/item (option 2;
+        #                    intent token off by default, set intent_token:true for parity)
+        #   {type: attentive, num_query_tokens: 4, num_heads: 8, dropout: 0.0}
+        self.item_token_merger = build_item_token_merger(
+            item_token_aggregation,
+            embedding_dim=self.embedding_dim,
+            num_tokens=self.num_hierarchies,
+        )
+
+        # separation token for the encoder to differentiate between items.
+        # Not needed (and would be an unused DDP parameter) when the item-token
+        # merger is active, since each item is then a single encoder position.
         self.sep_token = (
             torch.nn.Parameter(torch.randn(1, self.embedding_dim), requires_grad=True)
-            if should_add_sep_token
+            if should_add_sep_token and self.item_token_merger is None
             else None
         )
         # the key value names for the prediction output
@@ -1244,6 +1265,52 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             batch, neighbor_item_ids or set()
         )
 
+    def _aggregate_item_tokens(
+        self,
+        id_embeddings: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Merge each item's ``num_hierarchies`` token embeddings into ``k_out``
+        compact vectors.
+
+        Input-side aggregation for long RQ IDs (options 1 & 2). Reshapes the flat
+        per-token embeddings ``[B, seq_len, d]`` into item blocks
+        ``[B, n_items, num_hierarchies, d]``, applies ``self.item_token_merger``
+        to get ``[B, n_items, k_out, d]`` (``k_out=1`` for mean pooling, ``k`` for
+        the attentive merger), and flattens the item/latent axes back to a flat
+        encoder sequence ``[B, n_items * k_out, d]``. The per-token attention mask
+        is collapsed to a per-item mask (an item is valid iff any of its tokens
+        attend -- padding is applied whole-item) and repeated across the item's
+        ``k_out`` output vectors.
+
+        Returns ``(merged_embeddings, item_attention_mask)``.
+        """
+        batch_size, seq_len, emb_dim = id_embeddings.size()
+        num_hierarchies = self.num_hierarchies
+        if seq_len % num_hierarchies != 0:
+            raise ValueError(
+                f"encoder sequence length {seq_len} is not a multiple of "
+                f"num_hierarchies {num_hierarchies}; cannot split into item blocks "
+                f"for item-token aggregation"
+            )
+        n_items = seq_len // num_hierarchies
+        item_tokens = id_embeddings.view(
+            batch_size, n_items, num_hierarchies, emb_dim
+        )
+        merged = self.item_token_merger(item_tokens)  # (B, n_items, k_out, d)
+        k_out = merged.size(2)
+        merged = merged.reshape(batch_size, n_items * k_out, emb_dim)
+        # per-item validity, repeated across the item's k_out output vectors
+        item_mask = attention_mask.view(
+            batch_size, n_items, num_hierarchies
+        ).amax(dim=-1)  # (B, n_items)
+        item_attention_mask = (
+            item_mask.unsqueeze(-1)
+            .expand(batch_size, n_items, k_out)
+            .reshape(batch_size, n_items * k_out)
+        )
+        return merged, item_attention_mask
+
     def encoder_forward_pass(
         self,
         attention_mask: torch.Tensor,
@@ -1271,12 +1338,25 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             shifted_sids
         )
         # Per-item adaptive offsets (option 2); no-op unless enabled. Applied
-        # before sep-token injection so item blocks are still aligned to raw_codes.
+        # before sep-token injection / item-token merging so item blocks are
+        # still aligned to raw_codes.
         inputs_embeds_for_encoder = self._inject_adaptive_offsets(
             inputs_embeds_for_encoder, input_ids
         )
 
-        if self.sep_token is not None:
+        if self.item_token_merger is not None:
+            # Input-side aggregation: collapse each item's num_hierarchies token
+            # embeddings into a single encoder input vector (options 1 & 2). This
+            # replaces the per-token + separator-token layout, so no sep token is
+            # injected in this branch.
+            (
+                inputs_embeds_for_encoder,
+                attention_mask,
+            ) = self._aggregate_item_tokens(
+                id_embeddings=inputs_embeds_for_encoder,
+                attention_mask=attention_mask,
+            )
+        elif self.sep_token is not None:
             (
                 inputs_embeds_for_encoder,
                 attention_mask,

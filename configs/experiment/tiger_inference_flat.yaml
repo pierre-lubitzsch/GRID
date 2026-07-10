@@ -50,6 +50,12 @@ model:
   num_hierarchies: ${num_hierarchies}
   num_user_bins: null
   codebooks: ${data_loading.predict_dataloader_config.dataloader.dataset_config.semantic_id_map.sequence_data}
+  # Input-side item-token aggregation. Must mirror how the checkpoint was
+  # trained (see tiger_train_flat.yaml) so the model schema matches. To evaluate
+  # a merger-trained checkpoint, override e.g.
+  #   model.item_token_aggregation=mean
+  #   'model.item_token_aggregation={type:attentive,num_query_tokens:4,num_heads:8}'
+  item_token_aggregation: null
   mlp_layers: 2
   # Must mirror tiger_train_flat.yaml so the checkpoint schema stays identical.
   # See that file for the meaning of pkm_layers / pkm_mode / pkm_params.

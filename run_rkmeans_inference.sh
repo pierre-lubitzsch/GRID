@@ -46,16 +46,23 @@ if [ -z "${EMBEDDING_PATH}" ]; then
   EMBEDDING_PATH="$(ls -t logs/inference/runs/*/*/pickle/merged_predictions_tensor.pt 2>/dev/null | head -n1 || true)"
 fi
 
+# Must match run_rkmeans_train.sh (the checkpoint's codebooks have this shape).
+# For final ID length L in {8, 16} with fixed codebook size 256, set
+# RKMEANS_HIER=L-1 (7 or 15); the dedup step below appends the +1 digit.
+RKMEANS_HIER="${RKMEANS_HIER:-3}"
+CODEBOOK_WIDTH="${CODEBOOK_WIDTH:-256}"
+
 echo "[$(date -Is)] Starting rkmeans inference on dataset=${DATASET}"
 echo "Using data_dir=${GRID_DATA_DIR}"
+echo "Codebooks: num_hierarchies=${RKMEANS_HIER} codebook_width=${CODEBOOK_WIDTH} (final ID length = ${RKMEANS_HIER}+1 after dedup)"
 
 python -u -m src.inference \
   experiment=rkmeans_inference_flat \
   data_dir="${GRID_DATA_DIR}" \
   "embedding_path='${EMBEDDING_PATH}'" \
   embedding_dim=2048 \
-  num_hierarchies=3 \
-  codebook_width=256 \
+  num_hierarchies="${RKMEANS_HIER}" \
+  codebook_width="${CODEBOOK_WIDTH}" \
   "ckpt_path='${CKPT_PATH}'" \
   callbacks.pickle_writer.should_merge_files_on_main=false
 
@@ -111,4 +118,17 @@ print(f"Merged {len(merged)} rows into {pt_path}")
 PY
 
 echo "[$(date -Is)] Merge complete: ${PICKLE_DIR}/merged_predictions_tensor.pt"
-bash "${GRID_DIR}/scripts/install_semantic_id_tensor.sh" "${DATASET}" "${PICKLE_DIR}/merged_predictions_tensor.pt"
+# Install guard for longer IDs: the canonical embeddings/<dataset>/ path is the
+# L=4 tensor (RKMEANS_HIER=3 + dedup digit) that all standard runs read. A
+# non-default RKMEANS_HIER would silently OVERWRITE it with a different-L tensor,
+# so install those to the per-L dir embeddings/<dataset>_L<L>/ instead (same
+# layout run_generate_sid.sh uses).
+if [ "${RKMEANS_HIER}" = "3" ]; then
+  bash "${GRID_DIR}/scripts/install_semantic_id_tensor.sh" "${DATASET}" "${PICKLE_DIR}/merged_predictions_tensor.pt"
+else
+  L=$(( RKMEANS_HIER + 1 ))
+  DEST_DIR="embeddings/${DATASET}_L${L}"
+  mkdir -p "${DEST_DIR}"
+  cp -f "${PICKLE_DIR}/merged_predictions_tensor.pt" "${DEST_DIR}/merged_predictions_tensor.pt"
+  echo "Installed L=${L} tensor -> ${DEST_DIR}/merged_predictions_tensor.pt (canonical embeddings/${DATASET}/ left untouched)"
+fi
