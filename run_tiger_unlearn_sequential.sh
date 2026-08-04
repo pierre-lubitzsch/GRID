@@ -300,6 +300,17 @@ if [ -n "${UNLEARN_SEQ_LEN:-}" ]; then
   SEQ_OVR=("sequence_length=${UNLEARN_SEQ_LEN}")
 fi
 
+# Which per-request checkpoints to keep. The config default is now [1.0] = only
+# the FINAL one, which is what 'checkpoints/unlearned.ckpt' resolves to and the
+# only one the post-unlearn eval and the result tables read. Set this to restore
+# the old progression snapshots, e.g. CKPT_FRACTIONS='[0.01,0.10,1.0]' — each
+# extra fraction costs another full checkpoint (1.9-3.6 GiB) per run.
+CKPT_OVR=()
+if [ -n "${CKPT_FRACTIONS:-}" ]; then
+  CKPT_OVR=("unlearning.checkpoint_fractions=${CKPT_FRACTIONS}")
+  echo "Checkpoint fractions override: ${CKPT_FRACTIONS}"
+fi
+
 # Hydra: quote values that contain '=' (Lightning checkpoint filenames).
 python -u -m src.unlearn_sequential \
   experiment="${EXPERIMENT}" \
@@ -308,6 +319,7 @@ python -u -m src.unlearn_sequential \
   "ckpt_path='${CKPT_PATH}'" \
   num_hierarchies="${NUM_HIER}" \
   ${SEQ_OVR[@]+"${SEQ_OVR[@]}"} \
+  ${CKPT_OVR[@]+"${CKPT_OVR[@]}"} \
   seed="${UNLEARN_SEED}" \
   unlearning.algorithm="${ALGORITHM}" \
   unlearning.neighborhood_aware=${NEIGHBORHOOD_AWARE} \

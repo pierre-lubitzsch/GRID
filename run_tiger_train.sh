@@ -134,6 +134,10 @@ fi
 if [ -n "${HISTORY_ITEMS:-}" ]; then
   RUN_LABEL="${RUN_LABEL}_h${HISTORY_ITEMS}"
 fi
+# Tag resumed segments (self-describing chain: _res marks a continuation run).
+if [ -n "${RESUME_FROM:-}" ]; then
+  RUN_LABEL="${RUN_LABEL}_res"
+fi
 case "$(printf '%s' "${ITEM_TOKEN_AGG:-}" | tr '[:upper:]' '[:lower:]')" in
   ""|none|null|off|false) : ;;
   mean)                    RUN_LABEL="${RUN_LABEL}_aggmean" ;;
@@ -222,6 +226,47 @@ fi
 # or 16 for longer RQ IDs (codebook size stays fixed via vocab_size=256). The
 # semantic_id_path tensor MUST have this many hierarchies.
 NUM_HIER="${NUM_HIER:-4}"
+
+# Resume training from a checkpoint (multi-sbatch-job chains around the 2-day
+# wall limit). RESUME_FROM accepts:
+#   job:<slurm_jobid>  -> that training job's run dir, resolved AT JOB START
+#                         (so segments can be chained with --dependency=afterany
+#                         on a predecessor that is still queued/running now)
+#   <run dir>          -> its checkpoints/
+#   <file.ckpt>        -> used as-is
+# Directory forms prefer 'last.ckpt' (the true latest state; save_last=true in
+# the config) and fall back to the newest *.ckpt. Lightning restores optimizer/
+# lr-scheduler/loop state from the ckpt; the RngStateCallback restores RNG
+# states (post-callback ckpts), so a resumed run is reproducible (rerun the
+# same segment -> same trajectory). NOTE: the streaming TFRecord dataloader
+# cannot seek, so the input stream restarts at resume — the chain is NOT
+# sample-identical to an uninterrupted run.
+if [ -n "${RESUME_FROM:-}" ]; then
+  _SRC="${RESUME_FROM}"
+  if [[ "${_SRC}" == job:* ]]; then
+    _JID="${_SRC#job:}"
+    _SRC="$(ls -1d logs/train/runs/*/*job${_JID}_* 2>/dev/null | head -1 || true)"
+    if [ -z "${_SRC}" ]; then
+      echo "RESUME_FROM=${RESUME_FROM}: no training run dir found for job ${_JID}"; exit 1
+    fi
+  fi
+  if [ -d "${_SRC}" ]; then
+    _CKDIR="${_SRC%/}"
+    [ -d "${_CKDIR}/checkpoints" ] && _CKDIR="${_CKDIR}/checkpoints"
+    if [ -f "${_CKDIR}/last.ckpt" ]; then
+      RESUME_CKPT="${_CKDIR}/last.ckpt"
+    else
+      RESUME_CKPT="$(ls -t "${_CKDIR}"/*.ckpt 2>/dev/null | head -1 || true)"
+    fi
+  else
+    RESUME_CKPT="${_SRC}"
+  fi
+  if [ -z "${RESUME_CKPT:-}" ] || [ ! -f "${RESUME_CKPT}" ]; then
+    echo "RESUME_FROM=${RESUME_FROM}: no checkpoint found (looked at '${_SRC}')"; exit 1
+  fi
+  EXTRA_OVERRIDES+=("ckpt_path='${RESUME_CKPT}'")
+  echo "Resuming from checkpoint: ${RESUME_CKPT}"
+fi
 
 # History length in ITEMS. The config's sequence_length is a raw-code (token)
 # budget that must be a multiple of NUM_HIER (each item = NUM_HIER codes; the

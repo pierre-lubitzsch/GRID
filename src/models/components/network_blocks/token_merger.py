@@ -153,8 +153,20 @@ class AttentiveTokenMerger(ItemTokenMerger):
 
         hidden_dim = int(embedding_dim * mlp_ratio)
 
-        # (2) learnable latent query vectors Q_i in R^{k x d}
-        self.query = nn.Parameter(torch.randn(num_query_tokens, embedding_dim))
+        # (2) learnable latent query vectors Q_i in R^{k x d}.
+        # SMALL init (std 0.02, BERT-style) is load-bearing: the queries are
+        # shared across ALL items and sit on the residual path
+        # (latents = queries + attended). With the original randn(0,1) init the
+        # shared query term dominated the item-dependent attended term, so
+        # early in training every item produced near-identical latents, the
+        # decoder learned unconditional code priors while ignoring the encoder,
+        # and val recall never left ~0 -> early stopping killed the run
+        # (observed on all clean + all L=16 runs, 2026-07-14). At std 0.02 the
+        # residual is negligible and latents are item-discriminative from
+        # step 0.
+        self.query = nn.Parameter(
+            0.02 * torch.randn(num_query_tokens, embedding_dim)
+        )
         # (1) learnable positional embeddings P in R^{L x d}
         if use_positional_embedding:
             self.pos_embedding: Optional[nn.Parameter] = nn.Parameter(

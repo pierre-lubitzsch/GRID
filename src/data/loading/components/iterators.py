@@ -138,6 +138,25 @@ class TFRecordIterator(RawDataIterator):
                 self.parse_tfrecord(sample_record).features.feature  # type: ignore
             )
 
+    def _row_shuffle_seed(self):
+        """Deterministic per-worker seed for the tf.data row shuffle.
+
+        tf.data.Dataset.shuffle without a seed draws a fresh nondeterministic
+        seed EVERY RUN — outside the control of lightning's seed_everything —
+        so two identical runs see different record orders and training is not
+        reproducible even with DETERMINISTIC=1 (found 2026-07-14 by the resume
+        smoke test: identical resumed runs diverged). torch.initial_seed() in a
+        dataloader worker is base_seed-derived and per-worker distinct (set by
+        pl_worker_init_function), so it is the right deterministic source.
+        Falls back to None (old nondeterministic behaviour) if torch is absent.
+        """
+        try:
+            import torch
+
+            return int(torch.initial_seed() % (2**31))
+        except Exception:
+            return None
+
     def iterrows(self):
         assert self.list_of_file_paths is not None, "list_of_file_paths is not set"
         raw_dataset = tf.data.TFRecordDataset(
@@ -147,7 +166,9 @@ class TFRecordIterator(RawDataIterator):
             # the buffer here is the number of records to shuffle
             # the larger the buffer, the more memory it will use
             # too large might cause OOM
-            raw_dataset = raw_dataset.shuffle(buffer_size=128)
+            raw_dataset = raw_dataset.shuffle(
+                buffer_size=128, seed=self._row_shuffle_seed()
+            )
 
         self.initialize_feature_description(raw_dataset)
         # We create an iterator and manually iterate to allow for retrying the
@@ -169,7 +190,9 @@ class TFRecordIterator(RawDataIterator):
             # the buffer here is the number of records to shuffle
             # the larger the buffer, the more memory it will use
             # too large might cause OOM
-            raw_dataset = raw_dataset.shuffle(buffer_size=128)
+            raw_dataset = raw_dataset.shuffle(
+                buffer_size=128, seed=self._row_shuffle_seed()
+            )
 
         self.initialize_feature_description(raw_dataset)
         # to avoid the issues with tf record warnings, we drop the last instances

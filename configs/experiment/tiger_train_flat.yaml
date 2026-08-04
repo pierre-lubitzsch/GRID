@@ -309,7 +309,10 @@ callbacks:
     filename: checkpoint_{epoch:03d}_{step:06d}
     monitor: val/recall@5
     verbose: true
-    save_last: null
+    # Keep a 'last.ckpt' alongside the best-by-val ckpt: the stable resume
+    # anchor for the 2-day-wall resume chains (best-by-val can be much older
+    # than the latest training state).
+    save_last: true
     save_top_k: 1
     mode: max
     auto_insert_metric_name: true
@@ -336,6 +339,12 @@ callbacks:
   restart_job:
     _target_: src.utils.restart_job.RestartAndLoadCheckpointCallback
     metadata_dir: ${paths.metadata_dir}
+  # Save/restore python/numpy/torch/CUDA RNG states in checkpoints so a run
+  # resumed via ckpt_path continues reproducibly (Lightning does not persist
+  # RNG states itself). Needed for the multi-sbatch-job resume chains that work
+  # around the 2-day wall limit (RESUME_FROM in run_tiger_train.sh).
+  rng_state:
+    _target_: src.utils.rng_state_callback.RngStateCallback
 logger:
   csv:
     _target_: lightning.pytorch.loggers.csv_logs.CSVLogger

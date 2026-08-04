@@ -745,6 +745,13 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 f"Unknown pkm_mode: {pkm_mode!r} (expected 'replace' or 'add')"
             )
         # Collect the FFN module names per subtree, keyed by transformer block id.
+        # NOTE: named_modules() yields each module ONCE under its FIRST
+        # registration path. The huggingface encoder is registered as
+        # ``self.model`` by BaseModule before the ``self.encoder`` wrapper, so
+        # encoder FFNs appear as ``model.encoder.block.N...`` — NOT
+        # ``encoder.*``. Classify by substring, checking "decoder" first (the
+        # decoder path ``decoder.decoder.block.N...`` never contains
+        # "encoder"; the encoder path never contains "decoder").
         enc_ffns: Dict[int, str] = {}
         dec_ffns: Dict[int, str] = {}
         for name, module in self.named_modules():
@@ -753,14 +760,25 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 if match is None:
                     continue
                 block_id = int(match.group(1))
-                if name.startswith("encoder"):
-                    enc_ffns[block_id] = name
-                elif name.startswith("decoder"):
+                if "decoder" in name:
                     dec_ffns[block_id] = name
+                elif "encoder" in name:
+                    enc_ffns[block_id] = name
 
         enc_ids, dec_ids = _resolve_pkm_selection(
             pkm_layers, sorted(enc_ffns), sorted(dec_ffns)
         )
+        # Fail loudly on selections that don't exist — a silent partial install
+        # would mislabel the experiment (an 'all' over a subtree that matched no
+        # FFNs used to no-op silently).
+        missing_enc = [i for i in enc_ids if i not in enc_ffns]
+        missing_dec = [i for i in dec_ids if i not in dec_ffns]
+        if missing_enc or missing_dec:
+            raise ValueError(
+                f"pkm_layers selection not found: encoder blocks {missing_enc} "
+                f"(available {sorted(enc_ffns)}), decoder blocks {missing_dec} "
+                f"(available {sorted(dec_ffns)})"
+            )
 
         config = self.encoder.encoder.config
         target_names = [enc_ffns[i] for i in enc_ids] + [dec_ffns[i] for i in dec_ids]
