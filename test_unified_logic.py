@@ -58,8 +58,7 @@ class MockTigerModel(nn.Module):
         self,
         batch: Tuple[torch.Tensor, torch.Tensor],
         *,
-        neighbor_item_ids: Any,
-        forget_item_ids: Any,
+        negative_item_ids: Any,
         temperature: float,
     ) -> torch.Tensor:
         x, _ = batch

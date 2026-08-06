@@ -78,12 +78,24 @@ unlearning:
   forget_loss_level: token  # token | sequence
   lambda_f: 1.0
   lambda_s: 0.1
-  # Coherence loss L_n (TRACER Eq. 9), prefix-neighbour variant; off by default.
-  # Teacher-forces i_T's closest catalog neighbours (shared SID prefix length
-  # >= neighborhood_prefix_length, forget items excluded) on the forget history.
+  # Coherence loss L_n, prefix-neighbour variant; off by default. Teacher-forces
+  # i_T's closest catalog neighbours (shared SID prefix length >=
+  # neighborhood_prefix_length, forget items excluded) on the forget history.
   lambda_n: 0.0
   neighborhood_count: 4
   neighborhood_prefix_length: 2
+  # target_only (default) = score only rows whose label IS a deletion target;
+  # all = every forget row (pre-2026-08-05 behaviour, >=92% filler neighbourhoods
+  # on bandwagon — kept only to reproduce the original lambda_n grid).
+  coherence_rows: target_only
+  # prefix (default) = shared-SID-prefix neighbourhood (width-dependent, can be
+  # empty); embedding = fixed-size top-k in the pre-quantization space
+  # (unlearning.embedding_path), never empty, width-independent.
+  coherence_neighbor_method: prefix
+  coherence_embedding_metric: cosine  # cosine | l2 (embedding method only)
+  # mass = -log sum_p p(s_p | H_f), bounded and satisfiable (recommended);
+  # nll = TRACER Eq. 9 per-neighbour -log p, infeasible optimum (back-compat).
+  coherence_loss_type: nll
   sep_temperature: 0.07
   # L_sep negatives: forget (default; all visible I_f forget-shard items — under
   # deletion_spec=session this is every distinct item in the spam sessions, not

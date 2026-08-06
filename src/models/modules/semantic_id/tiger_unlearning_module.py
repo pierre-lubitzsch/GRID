@@ -31,6 +31,8 @@ from src.components.unlearning.neighborhood_sampler import (
     closest_prefix_neighbors,
     collect_items_in_shards,
     load_codebook,
+    load_dense_embeddings,
+    topk_embedding_neighbors,
 )
 from src.components.unlearning.neg_train import neg_train_unlearn
 from src.components.unlearning.scif import scif_unlearn
@@ -380,6 +382,16 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             ctx["retain_batches"],
             steps=int(cfg.get("finetune_steps", 500)),
             lr=float(cfg.get("finetune_lr", 1e-3)),
+            # Same 'modular stabilizer' scope as unified. With a PKM installed
+            # over a checkpoint that was trained WITHOUT it (replace mode), this
+            # is the ablate-then-repair setup; finetune_steps=0 measures the
+            # pure ablation with no repair at all.
+            update_scope=str(cfg.get("update_scope", "all")),
+            pkm_update_keys=bool(cfg.get("pkm_update_keys", True)),
+            pkm_update_query=bool(cfg.get("pkm_update_query", True)),
+            optimizer=str(cfg.get("finetune_optimizer", "adam")),
+            patience=int(cfg.get("finetune_patience", 0) or 0),
+            min_delta=float(cfg.get("finetune_min_delta", 0.0) or 0.0),
             device=device,
         )
         info["wall_seconds"] = time.time() - t0
@@ -426,6 +438,21 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                     cfg.get("neighborhood_prefix_length", 2)
                 ),
                 exclude_items=ctx["visible_forget_items"],
+                # 'target_only' (default) restricts L_n to forget rows whose
+                # label IS a deletion target. 'all' reproduces the pre-2026-08-05
+                # behaviour, where >=92% of the term boosted neighbours of
+                # popular filler items instead (see _build_coherence_neighbors).
+                coherence_rows=str(cfg.get("coherence_rows", "target_only")),
+                target_items=set(ctx["meta"].get("target_items") or []),
+                # 'embedding' defines P(i_T) as a fixed-size top-k in the
+                # pre-quantization space: never empty, independent of codebook
+                # width, and the ground truth that a prefix bucket only
+                # approximates (0.24-0.68 overlap, sid_fidelity.json).
+                neighbor_method=str(
+                    cfg.get("coherence_neighbor_method", "prefix")
+                ),
+                embedding_path=cfg.get("embedding_path"),
+                embedding_metric=str(cfg.get("coherence_embedding_metric", "cosine")),
             )
 
         info = unified_unlearn(
@@ -441,6 +468,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             lambda_sep=float(cfg.get("lambda_s", 0.1)),
             lambda_neighborhood=lambda_neighborhood,
             coherence_neighbors=coherence_neighbors,
+            # 'mass' (logsumexp over the neighbourhood) is the bounded, feasible
+            # form; 'nll' is the original per-neighbour TRACER Eq. 9 whose optimum
+            # needs every neighbour at probability 1 (see compute_coherence_loss).
+            coherence_loss_type=str(cfg.get("coherence_loss_type", "nll")),
             forget_loss_level=str(cfg.get("forget_loss_level", "token")),
             sep_temperature=float(cfg.get("sep_temperature", 0.07)),
             deletion_spec=ctx["deletion_spec"],
@@ -463,9 +494,25 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             update_positions_backbone=bool(
                 cfg.get("update_positions_backbone", False)
             ),
+            # "Modular stabilizer" scope: update_scope='pkm_only' keeps ONLY the
+            # Product-Key Memory in the optimizer (backbone/SID/heads frozen), so
+            # forgetting must be expressible as a sparse-memory edit. Requires a
+            # PKM-bearing model (pass model.pkm_layers / model.pkm_mode).
+            update_scope=str(cfg.get("update_scope", "all")),
+            pkm_update_keys=bool(cfg.get("pkm_update_keys", True)),
+            pkm_update_query=bool(cfg.get("pkm_update_query", True)),
+            # top-t memory-slot restriction (requires update_scope=pkm_only)
+            slot_selection=str(cfg.get("slot_selection", "none")),
+            slot_top_t=int(cfg.get("slot_top_t", 32)),
+            slot_lambda=float(cfg.get("slot_lambda", 1.0)),
+            slot_mu=float(cfg.get("slot_mu", 5.0)),
+            slot_dot_abs=bool(cfg.get("slot_dot_abs", False)),
+            optimizer=str(cfg.get("unified_optimizer", "adam")),
             device=device,
         )
         info["wall_seconds"] = time.time() - t0
+        info["update_scope"] = str(cfg.get("update_scope", "all"))
+        info["optimizer"] = str(cfg.get("unified_optimizer", "adam"))
         info.update(ctx["meta"])
         return info
 
@@ -478,17 +525,68 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         neighborhood_count: int,
         neighborhood_prefix_length: int,
         exclude_items: Set[int],
+        coherence_rows: str = "target_only",
+        target_items: Optional[Set[int]] = None,
+        neighbor_method: str = "prefix",
+        embedding_path: Optional[str] = None,
+        embedding_metric: str = "cosine",
     ) -> List[Optional[Any]]:
         """Per-forget-batch neighbour semantic ids for the coherence loss.
 
-        For every forget sample ``(H_f, i_T)`` we resolve the target item ``i_T``
-        from its label semantic id, then look up the ``neighborhood_count``
-        closest catalog items by shared SID prefix (length ``>=
-        neighborhood_prefix_length``), excluding forget items. Returns a list
-        aligned to ``forget_batches``; each element is
+        For every eligible forget sample ``(H_f, i_T)`` we resolve the label item
+        ``i_T`` from its label semantic id, then look up the
+        ``neighborhood_count`` closest catalog items by shared SID prefix (length
+        ``>= neighborhood_prefix_length``), excluding forget items. Returns a
+        list aligned to ``forget_batches``; each element is
         ``(neighbor_sids[B, C, H], neighbor_mask[B, C])`` or ``None`` when a
         batch has no eligible neighbours anywhere.
+
+        ``coherence_rows`` decides which forget rows are eligible:
+
+        ``target_only`` (default)
+            Only rows whose label item is in ``target_items`` (the deletion
+            targets, i.e. the spam items). This is the documented TRACER
+            semantics — ``P(i_T)`` is the neighbourhood *of the removed item*.
+
+        ``all``
+            Every forget row, keyed on whatever its label happens to be. This
+            was the behaviour up to 2026-08-05 and is kept only to reproduce the
+            432-run λ_n grid and its 3-seed replication. It is **not** the
+            intended objective: TIGER's collate expands each session into all
+            contiguous sub-sequences and supervises the last item of each, so in
+            a bandwagon session the label is a popular *filler* item on all but
+            one row. Measured on beauty bandwagon pct1/n1 (226 spam users, one
+            target click each, 4110 forget rows over 10 chunks): only 226 rows
+            (8.3% of the 2739 rows that had a neighbour) could possibly be the
+            target, so >=91.7% of the λ_n gradient budget was spent boosting the
+            prefix-neighbours of popular filler items from spam contexts —
+            which is why λ_n never helped and hurt the `mid` stratum most (that
+            target has zero prefix-2 neighbours, so its share was exactly 0%).
         """
+        rows_mode = str(coherence_rows).lower()
+        if rows_mode not in ("target_only", "all"):
+            raise ValueError(
+                f"coherence_rows must be 'target_only'|'all', got {coherence_rows!r}"
+            )
+        nbr_method = str(neighbor_method).lower()
+        if nbr_method not in ("prefix", "embedding"):
+            raise ValueError(
+                "coherence_neighbor_method must be 'prefix'|'embedding', got "
+                f"{neighbor_method!r}"
+            )
+        if nbr_method == "embedding" and not embedding_path:
+            raise ValueError(
+                "coherence_neighbor_method='embedding' requires "
+                "unlearning.embedding_path (pre-quantization item embeddings, "
+                "e.g. embeddings/beauty_merged_predictions_tensor_latest.pt)."
+            )
+        eligible = {int(x) for x in (target_items or set())}
+        if rows_mode == "target_only" and not eligible:
+            raise ValueError(
+                "coherence_rows='target_only' needs a non-empty target item set "
+                "(manifest target_items / visible forget items). Pass "
+                "coherence_rows='all' to score every forget row instead."
+            )
         if not semantic_id_path:
             raise ValueError(
                 "lambda_n > 0 (coherence loss) requires semantic_id_path "
@@ -506,20 +604,65 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         sorted_sids = codebook.numpy()[sorted_ids]
         exclude = {int(x) for x in (exclude_items or set())}
 
+        # Embedding mode: the neighbourhood is a fixed-size top-k in the
+        # pre-quantization space, so every target gets exactly `count` neighbours
+        # regardless of codebook width. Loaded once; the k-NN itself is cached
+        # per item below (with coherence_rows='target_only' and n_target=1 that
+        # is a single query for the whole run).
+        embeddings = None
+        if nbr_method == "embedding":
+            embeddings = load_dense_embeddings(embedding_path)
+            # We index the embedding matrix BY ROW, because the codebook is
+            # indexed 0..N-1 by row and raw item IDs are not valid codebook
+            # indices for datasets with non-sequential IDs (rsc15's reach ~1e9).
+            # That is only sound if row i means the same item in both, which
+            # holds when the SID tensor came from RQ-KMeans over these very
+            # embeddings, in order. Assert the shapes agree rather than silently
+            # mismatching items.
+            if len(embeddings) != num_items:
+                raise ValueError(
+                    f"embedding_path has {len(embeddings)} items but the "
+                    f"codebook has {num_items}: they must be row-aligned "
+                    f"(same catalog, same order) for coherence_neighbor_method="
+                    f"'embedding'. Check that {embedding_path!r} is the "
+                    f"pre-quantization tensor the SID codebook was built from."
+                )
+            log.info(
+                "[unified] coherence L_n neighbours: embedding top-k "
+                "(metric=%s, k=%d) from %s [%d items, dim %d]",
+                embedding_metric,
+                count,
+                embedding_path,
+                len(embeddings),
+                int(embeddings.shape[1]),
+            )
+
         # item id -> neighbour SID rows [k, H] (cached; forget targets repeat).
         neighbor_cache: Dict[int, List[List[int]]] = {}
 
         def _neighbor_rows(item_id: int) -> List[List[int]]:
             if item_id not in neighbor_cache:
-                nbr_ids = closest_prefix_neighbors(
-                    codebook,
-                    item_id,
-                    count,
-                    neighborhood_prefix_length,
-                    sorted_ids=sorted_ids,
-                    sorted_sids=sorted_sids,
-                    exclude_ids=exclude,
-                )
+                if nbr_method == "embedding":
+                    # by_row: item_id and the returned neighbours are codebook
+                    # row indices, directly usable as codebook[n] below.
+                    nbr_ids = topk_embedding_neighbors(
+                        item_id,
+                        embeddings,
+                        count,
+                        metric=embedding_metric,
+                        exclude_ids=exclude,
+                        by_row=True,
+                    )
+                else:
+                    nbr_ids = closest_prefix_neighbors(
+                        codebook,
+                        item_id,
+                        count,
+                        neighborhood_prefix_length,
+                        sorted_ids=sorted_ids,
+                        sorted_sids=sorted_sids,
+                        exclude_ids=exclude,
+                    )
                 neighbor_cache[item_id] = [
                     [int(x) for x in codebook[n].tolist()] for n in nbr_ids
                 ]
@@ -527,6 +670,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
 
         out: List[Optional[Any]] = []
         n_samples = 0
+        n_eligible = 0
         n_with_neighbors = 0
         n_targets_missing = 0
         for model_input, label_data in forget_batches:
@@ -543,6 +687,11 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 if item_id is None:
                     n_targets_missing += 1
                     continue
+                # Skip rows whose label is not a deletion target: their
+                # neighbourhood is irrelevant to the removal (see docstring).
+                if rows_mode == "target_only" and item_id not in eligible:
+                    continue
+                n_eligible += 1
                 rows = _neighbor_rows(item_id)
                 if rows:
                     n_with_neighbors += 1
@@ -556,15 +705,37 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             )
 
         log.info(
-            "[unified] coherence L_n: %d/%d forget samples have >=1 prefix "
-            "neighbour (count=%d, min_prefix_length=%d, %d targets not found in "
-            "codebook)",
-            n_with_neighbors,
+            "[unified] coherence L_n: method=%s rows=%s, %d/%d forget rows "
+            "eligible, %d of those have >=1 neighbour (count=%d, "
+            "min_prefix_length=%s, %d labels not found in codebook)",
+            nbr_method,
+            rows_mode,
+            n_eligible,
             n_samples,
+            n_with_neighbors,
             count,
-            int(neighborhood_prefix_length),
+            int(neighborhood_prefix_length) if nbr_method == "prefix" else "n/a",
             n_targets_missing,
         )
+        if n_with_neighbors == 0:
+            if nbr_method == "prefix":
+                log.warning(
+                    "[unified] coherence L_n is identically ZERO: no eligible "
+                    "forget row has a catalog neighbour sharing a prefix of "
+                    "length >=%d. lambda_n cannot have any effect. Lower "
+                    "unlearning.neighborhood_prefix_length, switch to "
+                    "coherence_neighbor_method=embedding (fixed-size top-k, "
+                    "never empty), or use a narrower codebook (at beauty width "
+                    "256 the mean prefix-2 neighbourhood is ~3 items and ~31%% "
+                    "of items have none).",
+                    int(neighborhood_prefix_length),
+                )
+            else:
+                log.warning(
+                    "[unified] coherence L_n is identically ZERO despite "
+                    "embedding top-k neighbours — no eligible forget row was "
+                    "found at all (check coherence_rows/target_items)."
+                )
         return out
 
     def _run_kookmin(self, **kwargs: Any) -> Dict[str, Any]:
@@ -700,6 +871,244 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             "visible_forget_items": sorted(visible_forget),
         }
 
+    def diagnose_pkm_slots(
+        self,
+        *,
+        top_t: Optional[List[int]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Per-slot access statistics for every PKM, forget vs retain (read-only).
+
+        Answers the question that gates top-t memory-slot selection: do forget
+        and retain interactions route to DISJOINT memory slots? If they overlap
+        almost completely, no selection criterion can separate them.
+
+        Produces two candidate selection scores per slot:
+
+        * ``AF``      -- raw access frequency on the forget set. The
+          access-count baseline (what Sparse Memory Finetuning's TF term does).
+        * ``AF-IHF``  -- access frequency x inverse history frequency,
+          ``AF(s) * log((T_r + 1) / (HF(s) + 1))``, where ``HF`` is the retain
+          access count and ``T_r`` the total retain reads. This is the
+          recommender-side analogue of TF-IDF: a slot scores highly when the
+          forget data hits it often AND the retain ("history") data rarely does.
+
+        Nothing is updated; the model is only run forward.
+        """
+        from src.models.components.network_blocks.product_key_memory import (
+            HashingMemory,
+        )
+
+        tops = [int(t) for t in (top_t or [25, 50, 100, 200, 500, 1000])]
+        mems = [
+            (n, m) for n, m in self.named_modules() if isinstance(m, HashingMemory)
+        ]
+        if not mems:
+            raise ValueError(
+                "diagnose_pkm_slots requires a PKM-bearing model; pass the same "
+                "model.pkm_layers / model.pkm_mode the checkpoint was trained with."
+            )
+
+        ctx = self._prepare_unlearning_context(**kwargs)
+        device = kwargs.get("device") or next(self.parameters()).device
+
+        def _sweep(batches: List[Any]) -> Dict[str, Any]:
+            for _, m in mems:
+                m.enable_access_counting()
+                m.reset_access_counts()
+            was_training = self.training
+            self.eval()
+            with torch.no_grad():
+                for b in batches:
+                    self.model_step(*b)
+            out = {n: m.get_access_counts() for n, m in mems}
+            for _, m in mems:
+                m.disable_access_counting()
+            if was_training:
+                self.train()
+            return out
+
+        log.info(
+            "[pkm-slots] sweeping %d forget / %d retain batches over %d memories",
+            len(ctx["forget_batches"]), len(ctx["retain_batches"]), len(mems),
+        )
+        af_all = _sweep(ctx["forget_batches"])
+        hf_all = _sweep(ctx["retain_batches"])
+
+        # ---- per-slot GRADIENT signal -------------------------------------
+        # Access counts cannot separate forget from retain when both read the
+        # same slots. Gradient MAGNITUDE on those slots still can, so this is
+        # strictly more informative than AF-IHF on a collapsed memory.
+        # Accumulates the gradient of the summed loss w.r.t. values.weight
+        # (shape (size, v_dim)), then takes the per-slot row norm — i.e. the
+        # gradient of the objective, not a sum of per-batch norms.
+        def _grad_sweep(batches: List[Any]) -> Dict[str, torch.Tensor]:
+            acc: Dict[str, torch.Tensor] = {
+                n: torch.zeros_like(m.values.weight) for n, m in mems
+            }
+            was_training = self.training
+            self.eval()  # no dropout noise; grads still flow
+            for b in batches:
+                self.zero_grad(set_to_none=True)
+                _, loss = self.model_step(*b)
+                loss.backward()
+                for n, m in mems:
+                    g = m.values.weight.grad
+                    if g is not None:
+                        acc[n] += g.detach()
+            self.zero_grad(set_to_none=True)
+            if was_training:
+                self.train()
+            return acc
+
+        gf_vec = _grad_sweep(ctx["forget_batches"])
+        gr_vec = _grad_sweep(ctx["retain_batches"])
+
+        per_mem: Dict[str, Any] = {}
+        for name, mem in mems:
+            af = af_all[name][0].double()
+            hf = hf_all[name][0].double()
+            n_slots = int(af.numel())
+            t_f = float(af.sum().item())
+            t_r = float(hf.sum().item())
+            f_touch = af > 0
+            r_touch = hf > 0
+            inter = int((f_touch & r_touch).sum().item())
+            union = int((f_touch | r_touch).sum().item())
+
+            # AF-IHF: high forget access, low retain ("history") access.
+            ihf = torch.log((t_r + 1.0) / (hf + 1.0))
+            af_ihf = af * ihf
+
+            # gradient-based scores: g_f, g_r, and g_f - lambda*g_r
+            gf = gf_vec[name]
+            gr = gr_vec[name]
+            gf_n = gf.norm(dim=1).double()
+            gr_n = gr.norm(dim=1).double()
+            denom = (gf.norm(dim=1) * gr.norm(dim=1)).clamp_min(1e-12)
+            cos_fr = ((gf * gr).sum(dim=1) / denom).double()
+            # ---- selection scores -------------------------------------
+            # Magnitude-only criterion (g_f - lambda*g_r) compares NORMS and so
+            # is blind to DIRECTION: it cannot tell a slot whose forget-ascent
+            # direction also happens to help retain from one that wrecks it.
+            #
+            # The unlearning update moves along +g_f (ascend the forget loss),
+            # so the first-order change in the RETAIN loss from editing slot i is
+            # <g_f,i , g_r,i>. That inner product — not ||g_r,i|| — is the actual
+            # collateral-damage term, and it is signed: negative means editing
+            # for forgetting also IMPROVES retain.
+            #
+            # Combined score (all three terms max-normalised so lambda/mu are
+            # scale-free and comparable across memories):
+            #     s_i = gf_i - lambda * gr_i - mu * dot_i
+            # 'dotabs' variant penalises |dot| instead (pure orthogonality: we
+            # only care that the gradients are UNRELATED, either sign).
+            # Both are additively separable over slots, so exact top-t is just
+            # topk — no greedy approximation needed.
+            def _nrm(v: torch.Tensor) -> torch.Tensor:
+                m = v.abs().max()
+                return v / m if float(m) > 0 else v
+
+            dot_fr = (gf * gr).sum(dim=1).double()
+            gf_hat, gr_hat = _nrm(gf_n), _nrm(gr_n)
+            dot_hat = _nrm(dot_fr)
+            grad_scores = {}
+            for lam in (0.0, 1.0):
+                grad_scores[f"lam{lam}"] = gf_n - float(lam) * gr_n  # magnitude-only
+            for lam in (0.0, 1.0):
+                for mu in (1.0, 5.0):
+                    grad_scores[f"lam{lam}_mu{mu}"] = (
+                        gf_hat - float(lam) * gr_hat - float(mu) * dot_hat
+                    )
+                    grad_scores[f"lam{lam}_mu{mu}_dotabs"] = (
+                        gf_hat - float(lam) * gr_hat - float(mu) * dot_hat.abs()
+                    )
+
+            entry: Dict[str, Any] = {
+                "n_slots": n_slots,
+                "grad": {
+                    "forget_grad_norm_total": float(gf_n.sum().item()),
+                    "retain_grad_norm_total": float(gr_n.sum().item()),
+                    "slots_with_forget_grad": int((gf_n > 0).sum().item()),
+                    "slots_with_retain_grad": int((gr_n > 0).sum().item()),
+                    # mean cosine over slots that BOTH objectives touch: >0 means
+                    # the forget and retain updates pull the same way (conflict).
+                    "mean_fr_cosine_on_shared": float(
+                        cos_fr[(gf_n > 0) & (gr_n > 0)].mean().item()
+                    ) if int(((gf_n > 0) & (gr_n > 0)).sum().item()) else None,
+                    # how far apart are the two objectives' per-slot rankings?
+                    "mean_dot_fr": float(dot_fr.mean().item()),
+                    "frac_slots_dot_negative": float(
+                        (dot_fr < 0).double().mean().item()
+                    ),
+                },
+                "forget_reads": t_f,
+                "retain_reads": t_r,
+                "forget_slots_touched": int(f_touch.sum().item()),
+                "retain_slots_touched": int(r_touch.sum().item()),
+                "forget_coverage": float(f_touch.sum().item()) / n_slots,
+                "retain_coverage": float(r_touch.sum().item()) / n_slots,
+                "touched_jaccard": (inter / union) if union else 0.0,
+                # the decisive statistic: forget-hit slots the retain set never reads
+                "forget_exclusive_slots": int((f_touch & ~r_touch).sum().item()),
+                "forget_exclusive_frac_of_forget": (
+                    float((f_touch & ~r_touch).sum().item())
+                    / max(1, int(f_touch.sum().item()))
+                ),
+                "top_t": {},
+            }
+            for t in tops:
+                k = min(t, n_slots)
+                af_top = torch.topk(af, k).indices
+                ihf_top = torch.topk(af_ihf, k).indices
+                hf_top = torch.topk(hf, k).indices
+                af_set, ihf_set, hf_set = set(af_top.tolist()), set(ihf_top.tolist()), set(hf_top.tolist())
+                entry["top_t"][str(t)] = {
+                    # how different is AF-IHF from the plain access-count baseline?
+                    "af_vs_afihf_overlap": len(af_set & ihf_set) / max(1, k),
+                    # how much do the selected slots collide with retain's own top-t?
+                    "af_top_in_retain_top": len(af_set & hf_set) / max(1, k),
+                    "afihf_top_in_retain_top": len(ihf_set & hf_set) / max(1, k),
+                    # fraction of selected slots the retain set NEVER touches
+                    "af_top_retain_unused": float(
+                        (hf[af_top] == 0).sum().item()
+                    ) / max(1, k),
+                    "afihf_top_retain_unused": float(
+                        (hf[ihf_top] == 0).sum().item()
+                    ) / max(1, k),
+                    "afihf_top_slot_ids": ihf_top[: min(k, 32)].tolist(),
+                }
+                # gradient-criterion selections at the same cutoff
+                for sname, sc in grad_scores.items():
+                    g_top = torch.topk(sc, k).indices
+                    g_set = set(g_top.tolist())
+                    entry["top_t"][str(t)][f"grad_{sname}"] = {
+                        # the collateral-damage term on the SELECTED slots:
+                        # negative is good (forgetting also helps retain)
+                        "mean_dot_selected": float(dot_fr[g_top].mean().item()),
+                        # does the gradient criterion pick different slots than
+                        # the access-count criteria?
+                        "overlap_with_af": len(g_set & af_set) / max(1, k),
+                        "overlap_with_afihf": len(g_set & ihf_set) / max(1, k),
+                        "retain_unused": float(
+                            (hf[g_top] == 0).sum().item()
+                        ) / max(1, k),
+                        "mean_gf_selected": float(gf_n[g_top].mean().item()),
+                        "mean_gr_selected": float(gr_n[g_top].mean().item()),
+                    }
+            per_mem[name] = entry
+
+        return {
+            "diagnostic": "pkm_slots",
+            "n_memories": len(mems),
+            "top_t": tops,
+            "n_forget_batches": len(ctx["forget_batches"]),
+            "n_retain_batches": len(ctx["retain_batches"]),
+            "retain_source": ctx["meta"].get("retain_source"),
+            "per_memory": per_mem,
+            "meta": ctx["meta"],
+        }
+
     def _prepare_unlearning_context(
         self,
         *,
@@ -812,9 +1221,44 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             data_folder=forget_dir,
             batch_size_per_device_override=unlearn_batch_size,
         )
+        # Where the retain batches come from.
+        #   subset (DEFAULT) -> retain_subset_dir, the sampled subset of size
+        #       retain_samples_used_for_update * |D_f|. This is what every
+        #       influence-function / unlearning-scale algorithm expects and is
+        #       what all existing results were produced with.
+        #   full -> the ENTIRE retain split. Needed when the update has to REBUILD
+        #       capacity rather than nudge it (post-hoc PKM repair): fine-tuning
+        #       thousands of steps over a 2-batch subset just memorises it, which
+        #       collapsed utility 0.832 -> 0.360 in jobs 10280081-84.
+        retain_source = str(
+            unlearning_cfg.get("retain_source", "subset") or "subset"
+        ).strip().lower()
+        if retain_source not in ("subset", "full"):
+            raise ValueError(
+                f"unlearning.retain_source must be 'subset' or 'full', got {retain_source!r}"
+            )
+        retain_loader_dir = retain_dir if retain_source == "full" else retain_subset_dir
+        if retain_source == "full":
+            algo_name = str(unlearning_cfg.get("algorithm", "scif")).strip().lower()
+            log.warning(
+                "[retain_source=full] retain batches come from the FULL retain "
+                "split (%s), NOT the %d-per-|D_f| subset. Intended for capacity "
+                "REBUILD (post-hoc PKM repair).",
+                retain_dir,
+                int(unlearning_cfg.get("retain_samples_used_for_update") or 16),
+            )
+            if algo_name in ("scif", "seif"):
+                log.warning(
+                    "[retain_source=full] algorithm=%s derives its influence "
+                    "scaling from the SAMPLED retain subset "
+                    "(retain_count = retain_samples_used_for_update * |D_f|); "
+                    "using the full split changes that estimator's assumptions. "
+                    "Results will NOT be comparable to the recorded %s numbers.",
+                    algo_name, algo_name,
+                )
         retain_loader = _build_finite_loader(
             base_train_cfg=train_dataloader_config,
-            data_folder=retain_subset_dir,
+            data_folder=retain_loader_dir,
             batch_size_per_device_override=unlearn_batch_size,
         )
         forget_batches = _drain_loader(forget_loader, device=device)
@@ -822,7 +1266,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         if not forget_batches:
             raise RuntimeError(f"No forget batches from {forget_dir}")
         if not retain_batches:
-            raise RuntimeError(f"No retain batches from {retain_subset_dir}")
+            raise RuntimeError(f"No retain batches from {retain_loader_dir}")
 
         retain_size_full = _count_rows_in_tfrecord_dir(retain_dir)
         retain_samples_used = int(unlearning_cfg.get("retain_samples_used_for_update") or 16)
@@ -852,6 +1296,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 "retain_size_augmented": sum(tiger_batch_size(b) for b in retain_batches),
                 "retain_size_full": int(retain_size_full),
                 "retain_subset": subset_info,
+                "retain_source": retain_source,
+                "retain_loader_dir": retain_loader_dir,
                 "neighborhood_aware": neighborhood_aware,
                 "deletion_spec": deletion_spec,
                 "target_items": sorted(target_items),

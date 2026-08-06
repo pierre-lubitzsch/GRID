@@ -332,6 +332,62 @@ def select_code_position_params(
     return params, grad_masks
 
 
+def select_pkm_params(
+    model: nn.Module, *, include_query: bool = True, include_keys: bool = True
+) -> Tuple[List[nn.Parameter], List[str]]:
+    """Return only the Product-Key-Memory parameters (everything else frozen).
+
+    This is the "modular stabilizer" update scope: the backbone, SID embeddings
+    and decoder heads are left out of the optimizer entirely, so unlearning can
+    only edit what lives in the sparse memory.
+
+    Selection is by MODULE TYPE (``HashingMemory``), not by parameter name — the
+    PKM wrappers sit at different paths depending on whether they replaced the
+    FFN (``T5LayerPKM``) or run beside it (``T5LayerFFWithPKM``), and encoder
+    FFNs are registered under ``model.encoder.*`` rather than ``encoder.*``.
+
+    ``include_keys`` / ``include_query`` allow editing only the value table
+    (``values.weight``, the "what to output" side per Geva et al. 2021) while
+    freezing the routing, which is the more surgical variant.
+
+    Returns ``(params, names)``; ``names`` is for logging what was selected.
+    """
+    from src.models.components.network_blocks.product_key_memory import (
+        HashingMemory,
+    )
+
+    params: List[nn.Parameter] = []
+    names: List[str] = []
+    seen: set = set()
+    for mod_name, module in model.named_modules():
+        if not isinstance(module, HashingMemory):
+            continue
+        for p_name, p in module.named_parameters():
+            if not p.requires_grad or id(p) in seen:
+                continue
+            # ``keys`` is the product-key routing table; ``query_proj`` (or
+            # whatever the query net is called) maps the hidden state to a
+            # query. Both are optional so callers can edit values only.
+            is_keys = "keys" in p_name
+            is_query = "query" in p_name
+            if is_keys and not include_keys:
+                continue
+            if is_query and not include_query:
+                continue
+            seen.add(id(p))
+            params.append(p)
+            names.append(f"{mod_name}.{p_name}")
+
+    if not params:
+        raise ValueError(
+            "select_pkm_params found no HashingMemory parameters — the "
+            "checkpoint/model was built without PKM layers. Pass "
+            "model.pkm_layers=... (and model.pkm_mode) so the memory exists "
+            "before requesting update_scope='pkm_only'."
+        )
+    return params, names
+
+
 def named_target_params(
     model: nn.Module, policy: str = "all"
 ) -> List[tuple]:

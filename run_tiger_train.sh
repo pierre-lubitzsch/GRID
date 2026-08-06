@@ -141,8 +141,22 @@ fi
 case "$(printf '%s' "${ITEM_TOKEN_AGG:-}" | tr '[:upper:]' '[:lower:]')" in
   ""|none|null|off|false) : ;;
   mean)                    RUN_LABEL="${RUN_LABEL}_aggmean" ;;
-  *attentive*|*attention*|*merger*) RUN_LABEL="${RUN_LABEL}_aggattn" ;;
+  sum)                     RUN_LABEL="${RUN_LABEL}_aggsum" ;;
+  *attentive*|*attention*|*merger*)
+    # k latents/item is the compression ratio, and at L=4 the default k=4 means
+    # NO compression — so the label must record k or the runs are indistinguishable.
+    _k="$(printf '%s' "${ITEM_TOKEN_AGG}" | sed -n 's/.*num_query_tokens[: ]*\([0-9]\+\).*/\1/p')"
+    RUN_LABEL="${RUN_LABEL}_aggattn${_k:+k${_k}}" ;;
 esac
+# TRAIN_SEED: draw a DIFFERENT training run for replication. The config pins
+# seed: 2, and nothing here used to override it, so "re-run with another seed" was
+# not expressible — a repeat submission just reproduced the same draw. Setting it
+# passes `seed=N` to Hydra and (in deterministic mode) PYTHONHASHSEED=N.
+# The label token is appended only when != 2, so every historical seed-2 run dir
+# and every extractor keyed off those names stays byte-identical.
+if [ -n "${TRAIN_SEED:-}" ] && [ "${TRAIN_SEED}" != "2" ]; then
+  RUN_LABEL="${RUN_LABEL}_seed${TRAIN_SEED}"
+fi
 # Optional free-form label suffix (e.g. "_det_seed7") so multi-seed / variant
 # sweeps produce self-describing, non-colliding run dirs.
 RUN_LABEL="${RUN_LABEL}${RUN_LABEL_SUFFIX:-}"
@@ -162,9 +176,14 @@ case "${PKM_MODE_LC}" in
     # normalize a layer selector: ""->null, "all"/"null" passthrough, "0,1"->[0,1]
     pkm_sel() {
       case "${1:-}" in
-        "")          echo "null" ;;
-        all|null)    echo "$1" ;;
-        *)           echo "[$1]" ;;
+        "")             echo "null" ;;
+        all|null)       echo "$1" ;;
+        # 'none'/'off' are the natural way to say "no PKM on this sub-tree" when
+        # the OTHER sub-tree is being selected (e.g. PKM_ENCODER=2
+        # PKM_DECODER=none). Without this they fell through to the [$1] branch
+        # and produced an invalid 'decoder:[none]'.
+        none|off|false) echo "null" ;;
+        *)              echo "[$1]" ;;
       esac
     }
     PKM_ENC="$(pkm_sel "${PKM_ENCODER:-}")"
@@ -189,10 +208,19 @@ esac
 #   DETERMINISTIC_MODE=true    -> strict (trainer.deterministic=true; errors on
 #                                 any nondeterministic op — use to audit)
 # cuBLAS workspace MUST be set before CUDA init (i.e. here, before python).
+# Seed override (see TRAIN_SEED above). Passed to Hydra so seed_everything picks
+# it up; unset means the config default (2) applies untouched.
+if [ -n "${TRAIN_SEED:-}" ]; then
+  EXTRA_OVERRIDES+=("seed=${TRAIN_SEED}")
+  echo "Training seed: ${TRAIN_SEED} (config default is 2)"
+fi
+
 case "$(printf '%s' "${DETERMINISTIC:-}" | tr '[:upper:]' '[:lower:]')" in
   1|true|yes|on)
     export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
-    export PYTHONHASHSEED="${PYTHONHASHSEED:-2}"
+    # PYTHONHASHSEED must follow TRAIN_SEED, or a "different seed" run would keep
+    # the seed-2 hash seed and stay partly correlated with the original draw.
+    export PYTHONHASHSEED="${PYTHONHASHSEED:-${TRAIN_SEED:-2}}"
     DET_MODE="${DETERMINISTIC_MODE:-warn}"   # warn (safe) | true (strict)
     EXTRA_OVERRIDES+=("trainer.deterministic=${DET_MODE}")
     echo "Deterministic mode ON (trainer.deterministic=${DET_MODE}, CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG}); 2-GPU DDP retained."

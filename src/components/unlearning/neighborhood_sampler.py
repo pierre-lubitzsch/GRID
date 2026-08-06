@@ -304,6 +304,97 @@ def embedding_neighbors(
     return [int(embeddings.item_ids[i]) for i in idx.tolist()]
 
 
+def topk_embedding_neighbors(
+    item_id: int,
+    embeddings: DenseEmbeddings,
+    count: int,
+    *,
+    metric: str = "cosine",
+    exclude_ids: Optional[Set[int]] = None,
+    by_row: bool = False,
+) -> List[int]:
+    """Return the ``count`` nearest catalog items to ``item_id`` by embedding.
+
+    Unlike :func:`embedding_neighbors` (an ``epsilon``-ball, whose radius is
+    dataset-dependent and can return zero or thousands of items), this returns a
+    fixed-size top-k. That property is what makes it usable as the ``P(i_T)``
+    set of the coherence loss ``L_n``: every target gets exactly ``count``
+    neighbours, so the term can never silently become a no-op the way the
+    prefix neighbourhood does — at beauty width 256 the mean prefix-2
+    neighbourhood is 3.16 items, 30.6% of items have none, and the bandwagon
+    `mid` target has zero.
+
+    Embedding neighbours are also the ground truth that the prefix neighbourhood
+    only approximates. Measured overlap between a shared-prefix bucket and the
+    embedding top-k at matched k (``logs/eval/sid_fidelity.json``): beauty width
+    256 reaches 0.45-0.68 but only on the 23-66% of probes that have a bucket at
+    all, and the narrow codebooks trade that away — w16 depth-3 scores 0.241,
+    w8/L6 depth-4 0.236. Wider buckets give more neighbours, less faithful ones.
+
+    ``metric="cosine"`` (default) ranks by cosine similarity on L2-normalised
+    vectors, matching how ``scripts/diagnose_sid_neighborhoods.py`` measures
+    fidelity. ``metric="l2"`` ranks by raw Euclidean distance, matching
+    :func:`embedding_neighbors`.
+
+    ``by_row=False`` (default) treats ``item_id`` and ``exclude_ids`` as RAW item
+    IDs and returns raw item IDs — the same convention as
+    :func:`embedding_neighbors`.
+
+    ``by_row=True`` treats them as ROW INDICES into ``embeddings.tensor`` and
+    returns row indices. Callers working in codebook space must use this: the
+    codebook is indexed 0..N-1 by row, and for datasets whose raw item IDs are not
+    sequential (rsc15's run into the hundreds of millions) raw IDs are NOT valid
+    codebook indices. It is only correct when codebook row i and embedding row i
+    describe the same item, which holds because the SID tensor is produced by
+    RQ-KMeans inference over these embeddings in order — the caller should assert
+    the two row counts match.
+    """
+    metric = str(metric).lower()
+    if metric not in ("cosine", "l2"):
+        raise ValueError(f"metric must be 'cosine'|'l2', got {metric!r}")
+    count = int(count)
+    if count <= 0:
+        return []
+    n_rows = int(embeddings.tensor.shape[0])
+    if by_row:
+        if not (0 <= int(item_id) < n_rows):
+            return []
+    elif item_id not in embeddings:
+        return []
+
+    excluded = {int(x) for x in (exclude_ids or set())}
+    excluded.add(int(item_id))
+
+    center = (embeddings.tensor[int(item_id)] if by_row
+              else embeddings[item_id])
+    if metric == "cosine":
+        mat = torch.nn.functional.normalize(embeddings.tensor, dim=1)
+        vec = torch.nn.functional.normalize(center.unsqueeze(0), dim=1)
+        # Negate so that "smaller is closer" holds for both metrics.
+        scores = -(mat @ vec.squeeze(0))
+    else:
+        scores = torch.norm(embeddings.tensor - center.unsqueeze(0), dim=1)
+
+    for ex in excluded:
+        ex_idx = (int(ex) if by_row and 0 <= int(ex) < n_rows
+                  else embeddings.item_id_to_idx.get(int(ex)))
+        if ex_idx is not None:
+            scores[ex_idx] = float("inf")
+
+    # Ask for extra so the excluded rows we blanked can be dropped without
+    # short-changing the caller's requested count.
+    k = min(count + len(excluded), int(scores.numel()))
+    order = torch.topk(scores, k, largest=False).indices
+    out: List[int] = []
+    for i in order.tolist():
+        if math.isinf(float(scores[i])):
+            continue
+        out.append(int(i) if by_row else int(embeddings.item_ids[i]))
+        if len(out) >= count:
+            break
+    return out
+
+
 def select_retain_rows_embedding(
     all_rows: List[bytes],
     item_to_row_indices: Dict[int, List[int]],

@@ -36,6 +36,17 @@ unlearning:
   deletion_spec: session
   forget_size: null
   retain_samples_used_for_update: 16
+  # Where retain batches come from.
+  #   subset (DEFAULT) -> the sampled subset of size
+  #       retain_samples_used_for_update * |D_f|. What every unlearning-scale
+  #       algorithm expects; ALL existing recorded results use this.
+  #   full -> the ENTIRE retain split. Only for updates that must REBUILD
+  #       capacity rather than nudge it (post-hoc PKM repair). With the subset,
+  #       a long fine-tune sees ~2 batches and simply memorises them: utility
+  #       collapsed 0.832 -> 0.360 across 500 -> 10000 steps (jobs 10280081-84).
+  #       NOT comparable to recorded scif/seif numbers — their influence scaling
+  #       is derived from the sampled subset size (a warning is logged).
+  retain_source: subset
   retain_sample_size: null
   repair_sample_bound: null
   retain_max_rows: null
@@ -71,12 +82,65 @@ unlearning:
   update_positions: null
   update_positions_backbone: false
 
+  # --- PKM "modular stabilizer" update scope (algorithm=unified) ---
+  # all       -> normal behaviour: every trainable param is in the optimizer.
+  # pkm_only  -> ONLY the Product-Key Memory params are optimized; backbone, SID
+  #              embeddings and decoder heads are frozen, so forgetting must be
+  #              expressible as an edit to sparse memory. Requires a PKM-bearing
+  #              model — pass the SAME model.pkm_layers / model.pkm_mode the
+  #              checkpoint was trained with (or, for a post-hoc PKM inserted
+  #              into a non-PKM ckpt, whatever layout you want to add; the
+  #              checkpoint loader is strict=False so fresh PKM params are simply
+  #              reported as missing keys and keep their init).
+  # pkm_update_keys / pkm_update_query narrow it further to the VALUE table only
+  # (the "what to output" side), freezing the product-key routing.
+  update_scope: all
+  pkm_update_keys: true
+  pkm_update_query: true
+  # adam (default) | sgd, for algorithm=unified. See finetune_optimizer.
+  unified_optimizer: adam
+
+  # --- top-t memory-slot selection (requires update_scope=pkm_only) ---
+  # Adapts Sparse Memory Finetuning to unlearning: score every PKM value slot,
+  # keep the best t, mask the gradient of the rest.
+  #   none (default) | af | af_ihf | grad | grad_combined
+  #     af             raw forget access frequency (access-count baseline)
+  #     af_ihf         AF * log((T_r+1)/(HF+1)); history = the RETAIN split
+  #     grad           ||g_f|| - slot_lambda * ||g_r||          (magnitudes only)
+  #     grad_combined  gf_hat - slot_lambda*gr_hat - slot_mu*dot_hat, where
+  #                    dot_i = <g_f,i , g_r,i> is the SIGNED first-order change
+  #                    in retain loss from editing slot i. This is the term a
+  #                    norm-based score cannot express.
+  # slot_dot_abs=true penalises |dot| instead (pure orthogonality).
+  # WARNING (WORKFLOW.md section H): on a COLLAPSED memory af/af_ihf are
+  # degenerate (forget and retain read the same slots => IHF constant), and
+  # t >= the number of live slots makes the selection a no-op. A warning is
+  # logged when that happens. Meaningful t grid on a collapsed memory is
+  # {1,2,4,8,16,32}, not {25,...,1000}.
+  slot_selection: none
+  slot_top_t: 32
+  slot_lambda: 1.0
+  slot_mu: 5.0
+  slot_dot_abs: false
+
   # --- RQ-ID diagnostics (python -m src.diagnose_rq_ids) ---
   # both | positions | code_sharing. Read-only; no weight update.
   diagnostics_mode: both
 
   finetune_steps: 500
   finetune_lr: 0.001
+  # adam (default) | sgd. Sparse Memory Finetuning argues for SGD when the update
+  # is restricted to sparsely-selected memory slots: Adam's moment estimates get
+  # diluted on steps where a slot receives zero gradient.
+  finetune_optimizer: adam
+  # Early stopping on the RETAIN loss. 0 (default) = disabled, run all
+  # finetune_steps. patience>0 halts after that many consecutive steps without
+  # improving the best loss by > finetune_min_delta. Lets a large finetune_steps
+  # budget find its own plateau instead of guessing the step count. CAVEAT: this
+  # watches the training objective, not SH@k/UR (eval runs only after unlearning),
+  # so it detects "the rebuild converged", not "removal converged".
+  finetune_patience: 0
+  finetune_min_delta: 0.0
   neg_train_steps: 200
   neg_train_lr: 0.001
   neg_retain_every: 5
@@ -85,15 +149,57 @@ unlearning:
   # Unified objective weights: L = L_R + lambda_f*L_F + lambda_s*L_sep + lambda_n*L_n
   lambda_f: 1.0
   lambda_s: 0.1
-  # Coherence loss L_n (TRACER Eq. 9), prefix-neighbour variant. Off by default
-  # (lambda_n=0). For each forget sample (H_f, i_T) the model is teacher-forced
-  # on the semantic ids of i_T's closest catalog neighbours (by shared SID
-  # prefix, length >= neighborhood_prefix_length, forget items excluded),
-  # conditioned on the forget history, boosting coherent nearby items.
-  # (algorithm=unified only.)
+  # Coherence loss L_n, prefix-neighbour variant. Off by default (lambda_n=0).
+  # For each eligible forget sample (H_f, i_T) the model is teacher-forced on the
+  # semantic ids of i_T's closest catalog neighbours (by shared SID prefix,
+  # length >= neighborhood_prefix_length, forget items excluded), conditioned on
+  # the forget history, boosting coherent nearby items. (algorithm=unified only.)
   lambda_n: 0.0
   neighborhood_count: 4
   neighborhood_prefix_length: 2
+  # Which forget rows L_n scores.
+  #   target_only (default) rows whose LABEL is a deletion target — the
+  #               documented TRACER semantics, P(i_T) around the removed item.
+  #   all         every forget row, keyed on whatever its label is. Pre-2026-08-05
+  #               behaviour, kept ONLY to reproduce the 432-run lambda_n grid and
+  #               its 3-seed replication. TIGER's collate supervises the last item
+  #               of every contiguous sub-sequence, so in a bandwagon session all
+  #               but one row is labelled with a popular FILLER item: measured on
+  #               beauty bandwagon pct1/n1, >=91.7% of the lambda_n budget went to
+  #               filler neighbourhoods, which is why that grid found no benefit.
+  coherence_rows: target_only
+  # How P(i_T) — the neighbourhood L_n repairs — is defined.
+  #   prefix (default) shared SID prefix of length >= neighborhood_prefix_length.
+  #           Cheap, but width-dependent: at beauty width 256 the mean prefix-2
+  #           neighbourhood is 3.16 items, 30.6% of items have NONE, and the
+  #           bandwagon `mid` target has zero, so L_n silently becomes a no-op.
+  #   embedding  fixed-size top-k in the pre-quantization embedding space
+  #           (unlearning.embedding_path). Always returns exactly
+  #           neighborhood_count neighbours for every target, independent of
+  #           codebook width, and is the ground truth that a prefix bucket only
+  #           approximates — measured bucket-vs-embedding-topk overlap is
+  #           0.45-0.68 at width 256 (and only on the 23-66% of items that have
+  #           a bucket), dropping to 0.24 for the narrow codebooks.
+  #           Needs embedding_path set, e.g.
+  #           embeddings/beauty_merged_predictions_tensor_latest.pt [12101, 2048].
+  coherence_neighbor_method: prefix
+  # Ranking metric for coherence_neighbor_method=embedding.
+  #   cosine (default) cosine similarity on L2-normalised vectors — matches how
+  #          scripts/diagnose_sid_neighborhoods.py measures prefix fidelity.
+  #   l2     raw Euclidean distance — matches the legacy embedding_neighbors
+  #          epsilon-ball used by neighborhood-aware retain sampling.
+  coherence_embedding_metric: cosine
+  # Form of L_n.
+  #   mass (recommended) -log sum_{p in P(i_T)} p(s_p | H_f). Aggregates the
+  #        neighbourhood with logsumexp first: a real log-probability, bounded
+  #        below by 0, minimised when the neighbourhood collectively holds the
+  #        mass, gradient vanishes at the optimum.
+  #   nll  TRACER Eq. 9 as ported: a separate -log p per neighbour, so the
+  #        optimum needs ALL neighbourhood_count neighbours at probability 1 —
+  #        infeasible for count > 1, gradient never vanishes, and large lambda_n
+  #        acts as constant distortion pressure (lambda_n=10 cost ~2 NDCG@10
+  #        points in every stratum). Default only for back-compatibility.
+  coherence_loss_type: nll
   sep_temperature: 0.07
   # L_sep negatives: forget (default; all visible I_f forget-shard items — under
   # deletion_spec=session that is every distinct item in the spam sessions) |
@@ -361,6 +467,18 @@ model:
     query_dropout: 0.0
     value_dropout: 0.0
     sparse: false
+    # Value-table init. normal (default) = N(0, v_dim**-0.5) * value_init_scale;
+    # zeros = the memory is an exact NO-OP at step 0.
+    #   post-hoc ADD adapter  -> zeros (LoRA convention: start at the trained
+    #     model, learn a pure correction).
+    #   post-hoc REPLACE      -> zeros deletes the FFN rather than randomising
+    #     it, a cleaner start for a rebuild than injecting noise.
+    # CAVEAT: with all-zero values, d(out)/d(scores)=0, so query_proj and keys
+    # get NO gradient at step 0 (values still learn). Since collapse is a
+    # ROUTING failure, prefer value_init_scale=0.01 over exact zeros whenever
+    # the memory must ALSO learn to route (i.e. trained-in).
+    value_init: normal
+    value_init_scale: 1.0
 
 # Callbacks: keep a model-summary, drop everything fit-related --------------
 # `defaults: callbacks: default` inherits a model_checkpoint/early_stopping

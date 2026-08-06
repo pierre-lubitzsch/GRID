@@ -294,6 +294,18 @@ model:
     query_dropout: 0.0
     value_dropout: 0.0
     sparse: false
+    # Value-table init. normal (default) = N(0, v_dim**-0.5) * value_init_scale;
+    # zeros = the memory is an exact NO-OP at step 0.
+    #   post-hoc ADD adapter  -> zeros (LoRA convention: start at the trained
+    #     model, learn a pure correction).
+    #   post-hoc REPLACE      -> zeros deletes the FFN rather than randomising
+    #     it, a cleaner start for a rebuild than injecting noise.
+    # CAVEAT: with all-zero values, d(out)/d(scores)=0, so query_proj and keys
+    # get NO gradient at step 0 (values still learn). Since collapse is a
+    # ROUTING failure, prefer value_init_scale=0.01 over exact zeros whenever
+    # the memory must ALSO learn to route (i.e. trained-in).
+    value_init: normal
+    value_init_scale: 1.0
   # Optional separate optimizer param group for the PKM parameters (memory
   # keys/values + query net). null (default) => PKM shares the single global
   # optimizer group. Set a dict of per-group optimizer kwargs to give PKM its

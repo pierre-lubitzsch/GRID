@@ -54,6 +54,22 @@ class HashingMemory(nn.Module):
         input_dropout / query_dropout / value_dropout: dropout rates.
         sparse: use sparse gradients for the value ``EmbeddingBag`` (requires a
             sparse-capable optimizer, e.g. SparseAdam).
+        value_init: ``normal`` (default, ``N(0, v_dim**-0.5)``) or ``zeros``.
+            ``zeros`` makes the layer an exact no-op at step 0. For a POST-HOC
+            ``add`` adapter this is the right choice -- the model starts exactly
+            at its trained behaviour and the memory learns a pure correction
+            (the LoRA convention). For post-hoc ``replace`` it means the FFN is
+            *deleted* rather than *randomised*, which is a cleaner starting point
+            for a rebuild than injecting noise.
+            CAVEAT: with all-zero values the layer output is 0 AND
+            ``d(output)/d(scores) = 0``, so ``query_proj`` and ``keys`` receive
+            NO gradient at step 0 -- routing only starts learning once the values
+            become non-zero. Since PKM collapse is a ROUTING failure (see
+            WORKFLOW.md section H), prefer a small non-zero scale over exact
+            zeros when the memory must also learn to route (i.e. trained-in).
+        value_init_scale: multiplier on the ``normal`` std. ``1.0`` reproduces
+            the reference init; e.g. ``0.01`` gives a near-no-op start that still
+            keeps the routing gradients alive.
     """
 
     def __init__(
@@ -69,6 +85,8 @@ class HashingMemory(nn.Module):
         query_dropout: float = 0.0,
         value_dropout: float = 0.0,
         sparse: bool = False,
+        value_init: str = "normal",
+        value_init_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -92,7 +110,26 @@ class HashingMemory(nn.Module):
         # initialize keys / values
         self.initialize_keys()
         self.values = nn.EmbeddingBag(self.size, self.v_dim, mode="sum", sparse=sparse)
-        nn.init.normal_(self.values.weight, mean=0, std=self.v_dim ** -0.5)
+        vi = str(value_init).strip().lower()
+        if vi == "zeros":
+            nn.init.zeros_(self.values.weight)
+        elif vi == "normal":
+            nn.init.normal_(
+                self.values.weight,
+                mean=0,
+                std=(self.v_dim ** -0.5) * float(value_init_scale),
+            )
+        else:
+            raise ValueError(
+                f"value_init must be 'normal' or 'zeros', got {value_init!r}"
+            )
+        self.value_init = vi
+        self.value_init_scale = float(value_init_scale)
+
+        # slot-access instrumentation: off by default, zero overhead when off.
+        # The counter BUFFERS are created lazily by enable_access_counting();
+        # assigning them here as plain attributes would make register_buffer raise.
+        self._count_access = False
 
         # query network (linear projection, optionally followed by batchnorm)
         self.query_proj = nn.Sequential(
@@ -106,6 +143,43 @@ class HashingMemory(nn.Module):
                 ],
             )
         )
+
+    # ---- slot-access instrumentation (opt-in, off by default) --------------
+    # Records which of the ``size`` value slots each forward pass reads. Used to
+    # build the access statistics that drive top-t memory-slot selection
+    # (access-frequency / inverse-history-frequency, the AF-IHF analogue of the
+    # TF-IDF criterion in Sparse Memory Finetuning).
+    #
+    # The counters are registered with persistent=False so they NEVER enter the
+    # state_dict: adding them must not change checkpoint schemas or break the
+    # strict=False loads used throughout the unlearning pipeline.
+    def enable_access_counting(self) -> None:
+        """Start accumulating per-slot read counts (and softmax mass)."""
+        dev = self.keys.device
+        if getattr(self, "_access_count", None) is None:
+            self.register_buffer(
+                "_access_count", torch.zeros(self.size, device=dev), persistent=False
+            )
+            self.register_buffer(
+                "_access_mass", torch.zeros(self.size, device=dev), persistent=False
+            )
+        self._count_access = True
+
+    def disable_access_counting(self) -> None:
+        self._count_access = False
+
+    def reset_access_counts(self) -> None:
+        if getattr(self, "_access_count", None) is not None:
+            self._access_count.zero_()
+            self._access_mass.zero_()
+
+    def get_access_counts(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(read_count, softmax_mass)`` per slot, both length ``size``."""
+        if getattr(self, "_access_count", None) is None:
+            raise RuntimeError(
+                "access counting was never enabled; call enable_access_counting()"
+            )
+        return self._access_count.detach().clone(), self._access_mass.detach().clone()
 
     def initialize_keys(self) -> None:
         """Create two sub-key sets per head.
@@ -196,6 +270,17 @@ class HashingMemory(nn.Module):
         # merge heads / knn (since we sum heads)
         indices = indices.view(bs, self.heads * self.knn)  # (bs, heads*knn)
         scores = scores.view(bs, self.heads * self.knn)  # (bs, heads*knn)
+
+        if self._count_access:
+            # Read-only bookkeeping: detached, no autograd, no effect on output.
+            with torch.no_grad():
+                flat_idx = indices.reshape(-1)
+                self._access_count.index_add_(
+                    0, flat_idx, torch.ones_like(flat_idx, dtype=self._access_count.dtype)
+                )
+                self._access_mass.index_add_(
+                    0, flat_idx, scores.reshape(-1).detach().to(self._access_mass.dtype)
+                )
 
         # weighted sum of values
         output = self.values(indices, per_sample_weights=scores)  # (bs, v_dim)

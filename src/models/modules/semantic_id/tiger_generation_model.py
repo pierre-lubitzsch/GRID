@@ -965,18 +965,35 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         forget_batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
         neighbor_sids: torch.Tensor,
         neighbor_mask: torch.Tensor,
+        loss_type: str = "nll",
     ) -> torch.Tensor:
-        """Coherence loss ``L_n`` (TRACER Eq. 9), prefix-neighbour variant.
+        """Coherence loss ``L_n``, prefix-neighbour variant. Two forms.
+
+        ``loss_type="nll"`` — TRACER Eq. 9 as originally ported:
 
             L_n = -1/K Σ_{(H_f, i_T) ∈ batch} Σ_{i_p ∈ P(i_T)}
                         Σ_ℓ log p_θ(s^p_ℓ | 𝒯(H_f), s^p_{<ℓ})
 
-        For each forget sample, the model is conditioned on the *forget history*
-        ``H_f`` and scored (teacher-forced) on the semantic-id codes of each
-        neighbour ``i_p`` of the forget target ``i_T``. Minimising ``L_n`` boosts
-        generation of the target's semantic neighbours from the forget context,
-        so suppressed probability mass flows to coherent nearby items instead of
-        degenerating.
+        ``loss_type="mass"`` — neighbourhood probability mass (the Step-4
+        "probability mass control" form):
+
+            L_n = -1/B Σ_{(H_f, i_T) ∈ batch}
+                        log Σ_{i_p ∈ P(i_T)} p_θ(s^p | 𝒯(H_f))
+
+        Both condition on the *forget history* ``H_f`` and score (teacher-forced)
+        the semantic-id codes of the neighbours ``i_p`` of the forget target
+        ``i_T``, so that suppressed probability mass flows to coherent nearby
+        items instead of degenerating.
+
+        Prefer ``mass``. The ``nll`` form sums a separate ``-log p`` per
+        neighbour, so its optimum requires all ``C`` neighbours to *each* have
+        probability 1 — infeasible for ``C > 1``. Its gradient therefore never
+        vanishes and a large ``lambda_n`` acts as constant distortion pressure on
+        the whole next-token distribution (measured: ``lambda_n=10`` costs ~2
+        NDCG@10 points across every stratum). The ``mass`` form aggregates the
+        neighbours with ``logsumexp`` first, so it is a proper log-probability
+        bounded below by 0, is satisfiable (the neighbourhood collectively
+        holding all the mass), and its gradient vanishes at the optimum.
 
         Parameters
         ----------
@@ -989,10 +1006,16 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             in-range code; they are excluded via ``neighbor_mask``.
         neighbor_mask:
             ``[B, C]`` (0/1) marking valid neighbour slots. Samples/slots without
-            an eligible neighbour are masked out and do not contribute to ``K``.
+            an eligible neighbour are masked out and contribute to neither the
+            numerator nor the normaliser.
 
         Returns the scalar ``L_n``; ``0`` when no valid neighbour exists.
         """
+        loss_type = str(loss_type).lower()
+        if loss_type not in ("nll", "mass"):
+            raise ValueError(
+                f"coherence loss_type must be 'nll'|'mass', got {loss_type!r}"
+            )
         model_input, _ = forget_batch
         device = model_input.mask.device
         neighbor_sids = neighbor_sids.to(device).long()
@@ -1003,15 +1026,38 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             return torch.zeros((), device=device)
 
         n_slots = neighbor_sids.size(1)
-        total = torch.zeros((), device=device)
+        # Per-(sample, slot) sequence log-probs; invalid slots stay -inf so they
+        # drop out of both the masked sum and the logsumexp.
+        log_probs = neighbor_sids.new_full(
+            (neighbor_mask.size(0), n_slots), float("-inf"), dtype=torch.float32
+        )
         for c in range(n_slots):
             slot_mask = neighbor_mask[:, c]
             if float(slot_mask.sum()) == 0.0:
                 continue
-            log_prob = self._teacher_forced_log_prob(model_input, neighbor_sids[:, c])
-            total = total + (log_prob * slot_mask).sum()
-        # -1/K with K = number of valid (sample, neighbour) terms.
-        return -total / n_valid.clamp(min=1.0)
+            lp = self._teacher_forced_log_prob(model_input, neighbor_sids[:, c])
+            log_probs = log_probs.clone()
+            log_probs[:, c] = torch.where(
+                slot_mask > 0, lp, torch.full_like(lp, float("-inf"))
+            )
+
+        if loss_type == "nll":
+            # -1/K with K = number of valid (sample, neighbour) terms.
+            finite = torch.where(
+                neighbor_mask > 0, log_probs, torch.zeros_like(log_probs)
+            )
+            return -finite.sum() / n_valid.clamp(min=1.0)
+
+        # mass: logsumexp over each sample's valid neighbours, averaged over the
+        # samples that have at least one. A row with no valid slot is all -inf;
+        # excluding it here is what keeps the term finite.
+        row_has_neighbor = neighbor_mask.sum(dim=1) > 0
+        row_mass_logp = torch.logsumexp(log_probs, dim=1)
+        n_rows = row_has_neighbor.sum().to(row_mass_logp.dtype)
+        selected = torch.where(
+            row_has_neighbor, row_mass_logp, torch.zeros_like(row_mass_logp)
+        )
+        return -selected.sum() / n_rows.clamp(min=1.0)
 
     def compute_uniform_kl_loss(
         self,

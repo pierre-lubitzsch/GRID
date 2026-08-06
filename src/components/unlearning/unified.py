@@ -11,9 +11,11 @@ from torch import nn
 
 from src.components.unlearning.hvp import batch_size, batch_to_device
 from src.components.unlearning.local_repair import apply_local_repair_losses
+from src.components.unlearning.slot_selection import select_top_t_slots
 from src.components.unlearning.target_params import (
     select_adaptive_code_params,
     select_code_position_params,
+    select_pkm_params,
 )
 
 log = logging.getLogger(__name__)
@@ -32,6 +34,7 @@ def unified_unlearn(
     lambda_sep: float = 0.1,
     lambda_neighborhood: float = 0.0,
     coherence_neighbors: Optional[Sequence[Any]] = None,
+    coherence_loss_type: str = "nll",
     forget_loss_level: str = "token",
     sep_temperature: float = 0.07,
     deletion_spec: str = "session",
@@ -46,6 +49,15 @@ def unified_unlearn(
     adaptive_adapter: bool = False,
     update_positions: Optional[List[int]] = None,
     update_positions_backbone: bool = False,
+    update_scope: str = "all",
+    pkm_update_keys: bool = True,
+    pkm_update_query: bool = True,
+    slot_selection: str = "none",
+    slot_top_t: int = 32,
+    slot_lambda: float = 1.0,
+    slot_mu: float = 5.0,
+    slot_dot_abs: bool = False,
+    optimizer: str = "adam",
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Optimize unified objective.
@@ -74,14 +86,18 @@ def unified_unlearn(
     ``sep_negatives_mode`` is the originating mode string, recorded for
     metadata only. Local repair still uses ``neighbor_item_ids``.
 
-    When ``lambda_neighborhood > 0``, the TRACER coherence term ``L_n`` is added
-    to the forget side of each step: for each forget sample the model is scored
+    When ``lambda_neighborhood > 0``, the coherence term ``L_n`` is added to the
+    forget side of each step: for each eligible forget sample the model is scored
     (teacher-forced) on the semantic-id codes of its target's prefix-neighbours,
-    conditioned on the forget history, and this negative-log-prob is minimised so
-    suppressed mass flows to coherent neighbours. ``coherence_neighbors`` is a
-    per-forget-batch sequence aligned to ``forget_batches``; each element is
-    ``(neighbor_sids[B, C, H], neighbor_mask[B, C])`` (or ``None`` when a batch
-    has no eligible neighbours) as produced by the caller from the codebook.
+    conditioned on the forget history, and this negative log-probability is
+    minimised so suppressed mass flows to coherent neighbours.
+    ``coherence_neighbors`` is a per-forget-batch sequence aligned to
+    ``forget_batches``; each element is ``(neighbor_sids[B, C, H],
+    neighbor_mask[B, C])`` (or ``None`` when a batch has no eligible neighbours)
+    as produced by the caller from the codebook. ``coherence_loss_type`` selects
+    the ``nll`` (TRACER Eq. 9, per-neighbour, infeasible optimum) or ``mass``
+    (logsumexp over the neighbourhood, bounded and satisfiable) form — see
+    ``compute_coherence_loss``.
     """
     device = device or next(model.parameters()).device
     if not retain_batches:
@@ -130,7 +146,54 @@ def unified_unlearn(
     # Stable-Adaptive Semantic IDs: optionally confine the update to the
     # adaptive (fine-grained) code positions. grad_masks holds per-parameter
     # masks applied to .grad each step before opt.step().
-    if update_positions:
+    slot_select_info = None
+    if str(update_scope).lower() == "pkm_only":
+        # "Modular stabilizer" scope: only the Product-Key Memory is in the
+        # optimizer; backbone, SID embeddings and decoder heads stay frozen, so
+        # any forgetting has to be expressible as an edit to sparse memory.
+        # Takes precedence over the position/adaptive restrictions below.
+        params, pkm_names = select_pkm_params(
+            model,
+            include_keys=bool(pkm_update_keys),
+            include_query=bool(pkm_update_query),
+        )
+        grad_masks = {}
+        log.info(
+            "[unified] PKM-ONLY update scope: %d param tensors (%d params) "
+            "across %d memory modules (keys=%s query=%s); backbone FROZEN",
+            len(params),
+            int(sum(p.numel() for p in params)),
+            len({n.rsplit(".", 1)[0] for n in pkm_names}),
+            bool(pkm_update_keys),
+            bool(pkm_update_query),
+        )
+        # Optional top-t slot restriction on top of pkm_only: score every value
+        # slot from the forget/retain data and mask the gradient of all but the
+        # best t, so only those memory rows move.
+        if str(slot_selection).strip().lower() not in ("none", "", "off"):
+            masks, sel_info = select_top_t_slots(
+                model,
+                forget_batches,
+                retain_batches,
+                criterion=str(slot_selection),
+                top_t=int(slot_top_t),
+                lam=float(slot_lambda),
+                mu=float(slot_mu),
+                dot_abs=bool(slot_dot_abs),
+            )
+            name_to_mod = dict(model.named_modules())
+            n_masked = 0
+            for mem_name, mask in masks.items():
+                w = name_to_mod[mem_name].values.weight
+                grad_masks[id(w)] = mask
+                n_masked += 1
+            slot_select_info = sel_info
+            log.info(
+                "[unified] slot selection=%s top_t=%d -> gradient masks on %d "
+                "value tables",
+                str(slot_selection), int(slot_top_t), n_masked,
+            )
+    elif update_positions:
         # Position-wise intervention (same knob as SCIF's
         # unlearning.update_positions, generalizing adaptive_codes to ANY
         # subset of code positions — e.g. [0] = only the coarsest code c1
@@ -199,7 +262,15 @@ def unified_unlearn(
     else:
         params = [p for p in model.parameters() if p.requires_grad]
         grad_masks = {}
-    opt = torch.optim.Adam(params, lr=float(lr))
+    # SGD is the Sparse Memory Finetuning choice: with a sparse/selected update
+    # Adam's moment estimates get diluted on the steps where a slot receives no
+    # gradient, distorting its effective step size.
+    if str(optimizer).lower() == "sgd":
+        opt = torch.optim.SGD(params, lr=float(lr), momentum=0.9)
+    elif str(optimizer).lower() == "adam":
+        opt = torch.optim.Adam(params, lr=float(lr))
+    else:
+        raise ValueError(f"optimizer must be adam|sgd, got {optimizer!r}")
     model.train()
 
     totals: Dict[str, List[float]] = {
@@ -250,7 +321,10 @@ def unified_unlearn(
                 if cn is not None:
                     neighbor_sids, neighbor_mask = cn
                     l_coh = model.compute_coherence_loss(
-                        forget_batch, neighbor_sids, neighbor_mask
+                        forget_batch,
+                        neighbor_sids,
+                        neighbor_mask,
+                        loss_type=coherence_loss_type,
                     )
                     if l_coh.requires_grad:
                         coh_term = (float(lambda_neighborhood) * l_coh) / float(q_forget)
@@ -331,6 +405,7 @@ def unified_unlearn(
         "q_retain": q_retain,
         "lr": float(lr),
         "restrict_adaptive_codes": bool(restrict_adaptive_codes),
+        "slot_selection": slot_select_info,
         "update_positions": list(update_positions) if update_positions else None,
         "update_positions_backbone": (
             bool(update_positions_backbone) if update_positions else None
@@ -344,6 +419,7 @@ def unified_unlearn(
         "lambda_sep": float(lambda_sep),
         "lambda_neighborhood": float(lambda_neighborhood),
         "coherence_enabled": bool(use_coherence),
+        "coherence_loss_type": str(coherence_loss_type) if use_coherence else None,
         "n_coherence_batches": int(n_coherence_batches),
         "sep_negatives": str(sep_negatives_mode),
         "n_sep_negatives": len(sep_negatives_set),

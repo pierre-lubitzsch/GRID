@@ -64,6 +64,29 @@ class MeanTokenMerger(ItemTokenMerger):
         return item_tokens.mean(dim=2, keepdim=True)
 
 
+class SumTokenMerger(ItemTokenMerger):
+    """Option 1b -- sum pooling over an item's token embeddings (``k_out = 1``).
+
+    Since padding is applied whole-item, every non-padded item has exactly
+    ``L = num_hierarchies`` tokens, so ``sum = L * mean`` EXACTLY -- the two
+    differ only by a fixed scalar. That is not a no-op in this architecture:
+    T5's ``T5LayerNorm`` is RMS-norm and therefore scale-invariant, but T5 is
+    **pre-norm**, so the residual stream carries the un-scaled value. Multiplying
+    the encoder inputs by ``L`` thus changes the ratio of raw-embedding signal to
+    processed signal along the residual path -- effectively an embedding-scale
+    change, which is worth measuring rather than assuming away.
+
+    Shares :class:`MeanTokenMerger`'s weakness: pooling treats the RQ levels as
+    exchangeable and discards which level a code came from. Only
+    :class:`AttentiveTokenMerger` preserves per-hierarchy identity (via its
+    positional embeddings).
+    """
+
+    def forward(self, item_tokens: torch.Tensor) -> torch.Tensor:
+        # item_tokens: (B, N, L, d) -> (B, N, 1, d)
+        return item_tokens.sum(dim=2, keepdim=True)
+
+
 class AttentiveTokenMerger(ItemTokenMerger):
     """Option 2 -- ACERec Attentive Token Merger (learnable-query cross-attention).
 
@@ -131,6 +154,7 @@ class AttentiveTokenMerger(ItemTokenMerger):
         use_positional_embedding: bool = True,
         use_intent_token: bool = False,
         content_adaptive_queries: bool = False,
+        allow_no_compression: bool = False,
     ) -> None:
         super().__init__()
         if embedding_dim % num_heads != 0:
@@ -142,6 +166,29 @@ class AttentiveTokenMerger(ItemTokenMerger):
             raise ValueError(f"num_query_tokens must be >= 1, got {num_query_tokens}")
         if num_tokens < 1:
             raise ValueError(f"num_tokens must be >= 1, got {num_tokens}")
+
+        # The whole point of this module is to emit FEWER vectors per item than the
+        # item has ID tokens. k_out >= num_tokens silently turns it into a
+        # same-width transform, which reads as "aggregation enabled" in the config
+        # and the run label while saving nothing — the failure mode that made
+        # `num_query_tokens=4` (the ACERec default, chosen for L=8/16) a no-op at
+        # L=4. Refuse it unless the caller is deliberately running that control.
+        k_out_check = int(num_query_tokens) + (1 if use_intent_token else 0)
+        if k_out_check >= int(num_tokens) and not allow_no_compression:
+            _suggest = max(1, int(num_tokens) // 2)
+            raise ValueError(
+                f"AttentiveTokenMerger would not compress: it emits "
+                f"k_out={k_out_check} vector(s) per item "
+                f"(num_query_tokens={num_query_tokens}"
+                f"{' + 1 intent token' if use_intent_token else ''}) for an item "
+                f"of num_tokens={num_tokens} ID tokens, so the encoder sequence "
+                f"is not shortened at all"
+                f"{' (it grows)' if k_out_check > int(num_tokens) else ''}. "
+                f"Lower num_query_tokens (e.g. {_suggest}, giving "
+                f"{int(num_tokens) / _suggest:.1f}x compression), or pass "
+                f"allow_no_compression=true to run it as an explicit "
+                f"transform-only control."
+            )
 
         self.embedding_dim = embedding_dim
         self.num_tokens = num_tokens
@@ -277,10 +324,15 @@ def build_item_token_merger(
       * ``None`` / ``"none"`` / ``"off"``  -> ``None`` (feature disabled; the
         model keeps the default per-token + separator-token encoder input).
       * ``"mean"``                          -> :class:`MeanTokenMerger` (1 vec/item).
+      * ``"sum"``                           -> :class:`SumTokenMerger` (1 vec/item;
+        ``= L * mean``, which differs only via T5's pre-norm residual path).
       * ``"attentive"``                     -> :class:`AttentiveTokenMerger` with
-        k=4 latents and positional embeddings on; intent token off by default
-        (set ``intent_token: true`` for strict ACERec parity).
-      * mapping ``{type: mean|attentive, ...}`` -> the named merger, with the
+        positional embeddings on and the intent token off by default (set
+        ``intent_token: true`` for strict ACERec parity). ``num_query_tokens``
+        defaults to ``min(4, L//2)``, i.e. the historical ACERec k=4 at L=8/16 but
+        k=2 at L=4, where a literal 4 would compress nothing. A configuration
+        whose ``k_out >= L`` is rejected unless ``allow_no_compression: true``.
+      * mapping ``{type: mean|sum|attentive, ...}`` -> the named merger, with the
         remaining keys forwarded to the attentive merger (``num_query_tokens``,
         ``num_heads``, ``dropout``, ``mlp_ratio``, ``positional_embedding``,
         ``intent_token``, ``content_adaptive_queries``).
@@ -299,11 +351,18 @@ def build_item_token_merger(
         return None
     if agg_type == "mean":
         return MeanTokenMerger()
+    if agg_type == "sum":
+        return SumTokenMerger()
     if agg_type in ("attentive", "attention", "merger"):
+        # Default k adapts to L instead of being pinned to the ACERec value of 4,
+        # which only compresses when L > 4. min(4, L//2) keeps the historical
+        # k=4 at L=8 and L=16 (so existing runs/labels are unchanged) while
+        # giving L=4 a k=2 that actually halves the encoder sequence.
+        default_k = min(4, max(1, int(num_tokens) // 2))
         return AttentiveTokenMerger(
             embedding_dim=embedding_dim,
             num_tokens=int(num_tokens),
-            num_query_tokens=int(spec_dict.get("num_query_tokens", 4)),
+            num_query_tokens=int(spec_dict.get("num_query_tokens", default_k)),
             num_heads=int(spec_dict.get("num_heads", _default_num_heads(embedding_dim))),
             dropout=float(spec_dict.get("dropout", 0.0)),
             mlp_ratio=float(spec_dict.get("mlp_ratio", 4.0)),
@@ -313,6 +372,9 @@ def build_item_token_merger(
             use_intent_token=bool(spec_dict.get("intent_token", False)),
             content_adaptive_queries=bool(
                 spec_dict.get("content_adaptive_queries", False)
+            ),
+            allow_no_compression=bool(
+                spec_dict.get("allow_no_compression", False)
             ),
         )
     raise ValueError(
