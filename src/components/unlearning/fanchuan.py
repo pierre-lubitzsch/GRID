@@ -35,6 +35,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from src.components.unlearning.optim_utils import build_optimizer
+from src.components.unlearning.target_params import resolve_scope_params
 from src.components.unlearning.hvp import batch_size, batch_to_device
 
 log = logging.getLogger(__name__)
@@ -63,6 +65,10 @@ def fanchuan_unlearn(
     contrastive_temperature: float = 1.15,
     retain_epochs_per_iter: int = 1,
     seed: int = 2,
+    update_scope: str = "all",
+    pkm_update_keys: bool = True,
+    pkm_update_query: bool = True,
+    optimizer: str = "adam",
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Run Fanchuan two-stage unlearning on ``model`` in-place.
@@ -100,8 +106,13 @@ def fanchuan_unlearn(
 
     device = device or next(model.parameters()).device
     model.train()
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.Adam(params, lr=float(lr))
+    params, _ = resolve_scope_params(
+        model, update_scope,
+        fallback=[p for p in model.parameters() if p.requires_grad],
+        include_keys=pkm_update_keys, include_query=pkm_update_query,
+        algo="fanchuan",
+    )
+    opt = build_optimizer(optimizer, params, float(lr), algo="fanchuan")
     rng = random.Random(seed)
 
     log.info(

@@ -21,9 +21,37 @@ def convert_bytes_to_string(
     **kwargs,
 ) -> Dict[str, np.ndarray]:
     # For each feature to apply, cast its np.ndarray of bytes to string.
+    #
+    # Decode UTF-8 explicitly rather than `.astype(str)`: numpy's bytes->str cast
+    # assumes ASCII and raises UnicodeDecodeError on the first non-ASCII byte.
+    # The Amazon P5 item text happens to be ASCII, but Amazon-Reviews-2023 titles
+    # are not (em dashes, accents, trademark signs), which killed the grocery
+    # embedding job with "'ascii' codec can't decode byte 0xe2".
+    # UTF-8 is a strict superset of ASCII, so every existing dataset decodes
+    # byte-identically; `errors="replace"` keeps one malformed title from
+    # aborting a multi-hour job.
     for k in batch_or_row:
         if is_feature_in_features_to_apply(features_to_apply, k):
-            batch_or_row[k] = batch_or_row[k].astype(str)
+            arr = batch_or_row[k]
+            kind = getattr(getattr(arr, "dtype", None), "kind", None)
+            if kind == "S":
+                arr = np.char.decode(arr, "utf-8", "replace")
+            elif kind == "O":
+                # TFRecord parsing hands back an OBJECT array of python `bytes`,
+                # not a fixed-width "S" array, so this is the branch that actually
+                # runs -- and `.astype(str)` on bytes objects yields "b'...'" or
+                # raises UnicodeDecodeError on non-ASCII. Decode element-wise.
+                arr = np.array(
+                    [
+                        x.decode("utf-8", "replace") if isinstance(x, (bytes, bytearray))
+                        else str(x)
+                        for x in arr.ravel()
+                    ],
+                    dtype=object,
+                ).reshape(arr.shape)
+            else:
+                arr = arr.astype(str)
+            batch_or_row[k] = arr
     return batch_or_row
 
 def is_feature_in_features_to_apply(features_to_apply: List[str], k: str) -> bool:

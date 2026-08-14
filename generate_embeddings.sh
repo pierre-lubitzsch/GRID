@@ -12,7 +12,7 @@
 set -euo pipefail
 
 # Optional arg:
-#   1) dataset: beauty (default), sports, toys, rsc15, rsc15_smoke
+#   1) dataset: beauty (default), sports, toys, food, rsc15, rsc15_smoke
 #
 # Walltime: #SBATCH --time=2-00:00:00 (2 days). Override with: sbatch --time=08:00:00 ...
 #
@@ -38,9 +38,25 @@ fi
 echo "[$(date -Is)] Starting inference on dataset=${DATASET}"
 echo "Using data_dir=${GRID_DATA_DIR} (items/)"
 
+# Pin the Hydra run dir to a dataset+job-scoped path instead of letting the merge
+# step guess it afterwards. The old code did
+#     LATEST_RUN_DIR="$(ls -d logs/inference/runs/*/* | sort | tail -1)"
+# which has NO dataset filter, so two concurrent runs (e.g. toys and sports)
+# would both merge whichever run dir sorted last -- silently writing one
+# dataset's embeddings from the other dataset's pickle shards. Making the path
+# explicit lets these run in parallel safely.
+RUN_TAG="${DATASET}_${SLURM_JOB_ID:-$(date +%Y%m%d-%H%M%S)}"
+LATEST_RUN_DIR="logs/inference/runs/embeddings/${RUN_TAG}"
+PICKLE_DIR="${LATEST_RUN_DIR}/pickle"
+export PICKLE_DIR
+mkdir -p "${PICKLE_DIR}"
+
+echo "Run dir: ${LATEST_RUN_DIR}"
+
 python -u -m src.inference \
   experiment=sem_embeds_inference_flat \
   data_dir="${GRID_DATA_DIR}" \
+  hydra.run.dir="${LATEST_RUN_DIR}" \
   data_loading.datamodule.predict_dataloader_config.num_workers=0 \
   data_loading.datamodule.predict_dataloader_config.timeout=0 \
   data_loading.datamodule.predict_dataloader_config.persistent_workers=false \
@@ -48,12 +64,13 @@ python -u -m src.inference \
 
 echo "[$(date -Is)] Inference finished, merging pickle shards..."
 
-LATEST_RUN_DIR="$(ls -d logs/inference/runs/*/* 2>/dev/null | sort | tail -1)"
-PICKLE_DIR="${LATEST_RUN_DIR}/pickle"
-export PICKLE_DIR
-
-if [ -z "${LATEST_RUN_DIR}" ] || [ ! -d "${PICKLE_DIR}" ]; then
-  echo "Could not find latest run pickle directory under logs/inference/runs."
+if [ ! -d "${PICKLE_DIR}" ]; then
+  echo "Pickle directory missing: ${PICKLE_DIR}"
+  exit 1
+fi
+# Guard against merging an empty/foreign directory.
+if [ -z "$(ls -A "${PICKLE_DIR}"/*.pkl 2>/dev/null)" ]; then
+  echo "No pickle shards in ${PICKLE_DIR} -- inference did not write to the pinned run dir."
   exit 1
 fi
 

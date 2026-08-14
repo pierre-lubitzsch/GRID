@@ -67,6 +67,27 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Algorithms that read unlearning.update_scope. 'scif' is excluded (no second
+# derivative through PKM's EmbeddingBag) and 'filter' performs no weight update.
+_PKM_SCOPE_ALGOS = frozenset(
+    {"unified", "finetune", "neg_train", "kookmin", "fanchuan", "seif"}
+)
+
+
+def _resolve_optimizer(cfg, algo: str, default: str = "adam") -> str:
+    """Optimizer name for `algo`, honouring a global fallback.
+
+    Precedence: unlearning.<algo>_optimizer  >  unlearning.optimizer  > default.
+    The per-algorithm keys predate the global one and are kept so recorded
+    commands keep their meaning; the global key is what makes "optimizer" a real
+    experiment axis instead of something only three algorithms respect.
+    """
+    specific = cfg.get(f"{algo}_optimizer")
+    if specific:
+        return str(specific)
+    shared = cfg.get("optimizer")
+    return str(shared) if shared else default
+
 
 class TigerUnlearningModule(SemanticIDEncoderDecoder):
     """Drop-in TIGER subclass exposing multiple unlearning algorithms."""
@@ -92,6 +113,26 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         forget_manifest_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         algorithm = str(unlearning_cfg.get("algorithm", "scif")).strip().lower()
+        # update_scope=pkm_only is only honoured by the algorithms wired for it.
+        # Fail LOUDLY rather than silently performing a full-model update that
+        # would be recorded as a memory-only result.
+        _scope = str(unlearning_cfg.get("update_scope", "all") or "all").strip().lower()
+        if _scope not in ("all", "pkm_only", "ffn_only"):
+            raise ValueError(
+                f"unlearning.update_scope must be 'all', 'pkm_only' or "
+                f"'ffn_only', got {_scope!r}"
+            )
+        if _scope in ("pkm_only", "ffn_only") and algorithm not in _PKM_SCOPE_ALGOS:
+            raise ValueError(
+                f"unlearning.update_scope={_scope!r} is not supported for "
+                f"algorithm={algorithm!r}. Supported: {sorted(_PKM_SCOPE_ALGOS)}. "
+                + ("'scif' cannot work on PKM at all: its HVP needs a second "
+                   "derivative and PKM's EmbeddingBag has none. "
+                   if algorithm == "scif" else "")
+                + ("'filter' performs no weight update (it masks forbidden SIDs "
+                   "at decode time), so a parameter scope is meaningless. "
+                   if algorithm == "filter" else "")
+            )
         if algorithm == "retrain":
             raise ValueError(
                 "algorithm='retrain' is an external baseline; use run_tiger_train.sh "
@@ -167,11 +208,12 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 device=device,
                 forget_manifest_path=forget_manifest_path,
             )
-        if algorithm in ("kookmin", "fanchuan", "seif"):
+        if algorithm in ("kookmin", "fanchuan", "seif", "tracer"):
             runner = {
                 "kookmin": self._run_kookmin,
                 "fanchuan": self._run_fanchuan,
                 "seif": self._run_seif,
+                "tracer": self._run_tracer,
             }[algorithm]
             return runner(
                 unlearning_cfg=unlearning_cfg,
@@ -389,7 +431,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             update_scope=str(cfg.get("update_scope", "all")),
             pkm_update_keys=bool(cfg.get("pkm_update_keys", True)),
             pkm_update_query=bool(cfg.get("pkm_update_query", True)),
-            optimizer=str(cfg.get("finetune_optimizer", "adam")),
+            optimizer=_resolve_optimizer(cfg, "finetune"),
             patience=int(cfg.get("finetune_patience", 0) or 0),
             min_delta=float(cfg.get("finetune_min_delta", 0.0) or 0.0),
             device=device,
@@ -410,6 +452,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             steps=int(cfg.get("neg_train_steps", 200)),
             lr=float(cfg.get("neg_train_lr", 1e-3)),
             neg_retain_every=int(cfg.get("neg_retain_every", 5)),
+            update_scope=str(cfg.get("update_scope", "all")),
+            pkm_update_keys=bool(cfg.get("pkm_update_keys", True)),
+            pkm_update_query=bool(cfg.get("pkm_update_query", True)),
+            optimizer=_resolve_optimizer(cfg, "neg_train"),
             device=device,
         )
         info["wall_seconds"] = time.time() - t0
@@ -472,13 +518,21 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             # form; 'nll' is the original per-neighbour TRACER Eq. 9 whose optimum
             # needs every neighbour at probability 1 (see compute_coherence_loss).
             coherence_loss_type=str(cfg.get("coherence_loss_type", "nll")),
+            coherence_mass_cap=float(cfg.get("coherence_mass_cap", 0.999)),
             forget_loss_level=str(cfg.get("forget_loss_level", "token")),
             sep_temperature=float(cfg.get("sep_temperature", 0.07)),
             deletion_spec=ctx["deletion_spec"],
             forget_item_ids=ctx["visible_forget_items"],
             neighbor_item_ids=ctx["neighborhood_centers"],
             sep_negative_item_ids=ctx["sep_negative_items"],
-            sep_negatives_mode=str(cfg.get("sep_negatives", "forget")),
+            sep_negatives_mode=str(cfg.get("sep_negatives", "forget_target_only")),
+            # history (default, back-compatible but tautological: r_u IS the mean
+            # of the history items) | label (the true next item; a real positive).
+            sep_positives=str(cfg.get("sep_positives", "history")),
+            # cosine (default) = pooled-encoder similarity; generative = the
+            # model's own sequence log-prob, i.e. on the generation path.
+            sep_loss_type=str(cfg.get("sep_loss_type", "cosine")),
+            sep_gen_temperature=float(cfg.get("sep_gen_temperature", 1.0)),
             local_repair_cfg=local_repair,
             restrict_adaptive_codes=bool(cfg.get("adaptive_codes", False)),
             stable_codes=int(cfg.get("stable_codes", 2)),
@@ -507,12 +561,181 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             slot_lambda=float(cfg.get("slot_lambda", 1.0)),
             slot_mu=float(cfg.get("slot_mu", 5.0)),
             slot_dot_abs=bool(cfg.get("slot_dot_abs", False)),
-            optimizer=str(cfg.get("unified_optimizer", "adam")),
+            optimizer=_resolve_optimizer(cfg, "unified"),
+            # 1.0 = one lr for every parameter, the value every recorded run
+            # used. Lower it (0.1 / 0.01) to slow the identifier space down.
+            code_lr_scale=float(cfg.get("code_lr_scale", 1.0)),
+            # Extra multiplier on the ADAPTIVE tail [stable_codes, H) only, on
+            # top of code_lr_scale. 1.0 = one code group (previous behaviour).
+            adaptive_code_lr_scale=float(cfg.get("adaptive_code_lr_scale", 1.0)),
             device=device,
         )
         info["wall_seconds"] = time.time() - t0
         info["update_scope"] = str(cfg.get("update_scope", "all"))
         info["optimizer"] = str(cfg.get("unified_optimizer", "adam"))
+        info.update(ctx["meta"])
+        return info
+
+    def _run_tracer(self, **kwargs: Any) -> Dict[str, Any]:
+        """TRACER (arXiv:2606.07688) -- token reassignment, as a baseline.
+
+        Needs the RQ-KMeans codebook the semantic ids were built from
+        (``unlearning.tracer_rqkmeans_ckpt``) plus the pre-quantization item
+        embeddings (``unlearning.embedding_path``); ``phi=0`` is asserted to
+        reproduce the stored codes before anything is trained, because a codebook
+        that does not match the SID tensor would silently reassign items before
+        unlearning even starts.
+        """
+        import torch as _torch
+
+        from src.components.unlearning.tracer import tracer_unlearn
+        from src.components.unlearning.tracer_tokenizer import (
+            assert_reproduces_sids,
+            compute_residuals,
+            load_rq_centroids,
+        )
+        from src.components.unlearning.neighborhood_sampler import load_dense_embeddings
+
+        ctx = self._prepare_unlearning_context(**kwargs)
+        device = kwargs.get("device") or next(self.parameters()).device
+        cfg = kwargs["unlearning_cfg"]
+        t0 = time.time()
+
+        ckpt = cfg.get("tracer_rqkmeans_ckpt")
+        if not ckpt:
+            raise ValueError(
+                "algorithm=tracer requires unlearning.tracer_rqkmeans_ckpt (the "
+                "RQ-KMeans checkpoint holding the codeword centroids). The "
+                "original width-256/L4 beauty codebook no longer exists, so use "
+                "an identifier space whose checkpoint survives (w16, w8l6, L8)."
+            )
+        emb_path = cfg.get("embedding_path")
+        if not emb_path:
+            raise ValueError("algorithm=tracer requires unlearning.embedding_path")
+
+        num_hierarchies = int(kwargs.get("num_hierarchies") or self.num_hierarchies)
+        n_levels = int(cfg.get("tracer_levels") or (num_hierarchies - 1))
+        centroids = load_rq_centroids(str(ckpt), n_levels=n_levels)
+        centroids = _torch.stack([c for c in centroids])              # [L, K, D]
+
+        codes = self.codebooks.t().to(_torch.long).cpu()               # [H, N]
+        n_items = int(codes.shape[1])
+
+        # load_dense_embeddings returns a DenseEmbeddings whose rows are indexed by
+        # RAW item id (rsc15's reach into the hundreds of millions), while `codes`
+        # is indexed by dense id 0..N-1. Align explicitly rather than assuming the
+        # two coincide -- they happen to for Amazon, but silently mismatched rows
+        # would make every distance in Eq. 6 refer to the wrong item.
+        z_obj = load_dense_embeddings(str(emb_path))
+        if hasattr(z_obj, "tensor"):
+            id_to_idx = z_obj.item_id_to_idx
+            missing = [i for i in range(n_items) if i not in id_to_idx]
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} of {n_items} dense item ids are absent from "
+                    f"{emb_path} (first few: {missing[:5]}). The embeddings must "
+                    "cover every item in the SID tensor."
+                )
+            row_idx = _torch.tensor(
+                [id_to_idx[i] for i in range(n_items)], dtype=_torch.long
+            )
+            z = z_obj.tensor[row_idx]
+        else:
+            z = z_obj
+        if int(z.shape[0]) != n_items:
+            raise ValueError(
+                f"embeddings have {z.shape[0]} rows but the SID tensor has "
+                f"{n_items} items"
+            )
+
+        # Correctness anchor: refuses unless phi=0 reproduces every stored code.
+        assert_reproduces_sids(z, [centroids[i] for i in range(n_levels)], codes)
+
+        # Target items live under ctx["meta"], not ctx itself -- reading the
+        # wrong key made this look like "no targets" and tripped the
+        # coherence_rows=target_only guard on a dataset that has them.
+        target_items = sorted(int(i) for i in (ctx["meta"].get("target_items") or []))
+        if not target_items:
+            target_items = sorted(int(i) for i in (ctx.get("visible_forget_items") or []))
+        if not target_items:
+            raise ValueError("tracer found no concept items to reassign")
+        concept = _torch.tensor(target_items, dtype=_torch.long)
+        all_items = _torch.arange(codes.shape[1])
+        keep = _torch.ones(codes.shape[1], dtype=_torch.bool)
+        keep[concept] = False
+        retain_items = all_items[keep]
+
+        res_levels = compute_residuals(z, [centroids[i] for i in range(n_levels)], codes)
+        residuals = _torch.stack([r[concept] for r in res_levels], dim=1)  # [M, L, D]
+
+        # L_Coh's P(i_T) -- BUILT HERE, BY TRACER, ON PURPOSE.
+        #
+        # The paper's P(i_T) is the K nearest items to the CONCEPT item i_T in
+        # the frozen embedding space. That is computed directly below from `z`
+        # (the same dense embeddings the RQ-KMeans quantizer was fitted on, in
+        # dense-item-id row order), with the concept set excluded from its own
+        # neighbourhood.
+        #
+        # It deliberately does NOT call self._build_coherence_neighbors and does
+        # not read any coherence_* / neighborhood_* config key: our prefix and
+        # L_n neighbourhood construction is a contribution of ours, so routing a
+        # baseline through it would stop it being a baseline. The only knob is
+        # unlearning.tracer_neighborhood_count (the paper's K ~ 5).
+        k_coh = int(cfg.get("tracer_neighborhood_count", 5))
+        neighbor_items_log: Optional[List[List[int]]] = None
+        zc = _torch.nn.functional.normalize(z[concept].double(), dim=-1)   # [M, D]
+        za = _torch.nn.functional.normalize(z.double(), dim=-1)            # [N, D]
+        sim = zc @ za.t()                                                  # [M, N]
+        sim[:, concept] = float("-inf")   # never a neighbour of itself/the concept
+        k_eff = int(min(k_coh, max(0, sim.shape[1] - int(concept.numel()))))
+        if k_eff <= 0:
+            concept_neighbor_sids = None
+        else:
+            nbr_items = sim.topk(k_eff, dim=-1).indices                    # [M, k]
+            # codes is [H, N]; transpose to [N, H] and gather the neighbours'
+            # full semantic ids (including the trailing dedup digit).
+            concept_neighbor_sids = codes.t()[nbr_items].contiguous()      # [M, k, H]
+            neighbor_items_log = nbr_items.tolist()
+            log.info(
+                "[tracer] P(i_T): cosine top-%d over %s for %d concept item(s), "
+                "concept set excluded (built inside the TRACER path, not via "
+                "_build_coherence_neighbors). First concept item %d -> %s",
+                k_eff,
+                emb_path,
+                int(concept.numel()),
+                int(concept[0]),
+                nbr_items[0].tolist(),
+            )
+        del sim, zc, za
+
+        info = tracer_unlearn(
+            self,
+            forget_batches=ctx["forget_batches"],
+            retain_batches=ctx["retain_batches"],
+            concept_item_ids=concept,
+            residuals=residuals,
+            centroids=centroids,
+            codes=codes,
+            retain_item_ids=retain_items,
+            concept_neighbor_sids=concept_neighbor_sids,
+            steps=cfg.get("tracer_steps", 500),
+            n_epochs=cfg.get("n_epochs"),
+            lr=float(cfg.get("tracer_lr", 1e-4)),
+            phi_lr=float(cfg.get("tracer_phi_lr", 1e-2)),
+            tau=float(cfg.get("tracer_temperature", 0.005)),
+            lambda_forget=float(cfg.get("tracer_lambda_forget", 1.0)),
+            lambda_coherence=float(cfg.get("tracer_lambda_coherence", 1.0)),
+            lambda_reg=float(cfg.get("tracer_lambda_reg", 1e-3)),
+            selective_update=bool(cfg.get("tracer_selective_update", True)),
+            optimizer=_resolve_optimizer(cfg, "tracer", default="sgd"),
+            commit=bool(cfg.get("tracer_commit", True)),
+            device=device,
+        )
+        info["wall_seconds"] = time.time() - t0
+        info["tracer_rqkmeans_ckpt"] = str(ckpt)
+        # Audit trail for P(i_T): the exact neighbour item ids TRACER used.
+        info["tracer_coherence_neighbor_items"] = neighbor_items_log
+        info["tracer_coherence_metric"] = "cosine_topk_on_concept_items"
         info.update(ctx["meta"])
         return info
 
@@ -753,6 +976,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             retain_lr=float(cfg.get("kookmin_retain_lr", 1e-3)),
             scale_for_reinit_params=float(cfg.get("kookmin_scale_for_reinit", 10.0)),
             target_params_policy=str(cfg.get("target_params", "all")),
+            update_scope=str(cfg.get("update_scope", "all")),
+            pkm_update_keys=bool(cfg.get("pkm_update_keys", True)),
+            pkm_update_query=bool(cfg.get("pkm_update_query", True)),
+            optimizer=_resolve_optimizer(cfg, "kookmin"),
             device=device,
         )
         info["wall_seconds"] = time.time() - t0
@@ -776,6 +1003,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             ),
             retain_epochs_per_iter=int(cfg.get("fanchuan_retain_epochs_per_iter", 1)),
             seed=int(kwargs.get("seed", 2)),
+            update_scope=str(cfg.get("update_scope", "all")),
+            pkm_update_keys=bool(cfg.get("pkm_update_keys", True)),
+            pkm_update_query=bool(cfg.get("pkm_update_query", True)),
+            optimizer=_resolve_optimizer(cfg, "fanchuan"),
             device=device,
         )
         info["wall_seconds"] = time.time() - t0
@@ -806,6 +1037,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             repair_lr=float(cfg.get("seif_repair_lr", 7e-4)),
             weight_decay=float(cfg.get("seif_weight_decay", 5e-4)),
             noise_param_keywords=list(keywords) if keywords else None,
+            update_scope=str(cfg.get("update_scope", "all")),
+            pkm_update_keys=bool(cfg.get("pkm_update_keys", True)),
+            pkm_update_query=bool(cfg.get("pkm_update_query", True)),
+            optimizer=_resolve_optimizer(cfg, "seif"),
             device=device,
         )
         info["wall_seconds"] = time.time() - t0
@@ -1166,6 +1401,9 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                     target_items=target_items,
                     extra_source_dirs=extra_dirs,
                     rows_per_shard=int(unlearning_cfg.get("rows_per_shard", 4096)),
+                    include_context_rows=bool(
+                        unlearning_cfg.get("include_context_rows", False)
+                    ),
                 )
             forget_dir = item_pairs_dir
 

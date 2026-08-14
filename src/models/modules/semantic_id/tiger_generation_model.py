@@ -1,4 +1,6 @@
 import logging
+import math
+import os
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -25,6 +27,11 @@ from src.utils.utils import (
     get_parent_module_and_attr,
     reset_parameters,
 )
+
+# Module-level logger. This file previously had none, so the TRACER helpers'
+# `log.*` calls raised NameError; kept under a TRACER-specific name so it cannot
+# collide with a general-purpose `log` added elsewhere in this module.
+_TRACER_LOG = logging.getLogger(__name__)
 
 
 class SemanticIDGenerativeRecommender(TransformerBaseModule):
@@ -717,6 +724,93 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             }
         return {"optimizer": optimizer}
 
+    def reinit_ffn_layers(
+        self,
+        ffn_layers: Union[str, Dict[str, Any]],
+    ) -> List[str]:
+        """CONTROL for the post-hoc PKM experiments: re-initialise selected T5
+        feed-forward sub-layers *in place*, keeping them as ordinary FFNs.
+
+        This is the sanity check for "does PKM actually help?". The post-hoc PKM
+        recipe is: discard a trained FFN, put a fresh high-capacity module there,
+        fine-tune it on retain data. If doing the SAME thing with a freshly
+        initialised **FFN** matches it, then the result is about
+        *reinitialise-and-retrain-this-layer* and the PKM contributes nothing.
+
+        Uses the same selection format and the same module discovery as
+        :meth:`_install_pkm_layers`, so the two target byte-identical layers.
+
+        MUST be called AFTER ``load_state_dict``: unlike PKM params (which are
+        missing keys and keep their fresh init), FFN weights are present in the
+        checkpoint and would be overwritten by the load.
+
+        Returns the list of re-initialised module names; also stored on
+        ``self._reinit_ffn_module_names`` for ``update_scope='ffn_only'``.
+        """
+        # Match BOTH FFN types. mlp_layers bloating (in __init__) replaces every
+        # T5LayerFF with a T5MultiLayerFF, and it runs AFTER the PKM install --
+        # so _install_pkm_layers legitimately sees T5LayerFF, but this method
+        # runs post-init (after the ckpt load) when only T5MultiLayerFF remain.
+        # Checking just T5LayerFF here found zero layers.
+        _FFN_TYPES = (
+            transformers.models.t5.modeling_t5.T5LayerFF,
+            T5MultiLayerFF,
+        )
+        enc_ffns: Dict[int, str] = {}
+        dec_ffns: Dict[int, str] = {}
+        for name, module in self.named_modules():
+            if isinstance(module, _FFN_TYPES):
+                match = re.search(r"block\.(\d+)\.", name)
+                if match is None:
+                    continue
+                block_id = int(match.group(1))
+                if "decoder" in name:
+                    dec_ffns[block_id] = name
+                elif "encoder" in name:
+                    enc_ffns[block_id] = name
+
+        if not enc_ffns and not dec_ffns:
+            raise ValueError(
+                "reinit_ffn_layers found no FFN sub-layers of types "
+                f"{[t.__name__ for t in _FFN_TYPES]} — the model layout changed."
+            )
+
+        enc_ids, dec_ids = _resolve_pkm_selection(
+            ffn_layers, sorted(enc_ffns), sorted(dec_ffns)
+        )
+        missing_enc = [i for i in enc_ids if i not in enc_ffns]
+        missing_dec = [i for i in dec_ids if i not in dec_ffns]
+        if missing_enc or missing_dec:
+            raise ValueError(
+                f"ffn_reinit_layers selection not found: encoder blocks "
+                f"{missing_enc} (available {sorted(enc_ffns)}), decoder blocks "
+                f"{missing_dec} (available {sorted(dec_ffns)})"
+            )
+
+        target_names = [enc_ffns[i] for i in enc_ids] + [dec_ffns[i] for i in dec_ids]
+        if not target_names:
+            raise ValueError("ffn_reinit_layers selected no layers")
+
+        name_to_mod = dict(self.named_modules())
+        n_tensors = 0
+        n_params = 0
+        for tname in target_names:
+            mod = name_to_mod[tname]
+            for sub in mod.modules():
+                if hasattr(sub, "reset_parameters"):
+                    sub.reset_parameters()
+                    n_tensors += 1
+            n_params += sum(p.numel() for p in mod.parameters())
+
+        self._reinit_ffn_module_names = list(target_names)
+        # NOTE: this module logs via the root `logging`, not a module-level `log`.
+        logging.info(
+            "Re-initialised %d FFN sub-layers (%d tensors, %d params) -> "
+            "encoder blocks %s, decoder blocks %s [PKM CONTROL]",
+            len(target_names), n_tensors, n_params, enc_ids, dec_ids,
+        )
+        return list(target_names)
+
     def _install_pkm_layers(
         self,
         pkm_layers: Union[str, Dict[str, Any]],
@@ -846,6 +940,244 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             "_adaptive_sorted_item_ids", order.to(torch.long).to(device), persistent=False
         )
 
+    def enable_token_reassignment(
+        self,
+        concept_item_ids: torch.Tensor,
+        residuals: torch.Tensor,
+        centroids: torch.Tensor,
+        tau: float = 0.005,
+    ) -> None:
+        """TRACER token reassignment (arXiv:2606.07688, Eq. 6). Idempotent.
+
+        Adds a per-item, per-level, per-codeword score ``phi`` for the *concept*
+        items only, and swaps their SID token embeddings for the soft mixture
+
+            q_phi(s_i^l = k) = softmax_k( (-||r_i^l - c_k^l||^2 + phi_{i,k}^l) / tau )
+            e~_i^l           = sum_k q_phi(s_i^l = k) e_k^l
+
+        so gradients reach ``phi`` through the ordinary next-token losses and the
+        item can be *reassigned* to a different codeword rather than merely
+        suppressed.
+
+        Parameters
+        ----------
+        concept_item_ids: ``[M]`` item ids whose tokens may be reassigned.
+        residuals:  ``[M, L, D_z]`` quantizer residuals ``r_i^l`` for those items,
+            built with the normalize-in / normalize-residual recursion (see
+            ``tracer_tokenizer.compute_residuals``). Frozen.
+        centroids:  ``[L, K, D_z]`` codewords ``c_k^l``. Frozen.
+        tau: softmax temperature. The paper uses a narrow band (0.003-0.009);
+            smaller tau makes ``phi=0`` a closer match to the hard embedding.
+
+        Note ``phi=0`` reproduces the stored *assignment* exactly (argmax), but
+        the soft embedding is only approximately the hard one -- that gap is the
+        soft tokenizer of Eq. 5 and is controlled by ``tau``, not a bug.
+        """
+        if getattr(self, "tracer_phi", None) is not None:
+            return
+        if getattr(self, "codebooks", None) is None:
+            raise ValueError("enable_token_reassignment requires codebooks")
+        n_levels = int(centroids.shape[0])
+        if n_levels > int(self.num_hierarchies):
+            raise ValueError(
+                f"centroids has {n_levels} levels > num_hierarchies="
+                f"{self.num_hierarchies}"
+            )
+        if residuals.shape[0] != concept_item_ids.numel():
+            raise ValueError(
+                f"residuals has {residuals.shape[0]} rows but "
+                f"{concept_item_ids.numel()} concept items were given"
+            )
+        device = self.item_sid_embedding_table_encoder.weight.device
+        K = int(centroids.shape[1])
+        self._tracer_tau = float(tau)
+        self._tracer_levels = n_levels
+        self._tracer_codebook_size = K
+        self.tracer_phi = nn.Parameter(
+            torch.zeros(concept_item_ids.numel(), n_levels, K, device=device)
+        )
+        # Precompute -||r - c||^2 ONCE, in float64, and cache it. Two reasons:
+        #  * correctness -- the unlearning entrypoints set matmul precision to
+        #    "medium", and cdist is matmul-backed, so recomputing this per step in
+        #    float32 flips the argmin for near-tied codewords (measured: phi=0
+        #    reproduced 98.59% of beauty-w16 codes instead of 100%);
+        #  * speed -- the distances do not depend on phi, so there is nothing to
+        #    recompute anyway.
+        # Kept in float64: [M, L, K] with M = |concept items| is tiny, and the
+        # float32 rounding is exactly what re-introduces the ties.
+        r = residuals.to(device).double()                      # [M, L, D]
+        c = centroids.to(device).double()                      # [L, K, D]
+        neg_d2 = -torch.stack(
+            [torch.cdist(r[:, l], c[l]).pow(2) for l in range(n_levels)], dim=1
+        )                                                      # [M, L, K]
+        self.register_buffer("_tracer_neg_d2", neg_d2, persistent=False)
+        self.register_buffer(
+            "_tracer_residuals", residuals.to(device).float(), persistent=False
+        )
+        self.register_buffer(
+            "_tracer_centroids", centroids.to(device).float(), persistent=False
+        )
+        # Dense item_id -> phi row map (-1 for items TRACER must not touch), so
+        # the forward pass can look concept membership up without a search.
+        num_items = int(self.codebooks.size(0))
+        row_of = torch.full((num_items,), -1, dtype=torch.long, device=device)
+        row_of[concept_item_ids.to(device).long()] = torch.arange(
+            concept_item_ids.numel(), device=device
+        )
+        self.register_buffer("_tracer_row_of_item", row_of, persistent=False)
+        # The inverse code->item map is shared with the adaptive-offset path.
+        if not hasattr(self, "_adaptive_sorted_keys"):
+            self._build_code_to_item_index()
+        # Keep `tracer_phi` OUT of the saved state_dict. It is a training-time
+        # latent of the tokenizer, not a model weight: the reassignment it
+        # encodes is committed to the semantic ids, not to theta. Leaving it in
+        # would make the unlearned checkpoint fail every strict load downstream
+        # (post-unlearn eval, inference) with an unexpected-key error.
+        # NB: a state_dict post-hook must mutate in place and return None --
+        # returning the dict raises "state_dict post-hook must return None".
+        def _drop_tracer_phi(module, state, prefix, local_metadata):
+            state.pop(prefix + "tracer_phi", None)
+
+        if not getattr(self, "_tracer_sd_hook", False):
+            self._tracer_sd_hook = True
+            register = getattr(self, "register_state_dict_post_hook", None)
+            if register is None:  # torch < 2.5
+                register = self._register_state_dict_hook
+            register(_drop_tracer_phi)
+
+    def tracer_assignment_scores(self) -> torch.Tensor:
+        """``-||r_i^l - c_k^l||^2 + phi_{i,k}^l`` for every concept item.
+
+        ``[M, L, K]``. Shared by the soft mixture and the hard commit, so both
+        read exactly the same scores.
+
+        The distance term is the cached float64 ``_tracer_neg_d2`` (see
+        ``enable_token_reassignment``); only ``phi`` varies during training, so
+        recomputing ``cdist`` every step would be both wasteful and -- under the
+        entrypoints' "medium" matmul precision -- numerically unstable.
+        """
+        return self._tracer_neg_d2 + self.tracer_phi
+
+    def commit_token_reassignment(self) -> torch.Tensor:
+        """Hard ``argmax_k q_phi`` per concept item -- ``[M, L]`` new codes.
+
+        Inference-time assignment. Softmax is monotone, so this is temperature
+        free. Callers must re-derive the trailing dedup digit and rewrite the SID
+        tensor; stale codes silently break SH/ASI/TPM, which map targets through
+        ``semantic_id_path``.
+        """
+        with torch.no_grad():
+            return self.tracer_assignment_scores().argmax(dim=-1)
+
+    def _inject_soft_sid_embeddings(
+        self, embeds: torch.Tensor, raw_codes: torch.Tensor
+    ) -> torch.Tensor:
+        """Replace concept items' token embeddings with the Eq. 6 soft mixture.
+
+        No-op unless reassignment is enabled and ``raw_codes`` is aligned to full
+        ``num_hierarchies``-token item blocks (skipped during incremental
+        generation, where item identity is not yet determined) -- the same guard
+        the adaptive-offset path uses.
+        """
+        if getattr(self, "tracer_phi", None) is None:
+            return embeds
+        num_hierarchies = int(self.num_hierarchies)
+        if int(os.environ.get("TRACER_DEBUG", "0")):
+            n_dbg = int(getattr(self, "_tracer_dbg_calls", 0))
+            if n_dbg < 6:
+                self._tracer_dbg_calls = n_dbg + 1
+                import traceback as _tb
+
+                _TRACER_LOG.warning(
+                    "[tracer-debug] call %d: embeds=%s raw_codes=%s nh=%d "
+                    "raw_codes[0,:8]=%s\ncaller:\n%s",
+                    n_dbg,
+                    tuple(embeds.shape),
+                    tuple(raw_codes.shape),
+                    num_hierarchies,
+                    raw_codes.reshape(raw_codes.size(0), -1)[0, :8].tolist(),
+                    "".join(_tb.format_stack()[-6:-1]),
+                )
+        if (
+            raw_codes.dim() != 2
+            or raw_codes.size(1) == 0
+            or raw_codes.size(1) % num_hierarchies != 0
+        ):
+            return embeds
+        batch, seq_len = raw_codes.shape
+        n_items = seq_len // num_hierarchies
+        codes_items = raw_codes.view(batch, n_items, num_hierarchies)
+        item_ids = self._codes_to_item_ids(codes_items)            # [b, n]
+        rows = torch.where(
+            item_ids >= 0,
+            self._tracer_row_of_item[item_ids.clamp(min=0)],
+            torch.full_like(item_ids, -1),
+        )                                                          # [b, n]
+        if not bool((rows >= 0).any()):
+            return embeds
+
+        table = self.get_embedding_table(table_name="encoder").weight
+        # The cached distances are float64 (see enable_token_reassignment), so the
+        # softmax comes out float64 too; the embedding table is float32, and
+        # `q @ table` then dies with "expected mat1 and mat2 to have the same
+        # dtype". Cast AFTER the softmax so the exact scores still decide the
+        # weights, and only the mixture is done in the table's precision.
+        q = torch.softmax(
+            self.tracer_assignment_scores() / self._tracer_tau, dim=-1
+        ).to(table.dtype)                                          # [M, L, K]
+        K = self._tracer_codebook_size
+        # e~^l = q^l @ E_l, with E_l the l-th contiguous K-row block of the table.
+        soft = torch.stack(
+            [q[:, l] @ table[l * K : (l + 1) * K] for l in range(self._tracer_levels)],
+            dim=1,
+        )                                                          # [M, L, D]
+
+        # `batch`/`seq_len`/`n_items` come from raw_codes, but the view is applied
+        # to `embeds`. When the two carry different sequence lengths (the encoder
+        # is handed shifted/decorated ids whose length need not equal input_ids)
+        # the view silently reshapes to the wrong item count and the masked
+        # assignment then fails with a shape mismatch. Check explicitly.
+        if embeds.dim() != 3 or embeds.size(0) != batch or embeds.size(1) != seq_len:
+            if not getattr(self, "_tracer_align_warned", False):
+                self._tracer_align_warned = True
+                _TRACER_LOG.warning(
+                    "[tracer] skipping soft-SID injection: embeds %s is not aligned "
+                    "to raw_codes %s, so item blocks cannot be identified. phi will "
+                    "receive NO gradient through this call site.",
+                    tuple(embeds.shape),
+                    tuple(raw_codes.shape),
+                )
+            return embeds
+
+        emb_items = embeds.view(batch, n_items, num_hierarchies, embeds.size(-1)).clone()
+        # Index dims 0/1 with EXPLICIT integer tensors, never with the 2-D bool
+        # mask. `emb_items[sel, :L, :]` looks equivalent but is not: in a mixed
+        # basic/advanced index tuple torch applies the SLICE first, so the mask is
+        # then validated against the sliced shape [b, L, H, d] and raises
+        #   "shape of the mask [b, n_items] ... does not match the shape of the
+        #    indexed tensor [b, L, H, d] at index 1"
+        # whenever n_items != L. That is what made TRACER die at every step; it is
+        # an indexing-semantics bug, NOT the sequence-length misalignment it looks
+        # like (embeds and raw_codes are in fact aligned here).
+        b_idx, i_idx = (rows >= 0).nonzero(as_tuple=True)          # [n_sel] each
+        emb_items[b_idx, i_idx, : self._tracer_levels, :] = soft[rows[b_idx, i_idx]]
+        return emb_items.view(batch, seq_len, embeds.size(-1))
+
+    def _build_code_to_item_index(self) -> None:
+        """Build the vectorised SID-tuple -> item-id map used by the injectors."""
+        num_hierarchies = int(self.num_hierarchies)
+        codebook_size = int(self.num_embeddings_per_hierarchy)
+        device = self.item_sid_embedding_table_encoder.weight.device
+        powers = codebook_size ** torch.arange(num_hierarchies, dtype=torch.long)
+        codebooks = self.codebooks.to(torch.long).cpu()
+        keys_all = (codebooks * powers).sum(dim=1)
+        sorted_keys, order = torch.sort(keys_all)
+        self.register_buffer("_adaptive_code_powers", powers.to(device), persistent=False)
+        self.register_buffer("_adaptive_sorted_keys", sorted_keys.to(device), persistent=False)
+        self.register_buffer(
+            "_adaptive_sorted_item_ids", order.to(torch.long).to(device), persistent=False
+        )
+
     def _codes_to_item_ids(self, codes_items: torch.Tensor) -> torch.Tensor:
         """Map raw SID code tuples ``(..., num_hierarchies)`` to item ids.
 
@@ -966,6 +1298,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         neighbor_sids: torch.Tensor,
         neighbor_mask: torch.Tensor,
         loss_type: str = "nll",
+        mass_cap: float = 0.999,
     ) -> torch.Tensor:
         """Coherence loss ``L_n``, prefix-neighbour variant. Two forms.
 
@@ -979,6 +1312,19 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
 
             L_n = -1/B Σ_{(H_f, i_T) ∈ batch}
                         log Σ_{i_p ∈ P(i_T)} p_θ(s^p | 𝒯(H_f))
+
+        ``loss_type="suppress"`` — the sign-flipped counterpart of ``mass``, for
+        the *sensitive-item* scenario rather than spam repair:
+
+            L_n = -1/B Σ_{(H_f, i_T) ∈ batch}
+                        log(1 - Σ_{i_p ∈ P(i_T)} p_θ(s^p | 𝒯(H_f)))
+
+        Here the neighbourhood must be **drained**, not repaired: near-duplicates
+        of a banned item must not be promoted into the hole it leaves. Bounded
+        below by 0 (no neighbourhood mass) and rising to ``-log(1 - mass_cap)``
+        as the neighbourhood takes all the mass. Use it with ``lambda_n > 0``;
+        expressing it as a *negative* ``lambda_n`` on ``nll``/``mass`` instead
+        gives an objective unbounded below, which diverges.
 
         Both condition on the *forget history* ``H_f`` and score (teacher-forced)
         the semantic-id codes of the neighbours ``i_p`` of the forget target
@@ -1012,10 +1358,13 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         Returns the scalar ``L_n``; ``0`` when no valid neighbour exists.
         """
         loss_type = str(loss_type).lower()
-        if loss_type not in ("nll", "mass"):
+        if loss_type not in ("nll", "mass", "suppress"):
             raise ValueError(
-                f"coherence loss_type must be 'nll'|'mass', got {loss_type!r}"
+                "coherence loss_type must be 'nll'|'mass'|'suppress', "
+                f"got {loss_type!r}"
             )
+        if not 0.0 < float(mass_cap) < 1.0:
+            raise ValueError(f"mass_cap must be in (0, 1), got {mass_cap!r}")
         model_input, _ = forget_batch
         device = model_input.mask.device
         neighbor_sids = neighbor_sids.to(device).long()
@@ -1048,12 +1397,46 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             )
             return -finite.sum() / n_valid.clamp(min=1.0)
 
-        # mass: logsumexp over each sample's valid neighbours, averaged over the
-        # samples that have at least one. A row with no valid slot is all -inf;
-        # excluding it here is what keeps the term finite.
+        # mass / suppress: logsumexp over each sample's valid neighbours, averaged
+        # over the samples that have at least one. A row with no valid slot is all
+        # -inf; excluding it here is what keeps the term finite.
         row_has_neighbor = neighbor_mask.sum(dim=1) > 0
         row_mass_logp = torch.logsumexp(log_probs, dim=1)
         n_rows = row_has_neighbor.sum().to(row_mass_logp.dtype)
+
+        if loss_type == "suppress":
+            # L_n = -log(1 - sum_j p_j), the sign-flipped counterpart of `mass`.
+            #   -> 0     as the neighbourhood mass -> 0   (nothing to suppress)
+            #   -> +inf  as it -> 1                       (all mass on neighbours)
+            # Minimising it (with lambda_n > 0) DRAINS the neighbourhood, which is
+            # what sensitive/harmful item deletion needs: near-duplicates of a
+            # banned item must not be promoted into the hole it leaves. Contrast
+            # `mass`, which deliberately pushes mass onto neighbours -- correct for
+            # spam repair, catastrophic here.
+            #
+            # Do NOT express this as a negative lambda_n: negating `nll`/`mass`
+            # gives an objective unbounded below, so the run diverges silently.
+            #
+            # Numerics. The bound is applied by SHRINKING the mass, not by
+            # clamping it:
+            #     L = -log(1 - (1-eps)*exp(m)),   eps = 1 - mass_cap
+            # Clamping m at log(mass_cap) would also bound the loss, but `clamp`
+            # has zero gradient in the saturated region -- i.e. it would kill the
+            # signal exactly when the neighbourhood holds ALL the mass, which is
+            # the case suppression exists for. Shrinking keeps dL/dm > 0
+            # everywhere while still bounding the loss at -log(eps) and the
+            # gradient at ~(1-eps)/eps.
+            # log1p rather than log(1 - x): at x ~ 1e-7 the naive form loses all
+            # precision. The clamp at 0 only absorbs float error (mass <= 1
+            # holds mathematically); it never binds in the working range.
+            eps = 1.0 - float(mass_cap)
+            m = row_mass_logp.clamp(max=0.0)
+            per_row = -torch.log1p(-(1.0 - eps) * torch.exp(m))
+            selected = torch.where(
+                row_has_neighbor, per_row, torch.zeros_like(per_row)
+            )
+            return selected.sum() / n_rows.clamp(min=1.0)
+
         selected = torch.where(
             row_has_neighbor, row_mass_logp, torch.zeros_like(row_mass_logp)
         )
@@ -1156,14 +1539,121 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         mask = enc_mask.unsqueeze(-1).float()
         return (enc_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
 
+    def _sep_loss_generative(
+        self,
+        retain_batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
+        *,
+        neg_ids: List[int],
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """``L_sep`` with sequence log-probabilities as the InfoNCE logits.
+
+            L = -log [ exp(log p(s_i+ | h_u)/T)
+                       / ( exp(log p(s_i+ | h_u)/T)
+                           + sum_f exp(log p(s_i_f | h_u)/T) ) ]
+
+        Positive = the batch label; negatives = ``neg_ids`` scored against the
+        SAME retain histories. See :meth:`compute_sep_loss` for why the negative
+        set must stay small. Costs ``1 + len(neg_ids)`` teacher-forced passes.
+        """
+        model_input, label_data = retain_batch
+        device = next(self.parameters()).device
+        n_hier = int(self.num_hierarchies)
+        bsz = int(model_input.mask.size(0))
+
+        fut_ids = None
+        for key in label_data.labels:
+            fut_ids = label_data.labels[key].reshape(bsz, -1)
+        if fut_ids is None:
+            raise ValueError(
+                "sep loss_type='generative' needs batch labels for the positive"
+            )
+        # log p(s_i+ | h_u): the true next item, scored against its own history.
+        pos_lp = self._teacher_forced_log_prob(
+            model_input, fut_ids[:, :n_hier].long()
+        )  # [B]
+
+        # log p(s_i_f | h_u) for each negative, same histories.
+        neg_sids = self.codebooks[torch.tensor(neg_ids)].to(device).long()  # [N, H]
+        neg_lps = [
+            self._teacher_forced_log_prob(
+                model_input, neg_sids[j].unsqueeze(0).expand(bsz, n_hier)
+            )
+            for j in range(neg_sids.size(0))
+        ]  # each [B]
+
+        tau = float(temperature)
+        if tau <= 0:
+            raise ValueError(f"sep gen_temperature must be > 0, got {tau}")
+        logits = torch.stack([pos_lp] + neg_lps, dim=1) / tau  # [B, 1+N]
+        # -log softmax(pos) == logsumexp(all) - pos
+        return (torch.logsumexp(logits, dim=1) - logits[:, 0]).mean()
+
     def compute_sep_loss(
         self,
         retain_batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
         *,
         negative_item_ids: Set[int],
         temperature: float = 0.07,
+        positives: str = "history",
+        loss_type: str = "cosine",
+        gen_temperature: float = 1.0,
     ) -> torch.Tensor:
         """Separation loss ``L_sep'`` (per-user, all-positives form).
+
+        ``loss_type`` selects the SCORING FUNCTION inside the same InfoNCE shape:
+
+        ``cosine`` (default, back-compatible)
+            score = ``sim(r_u, z_i)``, cosine between pooled-encoder vectors.
+            Acts on a representation geometry the decoder never reads, so the
+            model can satisfy it by rearranging embeddings WITHOUT changing what
+            it generates. Measured: a 10,000x sweep of lambda_s moves SH@10 by
+            <1% at the operating point.
+
+        ``generative``
+            score = ``log p_theta(s_i | h_u)``, the model's own sequence
+            log-probability (sum of per-hierarchy log-probs). At
+            ``gen_temperature=1`` the objective reads literally as
+
+                -log [ p(s_i+ | h_u) / ( p(s_i+ | h_u) + sum_f p(s_i_f | h_u) ) ]
+
+            i.e. "the true next item must outrank the spam items in the model's
+            own generation distribution" -- exactly what SH@k measures. Acts on
+            the next-token distribution, the same place ``L_forget`` acts, and is
+            complementary to it: ``L_forget`` suppresses the target on FORGET
+            histories, this enforces the ranking on RETAIN histories.
+
+            The positive is ALWAYS the label (the next item actually consumed);
+            ``positives`` is ignored, since a generative score for an item
+            already inside ``h_u`` is not what generation predicts.
+
+            Keep the negative set SMALL (``sep_negatives=forget_target_only``).
+            Expanding it toward the full catalog makes the denominator approach
+            the model's own normaliser, so the loss degenerates into
+            ``-log p(s_i+ | h_u)`` = the retain cross-entropy, diluting the
+            spam-specific signal to nothing. Cost is ``1 + |N|`` teacher-forced
+            decoder passes, so a large ``N`` is also expensive.
+
+        NOTE the two temperatures are deliberately separate. Cosine logits are
+        bounded to +-1/``temperature`` by L2 normalisation; sequence log-probs are
+        unbounded below, so reusing 0.07 there would put the logits in a wildly
+        different regime. ``gen_temperature`` defaults to 1.0, which is also the
+        only value at which the probability reading above holds.
+
+        ``positives`` selects what plays the role of ``i⁺``:
+
+        ``history`` (default, back-compatible)
+            Every non-padded item in the user's own history. NOTE this is
+            tautological: ``r_u`` is *defined* as the mean of those same items'
+            representations, so ``sim(r_u, z_{i⁺})`` is a mean vector scored
+            against its own constituents — high by construction and nearly
+            constant. The positive term therefore contributes almost no gradient
+            and the loss degenerates into one-sided repulsion from ``I_f``.
+
+        ``label``
+            The batch's LABEL item (the next item the user actually consumed).
+            A genuine positive: it is what the model has to predict, and it is
+            not part of ``r_u``. Makes the contrastive term non-trivial.
 
         Samples over retain users (one per batch row, visited once per epoch),
         pools the per-item encoder representations of every item in a user's
@@ -1184,12 +1674,28 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         are added. The loss averages over a user's positive items and then over
         the users in the batch.
         """
-        model_input, _ = retain_batch
+        model_input, label_data = retain_batch
         device = next(self.parameters()).device
+
+        positives = str(positives).lower()
+        if positives not in ("history", "label"):
+            raise ValueError(
+                f"sep positives must be 'history'|'label', got {positives!r}"
+            )
+        loss_type = str(loss_type).lower()
+        if loss_type not in ("cosine", "generative"):
+            raise ValueError(
+                f"sep loss_type must be 'cosine'|'generative', got {loss_type!r}"
+            )
 
         neg_ids = list(negative_item_ids)
         if not neg_ids or self.codebooks is None:
             return torch.zeros((), device=device)
+
+        if loss_type == "generative":
+            return self._sep_loss_generative(
+                retain_batch, neg_ids=neg_ids, temperature=float(gen_temperature)
+            )
 
         # --- history item SID rows: [B, n_items, H] (raw codes) ---
         # transformed_sequences uses the original feature name ("sequence_data"),
@@ -1243,10 +1749,31 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         )  # [N_neg, d]
 
         tau = float(temperature)
-        # sim(r_u, z_i⁺) for every (user, history-item) pair, and sim against I_f.
-        pos_sim = (r_u.unsqueeze(1) * z_items).sum(dim=-1) / tau   # [B, n_items]
         neg_logits = torch.mm(r_u, z_neg.t()) / tau               # [B, N_neg]
         neg_lse = torch.logsumexp(neg_logits, dim=-1)             # [B]
+
+        if positives == "label":
+            # One genuine positive per user: the item they actually consumed next.
+            # Unlike the history positives it is NOT a constituent of r_u, so the
+            # numerator carries real gradient.
+            fut_ids = None
+            for key in label_data.labels:
+                fut_ids = label_data.labels[key].reshape(bsz, -1)
+            if fut_ids is None:
+                raise ValueError("sep positives='label' but the batch has no labels")
+            z_pos = torch.nn.functional.normalize(
+                self._item_encoder_representation(fut_ids[:, :n_hier].long()), dim=-1
+            )                                                      # [B, d]
+            pos_sim = (r_u * z_pos).sum(dim=-1) / tau              # [B]
+            per_user = torch.logaddexp(pos_sim, neg_lse) - pos_sim  # [B]
+            # Every row has exactly one label, so no per-user averaging is needed;
+            # keep the same "users with >=1 valid history item" gate as the
+            # history branch so r_u is always well defined.
+            has_pos = (item_valid.sum(dim=1) > 0).float()
+            return (per_user * has_pos).sum() / has_pos.sum().clamp(min=1.0)
+
+        # sim(r_u, z_i⁺) for every (user, history-item) pair, and sim against I_f.
+        pos_sim = (r_u.unsqueeze(1) * z_items).sum(dim=-1) / tau   # [B, n_items]
         # per-positive InfoNCE: -log( e^{pos} / (e^{pos} + Σ_f e^{neg}) )
         denom_lse = torch.logaddexp(pos_sim, neg_lse.unsqueeze(1))  # [B, n_items]
         per_pos = denom_lse - pos_sim                              # [B, n_items]
@@ -1407,6 +1934,11 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         inputs_embeds_for_encoder = self._inject_adaptive_offsets(
             inputs_embeds_for_encoder, input_ids
         )
+        # TRACER soft token reassignment; no-op unless enabled. Same alignment
+        # requirement as the offsets above, so it goes at the same point.
+        inputs_embeds_for_encoder = self._inject_soft_sid_embeddings(
+            inputs_embeds_for_encoder, input_ids
+        )
 
         if self.item_token_merger is not None:
             # Input-side aggregation: collapse each item's num_hierarchies token
@@ -1508,6 +2040,9 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             # Per-item adaptive offsets (option 2); no-op unless enabled. Skipped
             # during incremental generation (future_ids not a full item block).
             inputs_embeds_for_decoder = self._inject_adaptive_offsets(
+                inputs_embeds_for_decoder, future_ids
+            )
+            inputs_embeds_for_decoder = self._inject_soft_sid_embeddings(
                 inputs_embeds_for_decoder, future_ids
             )
 

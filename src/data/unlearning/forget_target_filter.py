@@ -123,6 +123,7 @@ def materialize_item_pairs_forget_dir(
     extra_source_dirs: Optional[List[str]] = None,
     rows_per_shard: int = 4096,
     overwrite: bool = True,
+    include_context_rows: bool = False,
 ) -> Dict[str, object]:
     """Write forget shards with one entry per (full_prefix → target_item) pair.
 
@@ -198,12 +199,32 @@ def materialize_item_pairs_forget_dir(
         rows_in += 1
         seq = tf.sparse.to_dense(example[SEQUENCE_FIELD]).numpy().tolist()
 
+        # Positions to emit a prefix for. By default only positions where the
+        # target item is the LABEL, i.e. seq[:j+1] supervises seq[j] in I_f.
+        #
+        # include_context_rows additionally emits every LATER prefix
+        # seq[:k+1] for k > j, i.e. the rows where the sensitive item sits in
+        # the model's INPUT history rather than in the target. Those rows are
+        # genuinely part of a sensitive-item deletion request: the model still
+        # conditions on the user's alcohol purchase when predicting their next
+        # item, so leaving them in means the interaction was not unlearned.
+        # Target-position-only is the right default for SPAM (the attack works
+        # through the target), which is why this is opt-in: every recorded spam
+        # result keeps its exact forget set.
+        cut_points = set()
         for j, item in enumerate(seq):
             if int(item) not in target_items:
                 continue
-            if j == 0:
-                # No prefix items before the target — skip.
-                continue
+            if j >= 1:
+                cut_points.add(j)
+            if include_context_rows:
+                # every LATER prefix: k > j, so seq[k] is the label and the
+                # sensitive item at j sits in the history. Must start at j+1,
+                # not max(j,1)+1 -- the latter drops k=1 when the sensitive
+                # item is FIRST in the session (j=0), losing the row [i_0, i_1].
+                cut_points.update(range(j + 1, len(seq)))
+
+        for j in sorted(cut_points):
             key = tuple(int(x) for x in seq[: j + 1])
             if key in seen:
                 continue
@@ -224,6 +245,7 @@ def materialize_item_pairs_forget_dir(
         "rows_in": rows_in,
         "rows_out": rows_out,
         "n_unique_pairs": rows_out,
+        "include_context_rows": bool(include_context_rows),
         "shard_paths": writer.shard_paths,
     }
 

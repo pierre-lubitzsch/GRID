@@ -9,11 +9,15 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 import torch
 from torch import nn
 
+from src.components.unlearning.optim_utils import build_optimizer
 from src.components.unlearning.hvp import batch_size, batch_to_device
 from src.components.unlearning.local_repair import apply_local_repair_losses
 from src.components.unlearning.slot_selection import select_top_t_slots
 from src.components.unlearning.target_params import (
+    resolve_scope_params,
     select_adaptive_code_params,
+    split_adaptive_code_params,
+    split_code_params,
     select_code_position_params,
     select_pkm_params,
 )
@@ -35,6 +39,7 @@ def unified_unlearn(
     lambda_neighborhood: float = 0.0,
     coherence_neighbors: Optional[Sequence[Any]] = None,
     coherence_loss_type: str = "nll",
+    coherence_mass_cap: float = 0.999,
     forget_loss_level: str = "token",
     sep_temperature: float = 0.07,
     deletion_spec: str = "session",
@@ -42,6 +47,9 @@ def unified_unlearn(
     neighbor_item_ids: Optional[Set[int]] = None,
     sep_negative_item_ids: Optional[Set[int]] = None,
     sep_negatives_mode: str = "forget",
+    sep_positives: str = "history",
+    sep_loss_type: str = "cosine",
+    sep_gen_temperature: float = 1.0,
     local_repair_cfg: Optional[Dict[str, Any]] = None,
     restrict_adaptive_codes: bool = False,
     stable_codes: int = 2,
@@ -58,6 +66,8 @@ def unified_unlearn(
     slot_mu: float = 5.0,
     slot_dot_abs: bool = False,
     optimizer: str = "adam",
+    code_lr_scale: float = 1.0,
+    adaptive_code_lr_scale: float = 1.0,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Optimize unified objective.
@@ -143,19 +153,51 @@ def unified_unlearn(
         n_epochs if n_epochs is not None else "(unset)",
     )
 
+    # adaptive_code_lr_scale refines code_lr_scale by RQ POSITION: an extra
+    # multiplier on the adaptive (fine) tail [stable_codes, H) only, so the
+    # coarse codes that ~47 items share on average and the fine codes that are
+    # nearly item-unique can move at different speeds. 1.0 (default) = one code
+    # group, i.e. exactly the code_lr_scale behaviour. Validated up front, before
+    # any parameter selection, so a contradictory config fails on its own terms
+    # rather than on a downstream restriction error.
+    if float(adaptive_code_lr_scale) < 0.0:
+        raise ValueError(
+            f"adaptive_code_lr_scale must be >= 0, got {adaptive_code_lr_scale!r}"
+        )
+    scale_adaptive = float(adaptive_code_lr_scale) != 1.0
+    if scale_adaptive:
+        # In every restriction mode the non-adaptive half of the model is already
+        # frozen, so a *relative* adaptive rate degenerates into a plain lr
+        # change and the run would be mislabelled. Refuse rather than mislead.
+        conflict = None
+        if restrict_adaptive_codes:
+            conflict = "restrict_adaptive_codes=True"
+        elif update_positions:
+            conflict = f"update_positions={list(update_positions)}"
+        elif str(update_scope).lower() != "all":
+            conflict = f"update_scope={update_scope!r}"
+        if conflict is not None:
+            raise ValueError(
+                f"adaptive_code_lr_scale={adaptive_code_lr_scale} needs the "
+                f"unrestricted update set, but {conflict} already confines it. "
+                "Lower unified_lr instead, or set adaptive_code_lr_scale=1.0."
+            )
+
     # Stable-Adaptive Semantic IDs: optionally confine the update to the
     # adaptive (fine-grained) code positions. grad_masks holds per-parameter
     # masks applied to .grad each step before opt.step().
     slot_select_info = None
-    if str(update_scope).lower() == "pkm_only":
+    if str(update_scope).lower() in ("pkm_only", "ffn_only"):
         # "Modular stabilizer" scope: only the Product-Key Memory is in the
         # optimizer; backbone, SID embeddings and decoder heads stay frozen, so
         # any forgetting has to be expressible as an edit to sparse memory.
         # Takes precedence over the position/adaptive restrictions below.
-        params, pkm_names = select_pkm_params(
-            model,
+        params, pkm_names = resolve_scope_params(
+            model, update_scope,
+            fallback=[p for p in model.parameters() if p.requires_grad],
             include_keys=bool(pkm_update_keys),
             include_query=bool(pkm_update_query),
+            algo="unified",
         )
         grad_masks = {}
         log.info(
@@ -170,6 +212,12 @@ def unified_unlearn(
         # Optional top-t slot restriction on top of pkm_only: score every value
         # slot from the forget/retain data and mask the gradient of all but the
         # best t, so only those memory rows move.
+        if (str(update_scope).lower() == "ffn_only"
+                and str(slot_selection).strip().lower() not in ("none", "", "off")):
+            raise ValueError(
+                "slot_selection is PKM-specific and cannot be combined with "
+                "update_scope='ffn_only' (an FFN has no memory slots)."
+            )
         if str(slot_selection).strip().lower() not in ("none", "", "off"):
             masks, sel_info = select_top_t_slots(
                 model,
@@ -262,15 +310,98 @@ def unified_unlearn(
     else:
         params = [p for p in model.parameters() if p.requires_grad]
         grad_masks = {}
+    # Optional SOFT identifier-space restriction: give the semantic-ID code
+    # parameters (SID embedding table + per-hierarchy decoder heads) their own,
+    # lower learning rate, so unlearning perturbs what the tokens MEAN only
+    # slightly while the rest of the model absorbs the update.
+    #
+    # This is the soft counterpart of adaptive_codes, which hard-freezes the
+    # stable prefix: here every code can still move, just slowly. The two
+    # compose -- grad_masks are applied to .grad before the step regardless of
+    # which param group a tensor sits in.
+    #
+    # code_lr_scale=1.0 (default) builds a single group with the base lr, i.e.
+    # exactly the previous behaviour, so recorded results are unchanged.
+    # Per-tensor lr multiplier, composed from both scales, then grouped by value.
+    code_params, _other_params = split_code_params(model, params)
+    code_ids = {id(p) for p in code_params}
+    adaptive_tensors: List[nn.Parameter] = []
+    adaptive_row_masks: Dict[int, torch.Tensor] = {}
+    if scale_adaptive:
+        adaptive_tensors, adaptive_row_masks = split_adaptive_code_params(
+            model, params, stable_codes=int(stable_codes)
+        )
+        if not adaptive_tensors and not adaptive_row_masks:
+            raise ValueError(
+                "adaptive_code_lr_scale != 1.0 but no adaptive code parameters "
+                "were found (no SID table and no decoder_mlp heads); the knob "
+                "would silently do nothing."
+            )
+    adaptive_ids = {id(p) for p in adaptive_tensors}
+
+    if not code_params and float(code_lr_scale) != 1.0:
+        log.warning(
+            "[unified] code_lr_scale=%s requested but no semantic-ID code "
+            "params are in the update set (restriction policy may exclude "
+            "them); falling back to a single group.",
+            code_lr_scale,
+        )
+
+    multiplier: Dict[int, float] = {}
+    for p in params:
+        m = 1.0
+        if id(p) in code_ids:
+            m *= float(code_lr_scale)
+        if id(p) in adaptive_ids:
+            m *= float(adaptive_code_lr_scale)
+        multiplier[id(p)] = m
+
+    by_mult: Dict[float, List[nn.Parameter]] = {}
+    for p in params:
+        by_mult.setdefault(multiplier[id(p)], []).append(p)
+    groups: List[Dict[str, Any]] = [
+        {"params": ps, "lr": float(lr) * m} for m, ps in sorted(by_mult.items())
+    ]
+    for m, ps in sorted(by_mult.items()):
+        log.info(
+            "[unified] lr group x%.4g -> lr=%.3g: %d tensors (%d params)",
+            m, float(lr) * m, len(ps), int(sum(p.numel() for p in ps)),
+        )
+    # Row-level rate for the SID table, whose rows span both segments and so
+    # cannot be split across groups. Applied to the *update* after opt.step()
+    # (see split_adaptive_code_params): the table sits in the code group at
+    # lr*code_lr_scale, and its adaptive rows are then rescaled by
+    # adaptive_code_lr_scale, giving those rows the same effective rate the
+    # adaptive decoder heads get. Scaling .grad would be a no-op under Adam.
+    row_lr_scale: Dict[int, torch.Tensor] = {}
+    row_scaled_params: Dict[int, nn.Parameter] = {}
+    if adaptive_row_masks:
+        by_id = {id(p): p for p in params}
+        for pid, mask in adaptive_row_masks.items():
+            p = by_id.get(pid)
+            if p is None:
+                continue
+            # 1.0 on stable rows (keep this group's rate), scale on adaptive rows.
+            row_lr_scale[pid] = (
+                1.0 - mask + mask * float(adaptive_code_lr_scale)
+            ).to(dtype=p.dtype)
+            row_scaled_params[pid] = p
+        log.info(
+            "[unified] adaptive_code_lr_scale=%s: %d adaptive head tensors at "
+            "lr=%.3g, SID-table adaptive rows [%d:] rescaled to lr=%.3g "
+            "(stable rows keep lr=%.3g)",
+            adaptive_code_lr_scale,
+            len(adaptive_tensors),
+            float(lr) * float(code_lr_scale) * float(adaptive_code_lr_scale),
+            int(stable_codes) * int(getattr(model, "num_embeddings_per_hierarchy", 0)),
+            float(lr) * float(code_lr_scale) * float(adaptive_code_lr_scale),
+            float(lr) * float(code_lr_scale),
+        )
+
     # SGD is the Sparse Memory Finetuning choice: with a sparse/selected update
     # Adam's moment estimates get diluted on the steps where a slot receives no
     # gradient, distorting its effective step size.
-    if str(optimizer).lower() == "sgd":
-        opt = torch.optim.SGD(params, lr=float(lr), momentum=0.9)
-    elif str(optimizer).lower() == "adam":
-        opt = torch.optim.Adam(params, lr=float(lr))
-    else:
-        raise ValueError(f"optimizer must be adam|sgd, got {optimizer!r}")
+    opt = build_optimizer(optimizer, groups, float(lr), algo="unified")
     model.train()
 
     totals: Dict[str, List[float]] = {
@@ -281,6 +412,25 @@ def unified_unlearn(
         "coh": [],
     }
 
+    # Negative lambda_n is ALLOWED and does the directionally right thing for
+    # sensitive-item deletion: with `mass` the contribution becomes
+    # |lambda_n| * log(sum_j p_j), whose minimisation drains the neighbourhood.
+    # It is worth knowing what it costs, though: d/dm [|lambda_n| * m] is the
+    # CONSTANT |lambda_n|, so the term never converges -- it keeps pressing on
+    # the next-token distribution no matter how empty the neighbourhood already
+    # is, and it is unbounded below. That is the same failure mode that made
+    # `nll` cost ~2 NDCG@10 points at lambda_n=10. coherence_loss_type=suppress
+    # is the bounded form whose gradient vanishes once the mass is gone.
+    if float(lambda_neighborhood) < 0.0:
+        log.warning(
+            "[unified] lambda_n=%s < 0 with coherence_loss_type=%s: this drains "
+            "the neighbourhood, but the gradient is constant in log-mass, so the "
+            "term never converges and the objective is unbounded below. Prefer "
+            "lambda_n > 0 with coherence_loss_type=suppress unless you are "
+            "deliberately running the sign-flip ablation.",
+            lambda_neighborhood,
+            coherence_loss_type,
+        )
     use_coherence = float(lambda_neighborhood) != 0.0 and coherence_neighbors is not None
     n_coherence_batches = (
         sum(1 for cn in coherence_neighbors if cn is not None)
@@ -325,6 +475,7 @@ def unified_unlearn(
                         neighbor_sids,
                         neighbor_mask,
                         loss_type=coherence_loss_type,
+                        mass_cap=coherence_mass_cap,
                     )
                     if l_coh.requires_grad:
                         coh_term = (float(lambda_neighborhood) * l_coh) / float(q_forget)
@@ -344,6 +495,9 @@ def unified_unlearn(
                 retain_batch,
                 negative_item_ids=sep_negatives_set,
                 temperature=float(sep_temperature),
+                positives=sep_positives,
+                loss_type=sep_loss_type,
+                gen_temperature=float(sep_gen_temperature),
             )
             retain_side = l_retain + float(lambda_sep) * l_sep
             retain_side = apply_local_repair_losses(
@@ -364,7 +518,26 @@ def unified_unlearn(
                 if m is not None and p.grad is not None:
                     p.grad.mul_(m)
 
+        # Per-row learning rate for the SID table: take the step the optimizer
+        # would take, then shrink the adaptive rows' share of it. Exact for both
+        # Adam and SGD-momentum, whose update direction depends on the gradient
+        # history and not on previously applied deltas, so rescaling the delta is
+        # identical to having used lr * scale for those rows.
+        prev_rows: Dict[int, torch.Tensor] = {}
+        if row_scaled_params:
+            with torch.no_grad():
+                for pid, p in row_scaled_params.items():
+                    prev_rows[pid] = p.detach().clone()
+
         opt.step()
+
+        if row_scaled_params:
+            with torch.no_grad():
+                for pid, p in row_scaled_params.items():
+                    old = prev_rows[pid]
+                    delta = p.data.sub(old).mul_(row_lr_scale[pid])
+                    p.data.copy_(old.add_(delta))
+            prev_rows.clear()
 
         total_avg = (
             l_retain_avg
@@ -381,7 +554,7 @@ def unified_unlearn(
         if step % max(1, steps // 10) == 0:
             log.info(
                 "[unified] step=%d/%d total=%.4f retain=%.4f forget=%.4f "
-                "sep=%.4f coh=%.4f",
+                "sep=%.4f neighborhood=%.4f",
                 step,
                 steps,
                 total_avg,
@@ -404,6 +577,18 @@ def unified_unlearn(
         "q_forget": q_forget,
         "q_retain": q_retain,
         "lr": float(lr),
+        "code_lr_scale": float(code_lr_scale),
+        "adaptive_code_lr_scale": float(adaptive_code_lr_scale),
+        "adaptive_code_lr_stable_codes": (
+            int(stable_codes) if scale_adaptive else None
+        ),
+        "adaptive_code_lr_tensors": len(adaptive_tensors),
+        "adaptive_code_lr_row_scaled": len(row_scaled_params),
+        "lr_groups": [
+            {"mult": m, "lr": float(lr) * m, "n_tensors": len(ps),
+             "n_params": int(sum(p.numel() for p in ps))}
+            for m, ps in sorted(by_mult.items())
+        ],
         "restrict_adaptive_codes": bool(restrict_adaptive_codes),
         "slot_selection": slot_select_info,
         "update_positions": list(update_positions) if update_positions else None,
@@ -422,6 +607,8 @@ def unified_unlearn(
         "coherence_loss_type": str(coherence_loss_type) if use_coherence else None,
         "n_coherence_batches": int(n_coherence_batches),
         "sep_negatives": str(sep_negatives_mode),
+        "sep_positives": str(sep_positives),
+        "sep_loss_type": str(sep_loss_type),
         "n_sep_negatives": len(sep_negatives_set),
         "forget_loss_level": str(forget_loss_level),
         "deletion_spec": str(deletion_spec),
@@ -429,6 +616,10 @@ def unified_unlearn(
         "mean_retain_loss": _mean(totals["retain"]),
         "mean_forget_loss": _mean(totals["forget"]),
         "mean_sep_loss": _mean(totals["sep"]),
+        "mean_neighborhood_loss": _mean(totals["coh"]),
+        # Back-compat alias: this term is named "coherence" internally because
+        # the nll form was ported from TRACER (its L_Coh, Eq. 9), but in OUR
+        # objective it is the NEIGHBORHOOD term weighted by lambda_n.
         "mean_coh_loss": _mean(totals["coh"]),
         "n_forget_batches": n_forget,
         "n_retain_batches": n_retain,

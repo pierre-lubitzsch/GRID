@@ -56,9 +56,46 @@ echo "[$(date -Is)] Starting rkmeans inference on dataset=${DATASET}"
 echo "Using data_dir=${GRID_DATA_DIR}"
 echo "Codebooks: num_hierarchies=${RKMEANS_HIER} codebook_width=${CODEBOOK_WIDTH} (final ID length = ${RKMEANS_HIER}+1 after dedup)"
 
+# Quantizer choice. rkmeans (DEFAULT) reproduces every existing semantic ID;
+# rqvae / rvq select the autoencoder + VectorQuantization stacks instead. The
+# default is unchanged, so existing invocations behave exactly as before.
+# TRAIN and INFERENCE must use the SAME value -- a checkpoint trained with one
+# quantizer cannot be loaded by another (different module tree).
+QUANTIZER="${QUANTIZER:-rkmeans}"
+case "${QUANTIZER}" in
+  rkmeans|rqvae|rvq) ;;
+  *) echo "QUANTIZER must be rkmeans|rqvae|rvq, got '${QUANTIZER}'" >&2; exit 1 ;;
+esac
+# Fail fast with a useful message: not every quantizer has both a train and
+# an inference config (rvq currently has no inference counterpart), and a missing
+# experiment otherwise surfaces as an opaque Hydra composition error.
+_EXP_CFG="configs/experiment/${QUANTIZER}_inference_flat.yaml"
+if [ ! -f "${GRID_DIR:-$PWD}/${_EXP_CFG}" ] && [ ! -f "${_EXP_CFG}" ]; then
+  echo "No inference config for QUANTIZER=${QUANTIZER} (expected ${_EXP_CFG})." >&2
+  echo "Available: $(ls configs/experiment/*_inference_flat.yaml 2>/dev/null | xargs -n1 basename | sed 's/_inference_flat.yaml//' | tr '\n' ' ')" >&2
+  exit 1
+fi
+echo "Quantizer: ${QUANTIZER}"
+
+# Pin the Hydra run dir to a dataset+job-scoped path rather than guessing it
+# afterwards. The old code did
+#     LATEST_RUN_DIR="$(ls -d logs/inference/runs/*/* | sort | tail -1)"
+# which has NO dataset filter, so two concurrent runs (e.g. toys and sports)
+# would both merge whichever dir sorted last -- silently assigning one dataset's
+# semantic IDs from the other's predictions. That glob also matches the
+# `logs/inference/runs/embeddings/<ds>_<jobid>` dirs written by
+# generate_embeddings.sh, so it could even merge raw embedding shards.
+RUN_TAG="${DATASET}_${QUANTIZER}_${SLURM_JOB_ID:-$(date +%Y%m%d-%H%M%S)}"
+LATEST_RUN_DIR="logs/inference/runs/sid/${RUN_TAG}"
+PICKLE_DIR="${LATEST_RUN_DIR}/pickle"
+export PICKLE_DIR
+mkdir -p "${PICKLE_DIR}"
+echo "Run dir: ${LATEST_RUN_DIR}"
+
 python -u -m src.inference \
-  experiment=rkmeans_inference_flat \
+  experiment=${QUANTIZER}_inference_flat \
   data_dir="${GRID_DATA_DIR}" \
+  hydra.run.dir="${LATEST_RUN_DIR}" \
   "embedding_path='${EMBEDDING_PATH}'" \
   embedding_dim=2048 \
   num_hierarchies="${RKMEANS_HIER}" \
@@ -68,12 +105,12 @@ python -u -m src.inference \
 
 echo "[$(date -Is)] rkmeans inference finished, merging pickle shards..."
 
-LATEST_RUN_DIR="$(ls -d logs/inference/runs/*/* 2>/dev/null | sort | tail -1)"
-PICKLE_DIR="${LATEST_RUN_DIR}/pickle"
-export PICKLE_DIR
-
-if [ -z "${LATEST_RUN_DIR}" ] || [ ! -d "${PICKLE_DIR}" ]; then
-  echo "Could not find latest run pickle directory under logs/inference/runs."
+if [ ! -d "${PICKLE_DIR}" ]; then
+  echo "Pickle directory missing: ${PICKLE_DIR}"
+  exit 1
+fi
+if [ -z "$(ls -A "${PICKLE_DIR}"/*.pkl 2>/dev/null)" ]; then
+  echo "No pickle shards in ${PICKLE_DIR} -- inference did not write to the pinned run dir."
   exit 1
 fi
 

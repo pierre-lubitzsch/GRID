@@ -33,6 +33,11 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from torch import nn
 
+from src.components.unlearning.optim_utils import build_optimizer
+from src.components.unlearning.target_params import (
+    resolve_scope_params,
+    select_pkm_params,
+)
 from src.components.unlearning.hvp import batch_size, batch_to_device
 
 log = logging.getLogger(__name__)
@@ -77,6 +82,10 @@ def seif_unlearn(
     repair_lr: float = 7e-4,
     weight_decay: float = 5e-4,
     noise_param_keywords: Optional[Sequence[str]] = None,
+    update_scope: str = "all",
+    pkm_update_keys: bool = True,
+    pkm_update_query: bool = True,
+    optimizer: str = "adam",
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Run SEIF noise-erase + repair on ``model`` in-place.
@@ -109,10 +118,30 @@ def seif_unlearn(
 
     device = device or next(model.parameters()).device
     model.train()
-    keywords = list(noise_param_keywords or _DEFAULT_NOISE_KEYWORDS)
+    pkm_only = str(update_scope or "all").strip().lower() == "pkm_only"
+    if pkm_only:
+        # seif matches parameters BY NAME, so derive the allow-list from the
+        # actual PKM tensors instead of guessing a keyword. Without this the
+        # erase noise would hit the backbone and 'pkm_only' would be a lie.
+        _, _pkm_names = select_pkm_params(
+            model, include_keys=pkm_update_keys, include_query=pkm_update_query
+        )
+        keywords = _pkm_names
+        log.info(
+            "[seif] PKM-ONLY: erase noise restricted to %d PKM tensors "
+            "(keys=%s query=%s)",
+            len(keywords), bool(pkm_update_keys), bool(pkm_update_query),
+        )
+    else:
+        keywords = list(noise_param_keywords or _DEFAULT_NOISE_KEYWORDS)
 
     # --- Phase 1: erase ------------------------------------------------------
     n_noised = _add_multiplicative_noise(model, erase_std, keywords)
+    if n_noised == 0 and pkm_only:
+        raise ValueError(
+            "seif update_scope='pkm_only' matched no PKM tensors; refusing to "
+            "fall back to perturbing the whole model."
+        )
     if n_noised == 0:
         log.warning(
             "[seif] no parameters matched keywords %s; falling back to ALL "
@@ -138,10 +167,14 @@ def seif_unlearn(
     fallback_keywords = list(_DEFAULT_NOISE_KEYWORDS) if keywords is None else keywords
 
     # --- Phase 2: repair -----------------------------------------------------
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.Adam(
-        params, lr=float(repair_lr), weight_decay=float(weight_decay)
+    params, _ = resolve_scope_params(
+        model, update_scope,
+        fallback=[p for p in model.parameters() if p.requires_grad],
+        include_keys=pkm_update_keys, include_query=pkm_update_query,
+        algo="seif",
     )
+    opt = build_optimizer(optimizer, params, float(repair_lr),
+                          weight_decay=float(weight_decay), algo="seif")
     epoch_mean_losses: List[float] = []
     for repair_epoch in range(int(repair_epochs)):
         losses: List[float] = []

@@ -8,8 +8,9 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from torch import nn
 
+from src.components.unlearning.optim_utils import build_optimizer
 from src.components.unlearning.hvp import batch_size, batch_to_device
-from src.components.unlearning.target_params import select_pkm_params
+from src.components.unlearning.target_params import resolve_scope_params
 
 log = logging.getLogger(__name__)
 TigerBatch = Any
@@ -52,27 +53,14 @@ def finetune_unlearn(
     receive zero gradient on most steps.
     """
     device = device or next(model.parameters()).device
-    if str(update_scope).lower() == "pkm_only":
-        params, pkm_names = select_pkm_params(
-            model,
-            include_keys=bool(pkm_update_keys),
-            include_query=bool(pkm_update_query),
-        )
-        log.info(
-            "[finetune] PKM-ONLY update scope: %d param tensors (%d params) "
-            "across %d memory modules; backbone FROZEN",
-            len(params),
-            int(sum(p.numel() for p in params)),
-            len({n.rsplit('.', 1)[0] for n in pkm_names}),
-        )
-    else:
-        params = [p for p in model.parameters() if p.requires_grad]
-    if str(optimizer).lower() == "sgd":
-        opt = torch.optim.SGD(params, lr=float(lr), momentum=0.9)
-    elif str(optimizer).lower() == "adam":
-        opt = torch.optim.Adam(params, lr=float(lr))
-    else:
-        raise ValueError(f"optimizer must be adam|sgd, got {optimizer!r}")
+    params, _ = resolve_scope_params(
+        model, update_scope,
+        fallback=[p for p in model.parameters() if p.requires_grad],
+        include_keys=bool(pkm_update_keys),
+        include_query=bool(pkm_update_query),
+        algo="finetune",
+    )
+    opt = build_optimizer(optimizer, params, float(lr), algo="finetune")
     model.train()
     losses: List[float] = []
     if int(steps) > 0 and not retain_batches:

@@ -54,9 +54,45 @@ echo "Codebooks: num_hierarchies=${RKMEANS_HIER} codebook_width=${CODEBOOK_WIDTH
 LOCAL_CKPT_DIR="${TMPDIR:-/tmp}/rkmeans_ckpts_${SLURM_JOB_ID:-$$}"
 mkdir -p "${LOCAL_CKPT_DIR}"
 
+# Quantizer choice. rkmeans (DEFAULT) reproduces every existing semantic ID;
+# rqvae / rvq select the autoencoder + VectorQuantization stacks instead. The
+# default is unchanged, so existing invocations behave exactly as before.
+# TRAIN and INFERENCE must use the SAME value -- a checkpoint trained with one
+# quantizer cannot be loaded by another (different module tree).
+QUANTIZER="${QUANTIZER:-rkmeans}"
+case "${QUANTIZER}" in
+  rkmeans|rqvae|rvq) ;;
+  *) echo "QUANTIZER must be rkmeans|rqvae|rvq, got '${QUANTIZER}'" >&2; exit 1 ;;
+esac
+# Fail fast with a useful message: not every quantizer has both a train and
+# an inference config (rvq currently has no train counterpart), and a missing
+# experiment otherwise surfaces as an opaque Hydra composition error.
+_EXP_CFG="configs/experiment/${QUANTIZER}_train_flat.yaml"
+if [ ! -f "${GRID_DIR:-$PWD}/${_EXP_CFG}" ] && [ ! -f "${_EXP_CFG}" ]; then
+  echo "No train config for QUANTIZER=${QUANTIZER} (expected ${_EXP_CFG})." >&2
+  echo "Available: $(ls configs/experiment/*_train_flat.yaml 2>/dev/null | xargs -n1 basename | sed 's/_train_flat.yaml//' | tr '\n' ' ')" >&2
+  exit 1
+fi
+echo "Quantizer: ${QUANTIZER}"
+
+# Pin the Hydra run dir instead of guessing where the checkpoint should land.
+# The old code did
+#     LATEST_RUN_DIR="$(ls -d logs/train/runs/*/* | sort | tail -1)"
+# with NO dataset filter, so two concurrent codebook trainings (e.g. toys and
+# sports) could copy one dataset's checkpoint into the other's run dir -- and
+# every semantic ID built from it would then be silently wrong. It also picks a
+# different dir per DDP rank. (Jobs 10385160/61 happened to land correctly only
+# because their copy steps did not overlap; verified after the fact against
+# each run's .hydra/config.yaml embedding_path.)
+RUN_TAG="${DATASET}_${QUANTIZER}_${SLURM_JOB_ID:-$(date +%Y%m%d-%H%M%S)}"
+LATEST_RUN_DIR="${GRID_DIR}/logs/train/runs/codebook/${RUN_TAG}"
+mkdir -p "${LATEST_RUN_DIR}"
+echo "Run dir: ${LATEST_RUN_DIR}"
+
 python -u -m src.train \
-  experiment=rkmeans_train_flat \
+  experiment=${QUANTIZER}_train_flat \
   data_dir="${GRID_DATA_DIR}" \
+  hydra.run.dir="${LATEST_RUN_DIR}" \
   "embedding_path='${EMBEDDING_PATH}'" \
   embedding_dim=2048 \
   num_hierarchies="${RKMEANS_HIER}" \
@@ -64,7 +100,6 @@ python -u -m src.train \
   "callbacks.model_checkpoint.dirpath=${LOCAL_CKPT_DIR}" \
   "${@:3}"
 
-LATEST_RUN_DIR="$(ls -d "${GRID_DIR}/logs/train/runs"/*/* 2>/dev/null | sort | tail -1 || true)"
 if [ -n "${LATEST_RUN_DIR}" ] && ls "${LOCAL_CKPT_DIR}"/*.ckpt &>/dev/null; then
   mkdir -p "${LATEST_RUN_DIR}/checkpoints"
   cp "${LOCAL_CKPT_DIR}"/*.ckpt "${LATEST_RUN_DIR}/checkpoints/"

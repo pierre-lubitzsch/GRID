@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from torch import nn
 
+from src.components.unlearning.optim_utils import build_optimizer
+from src.components.unlearning.target_params import resolve_scope_params
 from src.components.unlearning.hvp import batch_size, batch_to_device
 
 log = logging.getLogger(__name__)
@@ -22,14 +24,23 @@ def neg_train_unlearn(
     steps: int = 200,
     lr: float = 1e-3,
     neg_retain_every: int = 5,
+    update_scope: str = "all",
+    pkm_update_keys: bool = True,
+    pkm_update_query: bool = True,
+    optimizer: str = "adam",
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Gradient ascent on forget batches with optional retain CE every k steps."""
     device = device or next(model.parameters()).device
     if not forget_batches:
         raise ValueError("forget_batches is empty")
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.Adam(params, lr=float(lr))
+    params, _ = resolve_scope_params(
+        model, update_scope,
+        fallback=[p for p in model.parameters() if p.requires_grad],
+        include_keys=pkm_update_keys, include_query=pkm_update_query,
+        algo="neg_train",
+    )
+    opt = build_optimizer(optimizer, params, float(lr), algo="neg_train")
     model.train()
     forget_losses: List[float] = []
     retain_losses: List[float] = []

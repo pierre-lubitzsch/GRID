@@ -34,12 +34,16 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from torch import nn
 
+from src.components.unlearning.optim_utils import build_optimizer
 from src.components.unlearning.hvp import (
     batch_grad,
     batch_size,
     batch_to_device,
 )
-from src.components.unlearning.target_params import select_target_params
+from src.components.unlearning.target_params import (
+    resolve_scope_params,
+    select_target_params,
+)
 
 log = logging.getLogger(__name__)
 TigerBatch = Any  # noqa: N816
@@ -81,6 +85,10 @@ def kookmin_unlearn(
     retain_lr: float = 1e-3,
     scale_for_reinit_params: float = 10.0,
     target_params_policy: str = "all",
+    update_scope: str = "all",
+    pkm_update_keys: bool = True,
+    pkm_update_query: bool = True,
+    optimizer: str = "adam",
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Run Kookmin gradient-guided reinitialisation + retain repair in-place.
@@ -113,7 +121,12 @@ def kookmin_unlearn(
 
     device = device or next(model.parameters()).device
     model.train()
-    params = select_target_params(model, policy=target_params_policy)
+    params, _ = resolve_scope_params(
+        model, update_scope,
+        fallback=select_target_params(model, policy=target_params_policy),
+        include_keys=pkm_update_keys, include_query=pkm_update_query,
+        algo="kookmin",
+    )
     log.info(
         "[kookmin] policy=%s touches %d tensors / %d params; init_rate=%.4g, "
         "neg_grad_sample_size=%d, retain_epochs=%d, scale_for_reinit=%.3g",
@@ -181,7 +194,7 @@ def kookmin_unlearn(
     # --- 5/6. retain-repair round with scaled grads on reinit slots ----------
     # A fresh optimiser starts with zero state, equivalent to ERASE's
     # `_reset_adam_state` on the reinitialised tensors.
-    opt = torch.optim.Adam(params, lr=float(retain_lr))
+    opt = build_optimizer(optimizer, params, float(retain_lr), algo="kookmin")
     repair_losses: List[float] = []
     for epoch in range(int(retain_epochs)):
         for batch in retain_batches:

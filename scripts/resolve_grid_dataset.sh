@@ -55,6 +55,26 @@ resolve_grid_dataset() {
       poison="${clean}${_sfx}"
       sid="embeddings/beauty/merged_predictions_tensor.pt"
       ;;
+    beauty_v2)
+      # Same Beauty DATA as `beauty`, but the 2026-08-12 width-256 RQ-KMeans
+      # codebook (train job 10397484) instead of the May-2026 one.
+      #
+      # Why a separate namespace: RQ-KMeans is not reproducible across runs here
+      # -- retraining with the same config/embeddings agrees with the published
+      # codes at 0.18-0.37%, i.e. chance (1/256 = 0.39%). So the new codebook is
+      # a DIFFERENT clustering and its semantic IDs are incompatible with every
+      # model trained on the old ones. Installing over embeddings/beauty/ would
+      # silently invalidate ~1272 recorded unlearning runs; the legacy tensor is
+      # kept at merged_predictions_tensor.LEGACY_may29.pt.
+      #
+      # Adopted so all runs share one codebook AND so faithful TRACER is possible
+      # (its centroids survive for this one, unlike the May-2026 codebook).
+      # Poison dirs deliberately resolve to the SHARED beauty_spam_* datasets:
+      # poisoning acts on user sequences, not semantic IDs, so they are reusable.
+      clean="src/data/amazon_data/beauty"
+      poison="${clean}${_sfx}"
+      sid="embeddings/beauty_v2/merged_predictions_tensor.pt"
+      ;;
     sports)
       clean="src/data/amazon_data/sports"
       poison="${clean}${_sfx}"
@@ -64,6 +84,33 @@ resolve_grid_dataset() {
       clean="src/data/amazon_data/toys"
       poison="${clean}${_sfx}"
       sid="embeddings/toys/merged_predictions_tensor.pt"
+      ;;
+    food)
+      # CANONICAL food build (Amazon Reviews 2023 "Grocery and Gourmet Food",
+      # renamed from grocery 2026-08-13). Built by
+      # src/data/amazon_data/convert_amazon_2023.py with items filtered at
+      # 3-core but users at >=4 interactions.
+      #
+      # Why the threshold is split: alcohol is only 0.039% of interactions and
+      # iterative k-core cascades away most of it, while leave-one-out needs
+      # users >= 4 (train = seq[:-2] must hold >= 2 items) or they vanish from
+      # training while staying in eval/test. Measured alcohol pool per variant:
+      #   food_k5        20 items / 123 interactions   (1e-4 needs 313 -> no)
+      #   food_k4        54 items / 269 interactions   (1e-4 needs 381 -> no)
+      #   food (this)   145 items / 458 interactions   (1e-4 needs 405 -> yes)
+      # Splits are symmetric (168/168/168). Carries sensitive_items_alcohol.json
+      # and forget_manifest_alcohol_1e-5_seed2.json.
+      clean="src/data/amazon_data/food"
+      poison="${clean}${_sfx}"
+      sid="embeddings/food/merged_predictions_tensor.pt"
+      ;;
+    food_k5|food_k4|food_k3_broken)
+      # Superseded builds, kept for reference. food_k5 (5-core) cannot satisfy
+      # ERASE's 1e-4 forget ratio; food_k3_broken has a BROKEN split (39% of
+      # users in eval/test but not training, built before the --min-seq-len fix).
+      clean="src/data/amazon_data/${name}"
+      poison="${clean}${_sfx}"
+      sid="embeddings/${name}/merged_predictions_tensor.pt"
       ;;
     rsc15)
       clean="src/data/erase_data/rsc15"

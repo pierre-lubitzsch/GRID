@@ -239,7 +239,15 @@ case "$(printf '%s' "${OPTIMIZER:-}" | tr '[:upper:]' '[:lower:]')" in
     fi
     echo "Optimizer: SGD (lr/weight_decay from optim.optimizer; momentum=${OPTIMIZER_MOMENTUM:-0})"
     ;;
-  *) echo "Unknown OPTIMIZER='${OPTIMIZER}' (expected adam|sgd)"; exit 1 ;;
+  adamw)
+    # AdamW decouples weight decay from the gradient update; optim.optimizer
+    # already carries weight_decay, so only the class changes. Matches the
+    # adam|adamw|sgd set the unlearning side accepts, so one OPTIMIZER value
+    # means the same thing for training, retraining and unlearning.
+    EXTRA_OVERRIDES+=("optim.optimizer._target_=torch.optim.AdamW")
+    echo "Optimizer: AdamW (lr/weight_decay from optim.optimizer)"
+    ;;
+  *) echo "Unknown OPTIMIZER='${OPTIMIZER}' (expected adam|adamw|sgd)"; exit 1 ;;
 esac
 
 # PKM-only optimizer param group: give the PKM params their own lr/weight_decay

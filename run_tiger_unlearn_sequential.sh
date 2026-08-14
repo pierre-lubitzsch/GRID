@@ -60,7 +60,7 @@ shift 2
 # Falls through transparently so existing calls without the algorithm arg still work.
 ALGORITHM="${UNLEARN_ALGORITHM:-scif}"
 case "${1:-}" in
-  scif|seif|kookmin|fanchuan|unified|finetune|neg_train|filter)
+  scif|seif|kookmin|fanchuan|tracer|unified|finetune|neg_train|filter)
     ALGORITHM="${1}"
     shift 1
     ;;
@@ -104,13 +104,13 @@ if [ -z "${CKPT_PATH}" ] || [ -z "${DATASET_OR_DIR}" ]; then
   echo "  [algorithm] [semantic_id_path] [neighborhood_aware:true|false] \\"
   echo "  [request_batch_size:int] [neighborhood_aware_sample_rate:float] \\"
   echo "  [extra hydra overrides...]"
-  echo "Supported algorithms: scif (default), seif, kookmin, fanchuan, unified, finetune, neg_train, filter"
+  echo "Supported algorithms: scif (default), seif, kookmin, fanchuan, tracer, unified, finetune, neg_train, filter"
   echo "Known datasets: beauty, sports, toys, rsc15, rsc15_smoke (see scripts/resolve_unlearn_dataset.sh)"
   exit 1
 fi
 
 case "${ALGORITHM}" in
-  scif|seif|kookmin|fanchuan|unified|finetune|neg_train|filter) ;;
+  scif|seif|kookmin|fanchuan|tracer|unified|finetune|neg_train|filter) ;;
   *)
     echo "Unknown algorithm '${ALGORITHM}'. Supported: scif, seif, kookmin, fanchuan, unified, finetune, neg_train, filter"
     exit 1

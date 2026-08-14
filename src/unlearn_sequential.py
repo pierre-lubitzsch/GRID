@@ -132,6 +132,21 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
                 f"{'...' if len(load_result.unexpected_keys) > 5 else ''}"
             )
 
+        # PKM CONTROL: re-initialise selected FFN sub-layers, keeping them as
+        # ordinary FFNs. MUST happen AFTER load_state_dict — unlike PKM params
+        # (missing keys that keep their fresh init), FFN weights are present in
+        # the checkpoint and the load would overwrite any earlier reinit.
+        _ffn_reinit = cfg.get("ffn_reinit_layers", None)
+        if _ffn_reinit is not None:
+            names = model.reinit_ffn_layers(
+                OmegaConf.to_container(_ffn_reinit, resolve=True)
+                if hasattr(_ffn_reinit, "_content") else _ffn_reinit
+            )
+            command_line_logger.warning(
+                f"[PKM CONTROL] re-initialised {len(names)} FFN sub-layer(s) "
+                f"AFTER checkpoint load: {names}"
+            )
+
         device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
