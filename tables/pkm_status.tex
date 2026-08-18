@@ -1,0 +1,770 @@
+\documentclass{beamer}
+
+\usetheme{metropolis}
+
+% NOTE: deliberately NOT using booktabs -- all tables are plain tabular + \hline
+\usepackage{xcolor}
+\usepackage{array}
+
+\hypersetup{
+    colorlinks=true,
+    urlcolor=blue
+}
+
+\title{Product-Key Memory as a Modular Unlearning Module}
+\subtitle{Spam unlearning for generative recommendation}
+\date{\today}
+
+% ---------------------------------------------------------------------------
+% Macros (extend here)
+% ---------------------------------------------------------------------------
+\newcommand{\pierre}[1]{\textcolor{cyan}{#1}}
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{TODO:} #1}}
+\newcommand{\done}[1]{\textcolor{green!50!black}{#1}}
+\newcommand{\open}[1]{\textcolor{orange!80!black}{#1}}
+
+\newcommand{\If}{\ensuremath{I_t}}      % target (spam) item set
+\newcommand{\Df}{\ensuremath{D_f}}      % forget set
+\newcommand{\Dr}{\ensuremath{D_r}}      % retain set
+\newcommand{\lf}{\ensuremath{\lambda_{\text{forget}}}}
+\newcommand{\ls}{\ensuremath{\lambda_{\text{sep}}}}
+\newcommand{\gf}{\ensuremath{g_f}}
+\newcommand{\gr}{\ensuremath{g_r}}
+% per-slot variants: \gf already carries a subscript, so \gf_{,i} would be a
+% double subscript -- use these instead.
+\newcommand{\gfi}{\ensuremath{g_{f,i}}}
+\newcommand{\gri}{\ensuremath{g_{r,i}}}
+
+% status markers for the plan tables
+\newcommand{\stdone}{\textcolor{green!50!black}{done}}
+\newcommand{\strun}{\textcolor{blue}{running}}
+\newcommand{\sttodo}{\textcolor{red}{todo}}
+
+\begin{document}
+
+\maketitle
+
+% ===========================================================================
+\begin{frame}{TL;DR}
+\begin{itemize}
+  \item We can remove $\sim$99\% of spam exposure at \emph{clean-level utility}
+        by replacing two decoder FFNs with a PKM and rebuilding them from
+        retain data only.
+  \item The spam is \textbf{decoder-localised} for removal, but an
+        \textbf{encoder} PKM prevents the attack from being learned in the
+        first place ($30\times$ less pickup).
+  \item \alert{The memory collapses when trained jointly}: 32 of 262{,}144 slots. Post-hoc PKMs (trained in isolation) do not collapse.
+  \item Top-$t$ slot selection is implemented but only testable on the non-collapsed (post-hoc) models.
+\end{itemize}
+\end{frame}
+
+% ===========================================================================
+\section{Setup}
+
+\begin{frame}{Setup: model, attack}
+\textbf{Model.} TIGER: small encoder--decoder trained from
+scratch on semantic-ID sequences ($d_{\text{model}}=128$, 4 encoder and 4 decoder blocks, $d_{ff}=1024$, RQ semantic IDs $L=4$, codebook width 256).
+
+\textbf{Attack.} Bandwagon: fake users click one target item among popular
+fillers. Beauty, $1\%$ poisoning, $n_{\text{target}}=1$, target strategy
+\texttt{mid} unless stated.
+
+\end{frame}
+
+\begin{frame}{Setup: metrics, reference points}
+    
+\textbf{Metrics.}
+\begin{itemize}
+  \item \textbf{SH@$k$} spam hit rate --- fraction of test users seeing \If{}
+  \item \textbf{ASI@$k$}, \textbf{TPM@$k$} --- related exposure measures
+  \item \textbf{N@10} nDCG (utility), \textbf{UR} $=$ N@10 / clean N@10
+  \item \textbf{removal} $= 1 - \text{SH}_{\text{unlearned}}/\text{SH}_{\text{poison}}$
+\end{itemize}
+
+\textbf{Reference points (non-PKM), dataset beauty.}
+\begin{center}
+\begin{tabular}{|l|c|c|}
+\hline
+model & SH@10 & N@10 \\
+\hline
+clean            & 0.00000 & 0.03763 \\
+poisoned         & 0.01274 & 0.03619 \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Why memory? (Geva et al., 2021)}
+FFNs behave like \textbf{key--value memories}:
+\begin{itemize}
+  \item \textbf{keys} capture input patterns
+  \item \textbf{values} encode what to output (a distribution over the vocab)
+  \item each FFN output is a composition of values; layers refine step by step
+\end{itemize}
+
+\medskip
+\textbf{Takeaway.} Forgetting by fine-tuning overwrites internal memory
+$\Rightarrow$ we want a \emph{modular stabilizer} instead of more backbone edits.
+
+% \medskip
+% Our data supports this in a specific way: spam removal only works when
+% we touch \emph{decoder} FFNs --- consistent with values encoding the output
+% distribution, and generation being decoder-side.
+\end{frame}
+
+% ===========================================================================
+\section{Design space}
+
+\begin{frame}{Design space: the knobs}
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{axis} & \textbf{options} \\
+\hline
+When       & trained-in $\;|\;$ post-hoc (insert into trained model) \\
+Mode       & \texttt{replace} FFN $\;|\;$ \texttt{add} alongside FFN \\
+Where      & encoder / decoder $\times$ block $\{0,1,2,3\}$, or sets \\
+Update scope & all params $\;|\;$ \texttt{pkm\_only} $\;|\;$ values only \\
+Selection  & none $\;|\;$ AF $\;|\;$ AF-IHF $\;|\;$ grad $\;|\;$ grad+dot \\
+$t$        & $1 \ldots 10^4$ (bounded by \emph{live} slots) \\
+Optimizer  & Adam $\;|\;$ SGD \\
+Init       & \texttt{normal}$\times s$ $\;|\;$ \texttt{zeros} \\
+Retain data & sampled subset $\;|\;$ full retain split \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\pierre{All of these are implemented as config knobs; defaults reproduce the
+PKM-free behavior.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Two variants of the idea}
+\textbf{A. Trained-in (``pretrained-memory'').}
+PKM is part of the model during training, so it \emph{learns} spam into memory
+slots; unlearning edits those slots.
+
+\medskip
+\textbf{B. Post-hoc (``correction module'').}
+PKM is inserted into an already-trained model, then adapted on clean data as a
+sparse corrective layer against a frozen backbone.
+
+\medskip
+If PKM is added after training, it has no target information to remove? $\to$ removal is the forgetting, fine-tuning on the retain set repairs this
+
+\end{frame}
+
+% ===========================================================================
+\section{Experiments done}
+
+\begin{frame}{Headline comparison (beauty, bandwagon \texttt{mid})}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+method & SH@10 & removal & UR \\
+\hline
+poison baseline                & 0.01274 & ---    & 0.962 \\
+\texttt{seif}                  & $\sim$0 & $\sim$full & 0.67--0.74 \\
+\texttt{unified} ac0 (full model) & 0.00411 & 67\% & 1.013 \\
+\hline
+trained-in PKM, \texttt{pkm\_only} & 0.00385 & 69\% & 1.004 \\
+\textbf{post-hoc d01 + rebuild}    & \textbf{0.00013} & \textbf{99\%} & \textbf{0.995} \\
+\quad \emph{control:} fresh FFN, no PKM & 0.00022 & 98\% & 0.995 \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\begin{itemize}
+  \item Post-hoc \textbf{dominates} everything: clean-equivalent on \emph{both}
+        axes (clean is SH 0.00000 / N@10 0.03763).
+  \item Trained-in \texttt{pkm\_only} matches full-model unlearning with the
+        \textbf{backbone frozen} --- 0.2\% utility cost vs.\ its own clean model.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Placement, post-hoc: spam is decoder-localised}
+Insert PKM at \emph{one} layer, rebuild on retain data:
+\begin{center}
+\begin{tabular}{|l|c|c|c||l|c|c|c|}
+\hline
+layer & SH@10 & rem. & UR & layer & SH@10 & rem. & UR \\
+\hline
+d0 & 0.00139 & 89\% & 0.978 & e0 & 0.01306 & $-3\%$  & 0.978 \\
+d1 & 0.00031 & 98\% & 0.958 & e1 & 0.01413 & $-11\%$ & 0.978 \\
+d2 & 0.00009 & 99\% & 0.904 & e2 & 0.01288 & $-1\%$  & 0.960 \\
+d3 & 0.00054 & 96\% & 0.898 & e3 & 0.01400 & $-10\%$ & 0.944 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{Every encoder layer removes nothing.} All decoder layers remove
+        89--99\%.
+  \item Deeper decoder $\Rightarrow$ more removal, less utility.
+  \item \texttt{d01} (both) beats every single layer: 99\% at UR 0.995
+        $\Rightarrow$ optimum is the \emph{first two} decoder FFNs.
+  \item \texttt{dall} (4 layers) does \emph{not} converge $\Rightarrow$
+        a destruction threshold.
+  \item Need comparison with FFN reinit instead of PKM replace
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Placement, trained-in: encoder PKM is prophylactic}
+PKM present \emph{during} training (poisoned run), spam$\times$ relative to
+non-PKM (SH 0.01274):
+\begin{center}
+\begin{tabular}{|l|c|c|c||l|c|c|c|}
+\hline
+layer & N@10 & SH@10 & spam$\times$ & layer & N@10 & SH@10 & spam$\times$ \\
+\hline
+D0 & 0.03452 & 0.00277 & 0.22 & E0 & 0.03511 & 0.00072 & 0.06 \\
+D1 & 0.03607 & 0.02111 & \alert{1.66} & E1 & 0.03507 & 0.00036 & \textbf{0.03} \\
+D2 & 0.03508 & 0.00648 & 0.51 & E2 & 0.03596 & 0.00778 & 0.61 \\
+D3 & 0.03480 & 0.01011 & 0.79 & E3 & 0.03508 & 0.00040 & \textbf{0.03} \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\textbf{Encoder PKM suppresses the attack $\sim 30\times$} (E1/E3) for $\sim$3\%
+utility. Exactly the opposite of the post-hoc screen --- and consistent:
+
+\begin{center}
+\emph{encoder PKM = prophylactic (prevents learning spam)}\\
+\emph{decoder PKM = therapeutic (enables removing spam)}
+\end{center}
+
+\pierre{Utility spread (0.954--0.997) is inside seed noise; the spam spread
+($55\times$) is not.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Encoder placements: suppression does \emph{not} stack}
+Trained-in, poisoned, decoder untouched. spam$\times$ relative to non-PKM:
+\begin{center}
+\begin{tabular}{|l|c|c|c||l|c|c|c|}
+\hline
+layers & N@10 & util$\times$ & spam$\times$ & layers & N@10 & util$\times$ & spam$\times$ \\
+\hline
+E0   & 0.03511 & 0.970 & 0.06 & E01   & 0.03511 & 0.970 & \textbf{0.04} \\
+E1   & 0.03507 & 0.969 & \textbf{0.03} & E012  & 0.03315 & 0.916 & 0.24 \\
+E2   & 0.03596 & 0.994 & 0.61 & E12   & 0.03717 & 1.027 & \alert{1.03} \\
+E3   & 0.03508 & 0.969 & \textbf{0.03} & E23   & 0.03435 & 0.949 & \alert{2.29} \\
+     &         &       &      & E0123 & 0.03739 & \textbf{1.033} & 0.26 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{No combination beats the best single layer} (E1/E3 at 0.03$\times$;
+        best combo E01 at 0.04$\times$). Extra blocks buy nothing.
+  \item \alert{Combining protective layers can destroy the protection.} E12 gives
+        \emph{zero} suppression despite containing E1 (30$\times$ alone); E23
+        \emph{amplifies} the attack (2.29$\times$) despite containing E3.
+  \item \pierre{Pattern: E2 is a disruptor, E0 a stabiliser --- every combo with
+        E2 but without E0 loses suppression; every combo with E0 keeps it.
+        Mechanism unexplained.}
+  \item Utility does not track layer count either: E0123 (4 blocks) is best
+        (1.033), E012 (3 blocks) worst (0.916).
+\end{itemize}
+
+\medskip
+\textbf{Encoder-PKM suppression is a fragile, non-additive property of specific
+blocks --- not a capacity effect.} One configuration makes the model \emph{more}
+vulnerable than baseline.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{\alert{Problem: the memory collapses}}
+Slot-access diagnostic, $n_{\text{keys}}=512 \Rightarrow 262{,}144$ slots/memory:
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+model & slots & touched & Jaccard & forget-excl. \\
+\hline
+trained-in E23D01 & 262144 & \alert{32} & \alert{1.000} & \alert{0} \\
+trained-in D1only & 262144 & \alert{32} & \alert{1.000} & \alert{0} \\
+trained-in D2only & 262144 & \alert{32} & \alert{1.000} & \alert{0} \\
+post-hoc \texttt{replace} & 262144 & 64052 & 0.386 & 3051 \\
+post-hoc \texttt{add}     & 262144 & 71547 & 0.411 & 3194 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item Jointly-trained PKMs use \textbf{0.012\%} of the memory; every token and
+        every head picks the \emph{same} 32 slots (routing is input-independent).
+  \item \textbf{Post-hoc PKMs are healthy} --- 59\% coverage, forget/retain route
+        differently, $\sim$3000 forget-exclusive slots.
+  \item \pierre{Hypothesis: trained in isolation on a frozen backbone, the query
+        net \emph{must} learn routing; in joint training the model routes
+        \emph{around} the memory.}
+  \item Consequence: every trained-in PKM number describes a \emph{low-rank
+        layer}, not a large sparse memory.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Top-$t$ slot selection: criteria}
+Adapt Sparse Memory Finetuning to unlearning --- score slots, update only top $t$.
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+criterion & score \\
+\hline
+AF      & forget access frequency (baseline) \\
+AF-IHF  & $\text{AF}(s)\cdot\log\frac{T_r+1}{\text{HF}(s)+1}$, history $=$ retain \\
+grad    & $\|\gf\| - \lambda\|\gr\|$ \\
+grad+dot & $\hat{g}_f - \lambda\hat{g}_r - \mu\,\widehat{\langle \gf,\gr\rangle}$ \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Why the dot term.} The update moves along $+\gf$, so the first-order
+change in the \emph{retain} loss from editing slot $i$ is
+$\langle \gfi, \gri \rangle$ --- \emph{not} $\|\gri\|$. It is signed:
+negative means forgetting also \emph{helps} retain.
+
+\end{frame}
+
+\begin{frame}{Top-$t$ slot selection: criteria}
+\textbf{Verified.} Two slots with identical $\|\gf\|=\|\gr\|=12$ but dot $0$
+vs.\ $+144$: ranked 1007 vs.\ 1006 by $\gf-\gr$ (indistinguishable), 1007
+vs.\ 1999 (last) by grad+dot.
+
+\medskip
+\pierre{Objective is additively separable over slots $\Rightarrow$ exact top-$t$
+is plain \texttt{topk}, no greedy needed.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Selection: gradient signal separates, access counts do not}
+Mean per-slot forget/retain gradient cosine:
+\begin{center}
+\begin{tabular}{|l|c|l|}
+\hline
+memory & mean cos & reading \\
+\hline
+E23D01 enc block 2 & $+0.52$ & strongly aligned (conflict) \\
+E23D01 enc block 3 & $+0.53$ & strongly aligned \\
+trained-in D1only  & $+0.21$ & aligned \\
+post-hoc \texttt{d01} & $-0.03$ & \textbf{near-orthogonal} \\
+\hline
+\end{tabular}
+\end{center}
+
+On the healthy post-hoc memory, at $t=25$:
+\begin{center}
+\begin{tabular}{|c|c|c|c|}
+\hline
+$\lambda$ & mean $\|\gf\|$ sel. & mean $\|\gr\|$ sel. & overlap with AF \\
+\hline
+0.0 & 5.06e--3 & 1.88e--2 & 0.36 \\
+1.0 & 3.79e--3 & \textbf{1.52e--3} & \textbf{0.00} \\
+\hline
+\end{tabular}
+\end{center}
+
+$\lambda{=}1$ gives up 25\% of forget signal to cut retain exposure
+$12\times$, and selects \emph{entirely different} slots than access frequency.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Ablations that came out negative (worth reporting)}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+post-hoc \texttt{d01} init & SH@10 & removal & UR \\
+\hline
+\texttt{normal} $\times 1.0$ (default) & 0.00013 & 99.0\% & \textbf{0.995} \\
+\texttt{zeros}                          & 0.00009 & 99.3\% & 0.977 \\
+\texttt{normal} $\times 0.01$           & 0.00004 & 99.6\% & 0.976 \\
+\texttt{add} + \texttt{zeros}           & 0.00018 & 98.6\% & 0.920 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item ``Smarter'' (identity-like) init is \textbf{worse}: full random init
+        rebuilds best. Init \emph{scale} matters, not routing gradients.
+  \item Initialising values from the FFN would \emph{re-import the spam} ---
+        the removal comes precisely from discarding those weights.
+  \item \textbf{Adam beat SGD} in the \texttt{pkm\_only} sweep --- but that
+        updated \emph{all} slots, which is not the regime SMF's argument covers.
+        Re-test under selection.
+  \item \texttt{add}+\texttt{zeros} \emph{also} removes spam (98.6\%): any
+        retain-only adaptation suppresses it. \alert{So we cannot easily build
+        ``healthy memory $+$ spam still present''.}
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Sequential unlearning: no drift, for either method}
+Same \emph{total} budget in every arm (chunks $\times$ steps $=$ 3000), same
+forget set --- only the number of sequential requests varies:
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+mode & chunks & steps/chunk & SH@10 & UR \\
+\hline
+PKM & 1  & 3000 & 0.00031 & 0.981 \\
+PKM & 5  & 600  & 0.00031 & 0.992 \\
+PKM & 10 & 300  & 0.00022 & 0.992 \\
+FFN & 1  & 3000 & 0.00031 & \textbf{1.005} \\
+FFN & 5  & 600  & 0.00022 & 0.992 \\
+FFN & 10 & 300  & 0.00027 & \textbf{1.005} \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Nothing degrades.} 10 sequential requests cost the same as 1:
+97.5--98.2\% removal, UR 0.981--1.005 everywhere.
+
+\medskip
+\alert{The modular-memory hypothesis fails on its \emph{premise}:} there is no
+accumulated damage for a sparse memory to protect against. A repeatedly
+retrained FFN does not drift either (UR 1.005, \emph{above} clean).
+
+\medskip
+\pierre{Practical upside: deletion requests can be processed incrementally at no
+cost.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Collapse is universal in trained-in PKMs}
+Slot diagnostic on all five \emph{encoder-only} trained-in models:
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+model & memories & slots used & Jaccard & forget-excl. \\
+\hline
+E01   & 2 & 128 / 128        & 1.000 & 0 \\
+E012  & 3 & 128 / 95 / 32    & 1.000 & 0 \\
+E12   & 2 & 125 / 32         & 1.000 & 0 \\
+E23   & 2 & 32 / 32          & 1.000 & 0 \\
+E0123 & 4 & 96 / 32 / 32 / 32 & 1.000 & 0 \\
+\hline
+\end{tabular}
+\end{center}
+
+Utilisation 0.012--0.049\% of 262{,}144 slots. \textbf{The hypothesis that the
+encoder might escape collapse is refuted} --- collapse is independent of
+encoder/decoder placement, layer count and depth. ($32 = knn$ exactly: those
+memories return the \emph{same} 32 slots for every token.)
+
+\medskip
+\alert{So the E2-disruptor / E0-stabiliser pattern cannot be a memory-content
+effect} --- there is no meaningful memory in any of them. Those layers act as
+low-rank layers.
+
+\medskip
+\pierre{Only healthy memories are post-hoc $\Rightarrow$ it is not \emph{where}
+the memory sits but \emph{how} it was trained: alone, against a frozen backbone.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Scorecard: PKM vs.\ a fresh FFN}
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+regime & winner \\
+\hline
+Converged, single edit       & tie (saturated) \\
+Heavy damage (\texttt{dall}) & \textbf{FFN} (UR 0.964 vs.\ 0.891) \\
+Small budget                 & \textbf{PKM} (1.75$\times$ removal, $\sim$2$\times$ faster) \\
+Sequential edits             & tie (no drift either way) \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\textbf{PKM's only measured advantage is convergence speed at constrained
+budgets.} The post-hoc contribution is therefore the \emph{localised retrain}
+itself --- re-initialise the first two decoder FFNs, retrain on retain data,
+backbone frozen --- with PKM a speed optimisation on top, not the mechanism.
+
+\medskip
+\pierre{Remaining lever for the memory story: ``train the memory in isolation,
+then unfreeze'' --- the one configuration empirically known to produce a healthy
+memory.}
+\end{frame}
+
+% ===========================================================================
+\section{Plan}
+
+\begin{frame}{What is done}
+\begin{center}
+\begin{tabular}{|l|c|}
+\hline
+item & status \\
+\hline
+PKM in training / post-hoc insertion            & \stdone \\
+Memory-only update (\texttt{pkm\_only})          & \stdone \\
+Full retain stream (\texttt{retain\_source})     & \stdone \\
+Slot access counters + diagnostics               & \stdone \\
+Top-$t$ selection (AF / AF-IHF / grad / grad+dot)& \stdone \\
+Optimizer + init knobs                           & \stdone \\
+Placement screen (post-hoc, 8 layers)            & \stdone \\
+Placement screen (trained-in, 8 layers)          & \stdone \\
+Architecture study + 168-run unlearning sweeps   & \stdone \\
+Clean-baseline audit (seed noise)                & \stdone \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{What needs to be done}
+\begin{center}
+\begin{tabular}{|l|l|c|}
+\hline
+\# & item & status \\
+\hline
+1 & \textbf{FFN-reinit control} instead of PKM replace   & \stdone \\
+2 & Other unlearning algorithms under \texttt{pkm\_only} & \sttodo \\
+3 & Fix memory collapse (routing, not capacity)          & \sttodo \\
+4 & Top-$t$ sweep on healthy (post-hoc) memory           & \sttodo \\
+5 & AF-IHF vs.\ grad vs.\ access baseline ablation       & \sttodo \\
+6 & Adam vs.\ SGD \emph{under} selection                 & \sttodo \\
+7 & Why does trained-in plateau at SH $\approx$ 0.004?   & \sttodo \\
+8 & Multi-seed (clean baselines \emph{and} runs)         & \sttodo \\
+9 & Other strategies $+$ other (Amazon) datasets         & \sttodo \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\alert{(1) is the sanity check the post-hoc story rests on:} re-initialise the
+same two decoder FFNs as \emph{ordinary FFNs} and fine-tune them identically.
+If that matches PKM, the mechanism is ``reinit-and-retrain-this-layer'' and the
+PKM is an implementation detail.
+
+\medskip
+\textbf{(3) is blocking (4)--(6).} Candidate causes:
+\texttt{query\_batchnorm=false} (padding-unsafe), \texttt{query\_proj} collapsing
+to a constant, keys never leaving their init.
+\pierre{Cheapest lead: post-hoc PKMs do not collapse --- isolate the memory
+during training.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Item 1: the FFN-reinit control (does PKM actually help?)}
+The post-hoc recipe is: \emph{discard} a trained FFN, put a fresh high-capacity
+module there, fine-tune it on retain data only.
+
+\medskip
+\textbf{Control:} do exactly the same, but re-initialise the layer as an
+\emph{ordinary FFN} --- same two decoder blocks, same discovery code, same
+optimiser, same steps, same full retain split.
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+arm & SH@10 & removal & UR \\
+\hline
+poison baseline               & 0.01274 & ---    & 0.962 \\
+PKM \texttt{d01} $+$ rebuild  & 0.00013 & 99.0\% & 0.995 \\
+fresh FFN \texttt{d01} (control) & 0.00022 & 98.2\% & 0.995 \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\alert{Why this decides the framing:} the removal already appears to come from
+the \emph{retain-only rebuild}, not from the memory --- ablation alone removes
+only 12\%, and \texttt{add} mode (FFN left intact) still removes 98.6\%.
+\alert{Result: tied.} Utility identical to 4 decimals (0.03745 vs 0.03746),
+removal 99.0\% vs 98.2\%. A plain FFN at \textbf{1/25th} the parameter budget
+(2.6M vs 67M) does it just as well.
+
+\medskip
+\textbf{So the headline post-hoc result is a \emph{localised retrain}, not a
+memory method} --- and it needs no PKM machinery at all.
+
+\medskip
+\pierre{But the test is SATURATED: both arms sit at the clean floor. A tie under
+saturation shows this task cannot separate them, not that they are equivalent.
+See the next slide.}
+\pierre{Implemented as \texttt{model.ffn\_reinit\_layers} $+$
+\texttt{unlearning.update\_scope=ffn\_only}; the reinit runs AFTER the ckpt load
+(FFN weights are in the ckpt, PKM's are not).}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Where could post-hoc PKM still beat a fresh FFN?}
+The tie was measured in a \textbf{saturated} regime --- both arms reach the clean
+floor, so the task has no headroom to rank them. To find out whether the sparse
+memory is ever worth its 25$\times$ parameter budget, we need a setting where
+\emph{neither} saturates:
+
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+regime & why PKM might win \\
+\hline
+More destruction (\texttt{dall}, 4 layers) & more capacity to rebuild with \\
+Smaller step budget & which recovers \emph{faster}? \\
+Stronger attack / other strategies & harder target to erase \\
+\textbf{Sequential requests} & \textbf{repeated edits without drift} \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\alert{The sequential setting is the real test of the modular claim:} a
+repeatedly-retrained FFN should accumulate drift, whereas a sparse memory can in
+principle localise each edit. That is the SMF/continual-learning argument, and it
+is the one regime we have not touched.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Answer: the two regimes disagree}
+\textbf{(A) More destruction --- \texttt{dall}, 4 decoder layers:}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+arm & SH@10 & removal & UR \\
+\hline
+PKM \texttt{dall} @2000   & 0.00000 & 100\%  & 0.891 \\
+PKM \texttt{dall} @10000  & 0.00000 & 100\%  & 0.686 \\
+\textbf{FFN \texttt{dall} @2000}  & 0.00009 & 99.3\% & \textbf{0.964} \\
+FFN \texttt{dall} @10000  & 0.00004 & 99.6\% & 0.877 \\
+\hline
+\end{tabular}
+\end{center}
+\alert{FFN wins by 7 points} and degrades less with extra steps. Where capacity
+should have helped most, it \emph{hurt}.
+
+\medskip
+\textbf{(B) Smaller budget --- \texttt{d01}, same destruction:}
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+steps & PKM SH@10 & PKM UR & FFN SH@10 & FFN UR \\
+\hline
+200        & \textbf{0.00555} & 0.977 & 0.00863 & 0.966 \\
+600        & \textbf{0.00148} & 0.989 & 0.00523 & 0.979 \\
+converged  & 0.00013 (1560 st.) & 0.995 & 0.00022 (3320 st.) & 0.995 \\
+\hline
+\end{tabular}
+\end{center}
+\alert{PKM removes $\sim$1.75$\times$ more at every budget} and converges in
+$<$half the steps.
+
+\medskip
+\begin{center}
+\textbf{PKM buys SPEED, not final QUALITY.}
+\end{center}
+\pierre{Budget-constrained $\Rightarrow$ PKM. Converged, or heavy damage
+$\Rightarrow$ FFN (simpler, 25$\times$ fewer params). Single seed; the
+\texttt{dall} gap wants replication, the budget gap is more robust.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Item 7: what is the ``SH $\approx$ 0.004 plateau''?}
+On the trained-in E23D01 model \emph{every} gradient-based route stops at the
+same residual, regardless of parameter scope or budget:
+\begin{center}
+\begin{tabular}{|l|c|c|}
+\hline
+route & SH@10 & UR \\
+\hline
+\texttt{unified}, full model   & 0.00411 & 1.013 \\
+\texttt{pkm\_only}, 40 epochs  & 0.00452 & 1.017 \\
+\texttt{pkm\_only}, 100 epochs & 0.00385 & 1.004 \\
+\texttt{pkm\_only}, 200 epochs & 0.00496 & 1.011 \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Not a measurement floor:} this model's \emph{clean} SH@10 is 0.00004 ---
+the plateau sits $\sim$85$\times$ above it, so real spam remains.
+\textbf{Not irreducible:} post-hoc reaches 0.00013 on the same attack.
+
+\medskip
+Three candidate explanations, each with a different implication:
+\begin{enumerate}
+  \item \textbf{Optimisation} --- more/better steps would get there.
+        \pierre{Weakened: 40$\to$100$\to$200 epochs is non-monotone.}
+  \item \textbf{Redundancy} --- spam spread over parameters the objective cannot
+        move simultaneously.
+  \item \textbf{It is the utility-preserving frontier}, not a ceiling: pushing SH
+        lower costs utility. \pierre{\texttt{seif} reaches SH$\approx$0 at
+        UR 0.67--0.74, consistent with this.}
+\end{enumerate}
+
+\medskip
+\alert{If (3), ``ceiling'' is the wrong word} --- the question becomes why the
+post-hoc rebuild escapes the frontier entirely.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Open design question}
+The selection experiment needs a model with
+\textbf{(a)} healthy memory \emph{and} \textbf{(b)} spam still present.
+
+\medskip
+But every route to (a) currently destroys (b):
+\begin{itemize}
+  \item \texttt{replace} + rebuild $\Rightarrow$ healthy, spam gone (99\%)
+  \item \texttt{add} + warmup $\Rightarrow$ healthy, spam gone (98.6\%)
+  \item trained-in $\Rightarrow$ spam present, memory collapsed
+\end{itemize}
+
+\medskip
+\textbf{Options:}
+\begin{enumerate}
+  \item Fix collapse in trained-in models (then (a) and (b) coexist naturally)
+  \item Two-stage: warm \emph{briefly} (routing forms, spam survives)
+        $\rightarrow$ select $\rightarrow$ train selected slots only
+  \item Reframe: selection as a way to make the \emph{rebuild} cheaper/safer
+        rather than to target spam
+\end{enumerate}
+
+\medskip
+\todo{decide which framing the paper takes}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Threats to validity}
+\begin{itemize}
+  \item \textbf{Single seed everywhere.} Three identical-config clean runs span
+        \textbf{7.5\%} (sd 3.6\%) --- larger than most architecture effects.
+        Utility claims below $\sim$5\% are not currently supportable.
+  \item \textbf{One attack, one dataset, one target strategy}
+        (beauty / bandwagon / \texttt{mid}).
+  \item \textbf{Denominators.} UR must be taken against each model's \emph{own}
+        clean baseline; mixing them conflates architecture cost with unlearning
+        cost.
+  \item \textbf{One cell has no attack} (ALLv2/popular: poison 0.00018 vs.\
+        clean 0.00013) --- must be excluded from removal claims.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Resources}
+\begin{itemize}
+  \item ERASE: \url{https://arxiv.org/abs/2603.08341}
+  \item FFNs are key--value memories: \url{https://aclanthology.org/2021.emnlp-main.446/}
+  \item Product-key memory (Lample et al.\ 2019): \url{https://arxiv.org/abs/1907.05242}
+  \item Memory layers at scale: \url{https://github.com/facebookresearch/memory}
+  \item GRID: \url{https://github.com/snap-research/GRID}
+\end{itemize}
+
+\medskip
+\textbf{Internal.} \texttt{WORKFLOW.md} sections F--J (full experiment record,
+job ids); \texttt{tables/pkm\_update.md} (extended notes).
+
+\medskip
+\textbf{Deadline.} ICLR 2027 --- Sep 25, 2026 AOE.
+\end{frame}
+
+% ===========================================================================
+% Add new frames below this line.
+% ===========================================================================
+
+\end{document}
