@@ -45,18 +45,18 @@
 \maketitle
 
 % ===========================================================================
-\begin{frame}{TL;DR}
-\begin{itemize}
-  \item We can remove $\sim$99\% of spam exposure at \emph{clean-level utility}
-        by replacing two decoder FFNs with a PKM and rebuilding them from
-        retain data only.
-  \item The spam is \textbf{decoder-localised} for removal, but an
-        \textbf{encoder} PKM prevents the attack from being learned in the
-        first place ($30\times$ less pickup).
-  \item \alert{The memory collapses when trained jointly}: 32 of 262{,}144 slots. Post-hoc PKMs (trained in isolation) do not collapse.
-  \item Top-$t$ slot selection is implemented but only testable on the non-collapsed (post-hoc) models.
-\end{itemize}
-\end{frame}
+% \begin{frame}{TL;DR}
+% \begin{itemize}
+%   \item We can remove $\sim$99\% of spam exposure at \emph{clean-level utility}
+%         by replacing two decoder FFNs with a PKM and rebuilding them from
+%         retain data only.
+%   \item The spam is \textbf{decoder-localised} for removal, but an
+%         \textbf{encoder} PKM prevents the attack from being learned in the
+%         first place ($30\times$ less pickup).
+%   \item \alert{The memory collapses when trained jointly}: 32 of 262{,}144 slots. Post-hoc PKMs (trained in isolation) do not collapse.
+%   \item Top-$t$ slot selection is implemented but only testable on the non-collapsed (post-hoc) models.
+% \end{itemize}
+% \end{frame}
 
 % ===========================================================================
 \section{Setup}
@@ -128,7 +128,7 @@ Where      & encoder / decoder $\times$ block $\{0,1,2,3\}$, or sets \\
 Update scope & all params $\;|\;$ \texttt{pkm\_only} $\;|\;$ values only \\
 Selection  & none $\;|\;$ AF $\;|\;$ AF-IHF $\;|\;$ grad $\;|\;$ grad+dot \\
 $t$        & $1 \ldots 10^4$ (bounded by \emph{live} slots) \\
-Optimizer  & Adam $\;|\;$ SGD \\
+Optimizer  & Adam $\;|\;$ SGD $\;|\;$ AdamW \\
 Init       & \texttt{normal}$\times s$ $\;|\;$ \texttt{zeros} \\
 Retain data & sampled subset $\;|\;$ full retain split \\
 \hline
@@ -218,6 +218,7 @@ d3 & 0.00054 & 96\% & 0.898 & e3 & 0.01400 & $-10\%$ & 0.944 \\
 PKM present \emph{during} training (poisoned run), spam$\times$ relative to
 non-PKM (SH 0.01274):
 \begin{center}
+\small
 \begin{tabular}{|l|c|c|c||l|c|c|c|}
 \hline
 layer & N@10 & SH@10 & spam$\times$ & layer & N@10 & SH@10 & spam$\times$ \\
@@ -241,42 +242,6 @@ utility. Exactly the opposite of the post-hoc screen --- and consistent:
 
 \pierre{Utility spread (0.954--0.997) is inside seed noise; the spam spread
 ($55\times$) is not.}
-\end{frame}
-
-% ---------------------------------------------------------------------------
-\begin{frame}{Encoder placements: suppression does \emph{not} stack}
-Trained-in, poisoned, decoder untouched. spam$\times$ relative to non-PKM:
-\begin{center}
-\begin{tabular}{|l|c|c|c||l|c|c|c|}
-\hline
-layers & N@10 & util$\times$ & spam$\times$ & layers & N@10 & util$\times$ & spam$\times$ \\
-\hline
-E0   & 0.03511 & 0.970 & 0.06 & E01   & 0.03511 & 0.970 & \textbf{0.04} \\
-E1   & 0.03507 & 0.969 & \textbf{0.03} & E012  & 0.03315 & 0.916 & 0.24 \\
-E2   & 0.03596 & 0.994 & 0.61 & E12   & 0.03717 & 1.027 & \alert{1.03} \\
-E3   & 0.03508 & 0.969 & \textbf{0.03} & E23   & 0.03435 & 0.949 & \alert{2.29} \\
-     &         &       &      & E0123 & 0.03739 & \textbf{1.033} & 0.26 \\
-\hline
-\end{tabular}
-\end{center}
-
-\begin{itemize}
-  \item \textbf{No combination beats the best single layer} (E1/E3 at 0.03$\times$;
-        best combo E01 at 0.04$\times$). Extra blocks buy nothing.
-  \item \alert{Combining protective layers can destroy the protection.} E12 gives
-        \emph{zero} suppression despite containing E1 (30$\times$ alone); E23
-        \emph{amplifies} the attack (2.29$\times$) despite containing E3.
-  \item \pierre{Pattern: E2 is a disruptor, E0 a stabiliser --- every combo with
-        E2 but without E0 loses suppression; every combo with E0 keeps it.
-        Mechanism unexplained.}
-  \item Utility does not track layer count either: E0123 (4 blocks) is best
-        (1.033), E012 (3 blocks) worst (0.916).
-\end{itemize}
-
-\medskip
-\textbf{Encoder-PKM suppression is a fragile, non-additive property of specific
-blocks --- not a capacity effect.} One configuration makes the model \emph{more}
-vulnerable than baseline.
 \end{frame}
 
 % ---------------------------------------------------------------------------
@@ -404,6 +369,76 @@ post-hoc \texttt{d01} init & SH@10 & removal & UR \\
 \end{frame}
 
 % ---------------------------------------------------------------------------
+\begin{frame}{Encoder placements: suppression does \emph{not} stack}
+Trained-in, poisoned, decoder untouched. spam$\times$ relative to non-PKM:
+\begin{center}
+\begin{tabular}{|l|c|c|c||l|c|c|c|}
+\hline
+layers & N@10 & util$\times$ & spam$\times$ & layers & N@10 & util$\times$ & spam$\times$ \\
+\hline
+E0   & 0.03511 & 0.970 & 0.06 & E01   & 0.03511 & 0.970 & \textbf{0.04} \\
+E1   & 0.03507 & 0.969 & \textbf{0.03} & E012  & 0.03315 & 0.916 & 0.24 \\
+E2   & 0.03596 & 0.994 & 0.61 & E12   & 0.03717 & 1.027 & \alert{1.03} \\
+E3   & 0.03508 & 0.969 & \textbf{0.03} & E23   & 0.03435 & 0.949 & \alert{2.29} \\
+     &         &       &      & E0123 & 0.03739 & \textbf{1.033} & 0.26 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{No combination beats the best single layer} (E1/E3 at 0.03$\times$;
+        best combo E01 at 0.04$\times$). Extra blocks buy nothing.
+  \item \alert{Combining protective layers can destroy the protection.} E12 gives
+        \emph{zero} suppression despite containing E1 (30$\times$ alone); E23
+        \emph{amplifies} the attack (2.29$\times$) despite containing E3.
+  \item \pierre{Pattern: E2 disrupts, E0 stabilises --- every combo with E2 but
+        without E0 loses suppression; every combo with E0 keeps it. Mechanism
+        unexplained.}
+  \item Utility does not track layer count: E0123 (4 blocks) best (1.033),
+        E012 (3 blocks) worst (0.916).
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{PKM vs.\ fresh FFN, out of saturation: the regimes disagree}
+The tie was measured where both arms hit the clean floor. Pushed out of
+saturation they separate --- in \emph{opposite} directions.
+
+\medskip
+\textbf{(A) More destruction --- \texttt{dall}, 4 decoder layers:}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+arm & SH@10 & removal & UR \\
+\hline
+PKM \texttt{dall} @2000   & 0.00000 & 100\%  & 0.891 \\
+PKM \texttt{dall} @10000  & 0.00000 & 100\%  & 0.686 \\
+\textbf{FFN \texttt{dall} @2000}  & 0.00009 & 99.3\% & \textbf{0.964} \\
+FFN \texttt{dall} @10000  & 0.00004 & 99.6\% & 0.877 \\
+\hline
+\end{tabular}
+\end{center}
+\alert{FFN wins by 7 points} and degrades less with extra steps. Where capacity
+should have helped most, it \emph{hurt}.
+
+\medskip
+\textbf{(B) Smaller budget --- \texttt{d01}, same destruction:}
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+steps & PKM SH@10 & PKM UR & FFN SH@10 & FFN UR \\
+\hline
+200        & \textbf{0.00555} & 0.977 & 0.00863 & 0.966 \\
+600        & \textbf{0.00148} & 0.989 & 0.00523 & 0.979 \\
+converged  & 0.00013 (1560 st.) & 0.995 & 0.00022 (3320 st.) & 0.995 \\
+\hline
+\end{tabular}
+\end{center}
+\alert{PKM removes $\sim$1.75$\times$ more at every budget} and converges in
+$<$half the steps.
+\end{frame}
+
+% ---------------------------------------------------------------------------
 \begin{frame}{Sequential unlearning: no drift, for either method}
 Same \emph{total} budget in every arm (chunks $\times$ steps $=$ 3000), same
 forget set --- only the number of sequential requests varies:
@@ -443,10 +478,10 @@ Slot diagnostic on all five \emph{encoder-only} trained-in models:
 \hline
 model & memories & slots used & Jaccard & forget-excl. \\
 \hline
-E01   & 2 & 128 / 128        & 1.000 & 0 \\
-E012  & 3 & 128 / 95 / 32    & 1.000 & 0 \\
-E12   & 2 & 125 / 32         & 1.000 & 0 \\
-E23   & 2 & 32 / 32          & 1.000 & 0 \\
+E01   & 2 & 128 / 128         & 1.000 & 0 \\
+E012  & 3 & 128 / 95 / 32     & 1.000 & 0 \\
+E12   & 2 & 125 / 32          & 1.000 & 0 \\
+E23   & 2 & 32 / 32           & 1.000 & 0 \\
 E0123 & 4 & 96 / 32 / 32 / 32 & 1.000 & 0 \\
 \hline
 \end{tabular}
@@ -458,13 +493,13 @@ encoder/decoder placement, layer count and depth. ($32 = knn$ exactly: those
 memories return the \emph{same} 32 slots for every token.)
 
 \medskip
-\alert{So the E2-disruptor / E0-stabiliser pattern cannot be a memory-content
-effect} --- there is no meaningful memory in any of them. Those layers act as
-low-rank layers.
+\alert{So the E2/E0 pattern cannot be a memory-content effect} --- there is no
+meaningful memory in any of them. Those layers act as low-rank layers.
 
 \medskip
-\pierre{Only healthy memories are post-hoc $\Rightarrow$ it is not \emph{where}
-the memory sits but \emph{how} it was trained: alone, against a frozen backbone.}
+\pierre{Only the post-hoc memories are healthy (59\% coverage, Jaccard 0.38,
+$\sim$3000 forget-exclusive slots) $\Rightarrow$ it is not \emph{where} the memory
+sits but \emph{how} it was trained: alone, against a frozen backbone.}
 \end{frame}
 
 % ---------------------------------------------------------------------------
@@ -487,11 +522,112 @@ Sequential edits             & tie (no drift either way) \\
 budgets.} The post-hoc contribution is therefore the \emph{localised retrain}
 itself --- re-initialise the first two decoder FFNs, retrain on retain data,
 backbone frozen --- with PKM a speed optimisation on top, not the mechanism.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Fixing collapse: what the literature actually says}
+\textbf{Neither paper offers a recipe --- and the reason matters.}
 
 \medskip
-\pierre{Remaining lever for the memory story: ``train the memory in isolation,
-then unfreeze'' --- the one configuration empirically known to produce a healthy
-memory.}
+\textbf{Sparse Memory Finetuning} (\url{https://arxiv.org/abs/2510.15103}) never
+faced collapse: it \emph{inherits} a memory pretrained at scale.
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+their setup & 1.3B base, 1M slots, $k{=}32$, 4 heads, $d_v{=}1024$ \\
+placement & ONE layer, middle of the model (12 of 22) \\
+optimizer & \textbf{SGD, lr 0.1--2} (AdamW for baselines) \\
+selection & TF-IDF over 1000 background batches, $t \in \{25..1000\}$ \\
+\hline
+\end{tabular}
+\end{center}
+No initialisation scheme, no warm-up, no query normalisation, \alert{no slot
+utilisation diagnostics at all}.
+
+\medskip
+\textbf{Memory Layers at Scale} (2412.09764), the source of that layer, mentions
+only \textbf{qk-normalisation} ``when needed'' for instability, plus silu gating
+and a \emph{shared} pool across 3 layers. No load-balancing loss.
+
+\medskip
+\pierre{So the collapse measurement --- and any fix --- is ours. Our lr is
+$10^{-3}$; SMF uses 0.1--2, i.e.\ $100\text{--}1000\times$ larger.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Two candidate fixes, and why collapse self-reinforces}
+\textbf{The trap.} At init the values are random, so \emph{which} slots the router
+picks barely changes the loss $\Rightarrow$ almost no gradient pressure on the
+query net $\Rightarrow$ it collapses to a near-constant. After that only the
+surviving slots ever train, which reinforces the collapse.
+
+\medskip
+\textbf{(1) \texttt{query\_norm=batchnorm}} (\texttt{track\_running\_stats=False},
+so the padding-corrupted running stats that motivated disabling it never exist):
+\begin{center}
+\begin{tabular}{|l|c|c|}
+\hline
+query\_norm & token-shared $\|\mu\|^2$ & distinct top-$k$ patterns \\
+\hline
+none      & 144.45 & 59 / 2048 \\
+layernorm & 12.56  & 51 / 2048 \quad(\emph{worse}) \\
+\textbf{batchnorm} & \textbf{0.000} & \textbf{118 / 2048} \\
+\hline
+\end{tabular}
+\end{center}
+Zeroes the token-shared component exactly and doubles diversity ---
+\alert{but still concentrated, so only a PARTIAL fix.}
+
+\medskip
+\textbf{(2) \texttt{warmup\_noise}} --- noisy top-$k$ gating: perturb routing
+scores for the first $N$ steps so selection varies and gradient spreads, at
+\emph{identical} cost. On a toy that reproduces collapse:
+\begin{center}
+\begin{tabular}{|l|c|}
+\hline
+config & slots touched / 4096 \\
+\hline
+baseline  & \alert{33} \quad(0.8\%, collapse reproduced) \\
+noise 0.5 & 1776 \\
+\textbf{noise 2.0} & \textbf{4082} \quad(99.7\%) \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Collapse fix: status --- \alert{verdict NOT in yet}}
+\textbf{What is measured:} only the two synthetic checks on the previous slide
+(query geometry; slot spread \emph{during} the warm-up window on a toy module).
+
+\medskip
+\alert{What is NOT measured:} whether either knob raises slot utilisation in an
+actually-trained TIGER model above the 0.012--0.049\% seen in all 8 layouts ---
+and critically, \textbf{whether utilisation survives after the noise switches
+off.} The router may re-collapse once selection becomes deterministic again. The
+toy cannot answer this.
+
+\medskip
+In flight: 4 capped runs on E1 (\texttt{max\_steps=4000}), then the slot
+diagnostic on each.
+\begin{center}
+\begin{tabular}{|l|l|c|}
+\hline
+arm & config & status \\
+\hline
+base  & ---                                 & \strun \\
+bn    & \texttt{query\_norm=batchnorm}       & \strun \\
+wu    & \texttt{warmup\_noise=2.0}, 2000 st. & \sttodo \\
+bnwu  & both                                 & \sttodo \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\pierre{The first warm-up attempt raised \texttt{knn} instead of adding noise.
+Lookup cost scales as $knn^2$, so $knn{=}256$ built a $(\text{rows},65536)$
+tensor, overflowed int32 indexing in \texttt{topk} and aborted with ``CUDA error:
+illegal memory access''. \texttt{warmup\_knn} is now hard-capped at 64.}
 \end{frame}
 
 % ===========================================================================
@@ -509,6 +645,9 @@ Full retain stream (\texttt{retain\_source})     & \stdone \\
 Slot access counters + diagnostics               & \stdone \\
 Top-$t$ selection (AF / AF-IHF / grad / grad+dot)& \stdone \\
 Optimizer + init knobs                           & \stdone \\
+Anti-collapse knobs (\texttt{query\_norm}, \texttt{warmup\_noise}) & \stdone \\
+FFN-reinit control (\texttt{ffn\_reinit\_layers})  & \stdone \\
+Sequential-unlearning comparison                  & \stdone \\
 Placement screen (post-hoc, 8 layers)            & \stdone \\
 Placement screen (trained-in, 8 layers)          & \stdone \\
 Architecture study + 168-run unlearning sweeps   & \stdone \\
@@ -525,9 +664,9 @@ Clean-baseline audit (seed noise)                & \stdone \\
 \hline
 \# & item & status \\
 \hline
-1 & \textbf{FFN-reinit control} instead of PKM replace   & \stdone \\
+1 & \textbf{FFN-reinit control} instead of PKM replace   & \strun \\
 2 & Other unlearning algorithms under \texttt{pkm\_only} & \sttodo \\
-3 & Fix memory collapse (routing, not capacity)          & \sttodo \\
+3 & Fix memory collapse (routing, not capacity)          & \strun \\
 4 & Top-$t$ sweep on healthy (post-hoc) memory           & \sttodo \\
 5 & AF-IHF vs.\ grad vs.\ access baseline ablation       & \sttodo \\
 6 & Adam vs.\ SGD \emph{under} selection                 & \sttodo \\
@@ -568,7 +707,7 @@ arm & SH@10 & removal & UR \\
 \hline
 poison baseline               & 0.01274 & ---    & 0.962 \\
 PKM \texttt{d01} $+$ rebuild  & 0.00013 & 99.0\% & 0.995 \\
-fresh FFN \texttt{d01} (control) & 0.00022 & 98.2\% & 0.995 \\
+\textbf{fresh FFN \texttt{d01} (control)} & \textbf{0.00022} & \textbf{98.2\%} & \textbf{0.995} \\
 \hline
 \end{tabular}
 \end{center}
@@ -577,9 +716,9 @@ fresh FFN \texttt{d01} (control) & 0.00022 & 98.2\% & 0.995 \\
 \alert{Why this decides the framing:} the removal already appears to come from
 the \emph{retain-only rebuild}, not from the memory --- ablation alone removes
 only 12\%, and \texttt{add} mode (FFN left intact) still removes 98.6\%.
-\alert{Result: tied.} Utility identical to 4 decimals (0.03745 vs 0.03746),
-removal 99.0\% vs 98.2\%. A plain FFN at \textbf{1/25th} the parameter budget
-(2.6M vs 67M) does it just as well.
+\alert{Result: tied.} Utility identical to 4 decimals (0.03745 vs.\ 0.03746),
+removal 99.0\% vs.\ 98.2\%. A plain FFN at \textbf{1/25th} the parameter budget
+(2.6M vs.\ 67M) does it just as well.
 
 \medskip
 \textbf{So the headline post-hoc result is a \emph{localised retrain}, not a
@@ -587,81 +726,10 @@ memory method} --- and it needs no PKM machinery at all.
 
 \medskip
 \pierre{But the test is SATURATED: both arms sit at the clean floor. A tie under
-saturation shows this task cannot separate them, not that they are equivalent.
-See the next slide.}
+saturation shows this task cannot separate them, not that they are equivalent.}
 \pierre{Implemented as \texttt{model.ffn\_reinit\_layers} $+$
 \texttt{unlearning.update\_scope=ffn\_only}; the reinit runs AFTER the ckpt load
 (FFN weights are in the ckpt, PKM's are not).}
-\end{frame}
-
-% ---------------------------------------------------------------------------
-\begin{frame}{Where could post-hoc PKM still beat a fresh FFN?}
-The tie was measured in a \textbf{saturated} regime --- both arms reach the clean
-floor, so the task has no headroom to rank them. To find out whether the sparse
-memory is ever worth its 25$\times$ parameter budget, we need a setting where
-\emph{neither} saturates:
-
-\begin{center}
-\begin{tabular}{|l|l|}
-\hline
-regime & why PKM might win \\
-\hline
-More destruction (\texttt{dall}, 4 layers) & more capacity to rebuild with \\
-Smaller step budget & which recovers \emph{faster}? \\
-Stronger attack / other strategies & harder target to erase \\
-\textbf{Sequential requests} & \textbf{repeated edits without drift} \\
-\hline
-\end{tabular}
-\end{center}
-
-\medskip
-\alert{The sequential setting is the real test of the modular claim:} a
-repeatedly-retrained FFN should accumulate drift, whereas a sparse memory can in
-principle localise each edit. That is the SMF/continual-learning argument, and it
-is the one regime we have not touched.
-\end{frame}
-
-% ---------------------------------------------------------------------------
-\begin{frame}{Answer: the two regimes disagree}
-\textbf{(A) More destruction --- \texttt{dall}, 4 decoder layers:}
-\begin{center}
-\begin{tabular}{|l|c|c|c|}
-\hline
-arm & SH@10 & removal & UR \\
-\hline
-PKM \texttt{dall} @2000   & 0.00000 & 100\%  & 0.891 \\
-PKM \texttt{dall} @10000  & 0.00000 & 100\%  & 0.686 \\
-\textbf{FFN \texttt{dall} @2000}  & 0.00009 & 99.3\% & \textbf{0.964} \\
-FFN \texttt{dall} @10000  & 0.00004 & 99.6\% & 0.877 \\
-\hline
-\end{tabular}
-\end{center}
-\alert{FFN wins by 7 points} and degrades less with extra steps. Where capacity
-should have helped most, it \emph{hurt}.
-
-\medskip
-\textbf{(B) Smaller budget --- \texttt{d01}, same destruction:}
-\begin{center}
-\begin{tabular}{|l|c|c|c|c|}
-\hline
-steps & PKM SH@10 & PKM UR & FFN SH@10 & FFN UR \\
-\hline
-200        & \textbf{0.00555} & 0.977 & 0.00863 & 0.966 \\
-600        & \textbf{0.00148} & 0.989 & 0.00523 & 0.979 \\
-converged  & 0.00013 (1560 st.) & 0.995 & 0.00022 (3320 st.) & 0.995 \\
-\hline
-\end{tabular}
-\end{center}
-\alert{PKM removes $\sim$1.75$\times$ more at every budget} and converges in
-$<$half the steps.
-
-\medskip
-\begin{center}
-\textbf{PKM buys SPEED, not final QUALITY.}
-\end{center}
-\pierre{Budget-constrained $\Rightarrow$ PKM. Converged, or heavy damage
-$\Rightarrow$ FFN (simpler, 25$\times$ fewer params). Single seed; the
-\texttt{dall} gap wants replication, the budget gap is more robust.}
 \end{frame}
 
 % ---------------------------------------------------------------------------

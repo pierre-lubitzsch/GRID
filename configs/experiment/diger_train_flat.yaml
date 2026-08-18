@@ -1,0 +1,538 @@
+# @package _global_
+data_dir: ???
+semantic_id_path: ???
+num_hierarchies: ???
+# DIGER only. Frozen [N, D] item content features -- the SAME dense embeddings
+# the RQ quantizer was fit on (e.g.
+# embeddings/beauty_merged_predictions_tensor_latest.pt, [12101, 2048]). Rows
+# must be aligned to item id with semantic_id_path, or every tokenized item is
+# the wrong one (the model raises if the row counts disagree).
+item_content_embeddings_path: ???
+sequence_length: 120
+# Poison forget_manifest used to source the spam target set I_t for the SH@k /
+# ASI@k spam-exposure metrics. Defaults to the dataset's own manifest (present
+# for poison datasets). For a clean-baseline run, override with the matching
+# poison dataset's manifest. Missing file -> SH/ASI silently skipped.
+spam_forget_manifest: ${data_dir}/forget_manifest.json
+
+task_name: train
+id: ${now:%Y-%m-%d}/${now:%H-%M-%S}
+tags:
+- amazon-p5-gr-train
+- diger
+train: true
+test: true
+ckpt_path: null
+seed: 2
+data_loading:
+  features_config:
+    features:
+    - name: sequence_data
+      num_placeholder_tokens: 0
+      semantic_ids: ???
+      is_item_ids: true
+      type:
+        _target_: torch.__dict__.get
+        _args_:
+        - int32
+    - name: embedding
+      type:
+        _target_: torch.__dict__.get
+        _args_:
+        - float32
+    - name: text
+      type:
+        _target_: torch.__dict__.get
+        _args_:
+        - bytes
+    - name: user_id
+      is_item_ids: true
+      type:
+        _target_: torch.__dict__.get
+        _args_:
+        - int32
+  dataset_config:
+    dataset:
+      _target_: src.data.loading.components.interfaces.SemanticIDDatasetConfig
+      user_id_field: user_id
+      min_sequence_length: 1
+      iterate_per_row: true
+      keep_user_id: true
+      features_to_consider: ${extract_fields_from_list_of_dicts:${data_loading.features_config.features},
+        "name", False, "is_item_ids", "True"}
+      num_placeholder_tokens_map: ${create_map_from_list_of_dicts:${data_loading.features_config.features},
+        "name", "num_placeholder_tokens"}
+      semantic_id_map: ${create_map_from_list_of_dicts:${data_loading.features_config.features},
+        "name", "semantic_ids"}
+      data_iterator:
+        _target_: src.data.loading.components.iterators.TFRecordIterator
+      preprocessing_functions:
+      - _target_: src.data.loading.components.pre_processing.filter_features_to_consider
+        _partial_: true
+      - _target_: src.data.loading.components.pre_processing.convert_to_dense_numpy_array
+        _partial_: true
+      - _target_: src.data.loading.components.pre_processing.convert_fields_to_tensors
+        _partial_: true
+      - _target_: src.data.loading.components.pre_processing.map_sparse_id_to_semantic_id
+        _partial_: true
+        features_to_apply:
+        - sequence_data
+        num_hierarchies: ${model.num_hierarchies}
+  train_dataloader_config:
+    dataloader:
+      _target_: src.data.loading.components.interfaces.SequenceDataloaderConfig
+      dataset_class:
+        _target_: src.data.loading.components.dataloading.UnboundedSequenceIterable
+        _partial_: true
+      data_folder: ${paths.data_dir}/training
+      should_shuffle_rows: true
+      labels:
+        sequence_data:
+          transform:
+            _target_: src.data.loading.components.label_function.NextKTokenMasking
+            next_k: ${model.num_hierarchies}
+      batch_size_per_device: 32
+      num_workers: 1
+      timeout: 60
+      assign_files_by_size: false
+      oov_token: null
+      masking_token: -1
+      sequence_length: ${sequence_length}
+      padding_token: -1
+      drop_last: true
+      persistent_workers: false
+      collate_fn:
+        _target_: src.data.loading.components.collate_functions.collate_with_sid_causal_duplicate
+        _partial_: true
+        sequence_length: ${data_loading.train_dataloader_config.dataloader.sequence_length}
+        padding_token: ${data_loading.train_dataloader_config.dataloader.padding_token}
+        sequence_field_name: sequence_data
+        sid_hierarchy: ${model.num_hierarchies}
+        max_batch_size: 512
+      dataset_config:
+        _target_: src.data.loading.components.interfaces.SemanticIDDatasetConfig
+        user_id_field: user_id
+        min_sequence_length: 1
+        iterate_per_row: true
+        keep_user_id: true
+        features_to_consider: ${extract_fields_from_list_of_dicts:${data_loading.features_config.features},
+          "name", False, "is_item_ids", "True"}
+        num_placeholder_tokens_map: ${create_map_from_list_of_dicts:${data_loading.features_config.features},
+          "name", "num_placeholder_tokens"}
+        semantic_id_map:
+          sequence_data:
+            _target_: torch.load
+            _args_:
+            - _target_: src.utils.file_utils.open_local_or_remote
+              file_path: ${semantic_id_path}
+              mode: rb
+        data_iterator:
+          _target_: src.data.loading.components.iterators.TFRecordIterator
+        preprocessing_functions:
+        - _target_: src.data.loading.components.pre_processing.filter_features_to_consider
+          _partial_: true
+        - _target_: src.data.loading.components.pre_processing.convert_to_dense_numpy_array
+          _partial_: true
+        - _target_: src.data.loading.components.pre_processing.convert_fields_to_tensors
+          _partial_: true
+        - _target_: src.data.loading.components.pre_processing.map_sparse_id_to_semantic_id
+          _partial_: true
+          features_to_apply:
+          - sequence_data
+          num_hierarchies: ${model.num_hierarchies}
+      assign_all_files_per_worker: true
+  val_dataloader_config:
+    dataloader:
+      _target_: src.data.loading.components.interfaces.SequenceDataloaderConfig
+      dataset_class:
+        _target_: src.data.loading.components.dataloading.UnboundedSequenceIterable
+        _partial_: true
+      data_folder: ${paths.data_dir}/evaluation
+      should_shuffle_rows: false
+      labels:
+        sequence_data:
+          transform:
+            _target_: src.data.loading.components.label_function.NextKTokenMasking
+            next_k: ${model.num_hierarchies}
+      batch_size_per_device: 8
+      num_workers: 1
+      timeout: 60
+      assign_files_by_size: true
+      oov_token: ${data_loading.train_dataloader_config.dataloader.oov_token}
+      masking_token: ${data_loading.train_dataloader_config.dataloader.masking_token}
+      sequence_length: ${data_loading.train_dataloader_config.dataloader.sequence_length}
+      padding_token: ${data_loading.train_dataloader_config.dataloader.padding_token}
+      drop_last: false
+      persistent_workers: false
+      collate_fn:
+        _target_: src.data.loading.components.collate_functions.collate_fn_train
+        _partial_: true
+        sequence_length: ${data_loading.train_dataloader_config.dataloader.sequence_length}
+        padding_token: ${data_loading.train_dataloader_config.dataloader.padding_token}
+      dataset_config: ${data_loading.train_dataloader_config.dataloader.dataset_config}
+      pin_memory: false
+  test_dataloader_config:
+    dataloader:
+      _target_: src.data.loading.components.interfaces.SequenceDataloaderConfig
+      dataset_class:
+        _target_: src.data.loading.components.dataloading.UnboundedSequenceIterable
+        _partial_: true
+      data_folder: ${paths.data_dir}/testing
+      should_shuffle_rows: false
+      labels:
+        sequence_data:
+          transform:
+            _target_: src.data.loading.components.label_function.NextKTokenMasking
+            next_k: ${model.num_hierarchies}
+      batch_size_per_device: 8
+      num_workers: 1
+      timeout: 60
+      assign_files_by_size: true
+      oov_token: ${data_loading.train_dataloader_config.dataloader.oov_token}
+      masking_token: ${data_loading.train_dataloader_config.dataloader.masking_token}
+      sequence_length: ${data_loading.train_dataloader_config.dataloader.sequence_length}
+      padding_token: ${data_loading.train_dataloader_config.dataloader.padding_token}
+      drop_last: false
+      persistent_workers: false
+      collate_fn:
+        _target_: src.data.loading.components.collate_functions.collate_fn_train
+        _partial_: true
+        sequence_length: ${data_loading.train_dataloader_config.dataloader.sequence_length}
+        padding_token: ${data_loading.train_dataloader_config.dataloader.padding_token}
+      dataset_config: ${data_loading.train_dataloader_config.dataloader.dataset_config}
+      pin_memory: false
+  datamodule:
+    _target_: src.data.loading.datamodules.sequence_datamodule.SequenceDataModule
+    train_dataloader_config: ${..train_dataloader_config.dataloader}
+    val_dataloader_config: ${..val_dataloader_config.dataloader}
+    test_dataloader_config: ${..test_dataloader_config.dataloader}
+model:
+  huggingface_model:
+    _target_: transformers.T5EncoderModel
+    config:
+      _target_: transformers.T5Config
+      vocab_size: 256
+      d_model: 128
+      num_heads: 6
+      dropout_rate: 0.15
+      d_ff: 1024
+      d_kv: 64
+      num_layers: 4
+  _target_: src.models.modules.semantic_id.diger_generation_model.DigerEncoderDecoder
+  # --- DIGER (arXiv:2601.19711) -------------------------------------------
+  # Frozen content features the differentiable tokenizer indexes.
+  item_content_embeddings:
+    _target_: torch.load
+    _args_:
+    - _target_: src.utils.file_utils.open_local_or_remote
+      file_path: ${item_content_embeddings_path}
+      mode: rb
+  # L = L_gen (SDUD-weighted) + lambda_vq L_vq + lambda_recon L_recon
+  diger_lambda_vq: 1.0
+  diger_lambda_recon: 1.0
+  # Standard-deviation uncertainty decay: sigma* = max(0, sqrt(L_gen) - lambda)
+  # self-anneals the generation term, so early high-variance recommendation
+  # gradients cannot wreck the codebook before it stabilises.
+  # FrqUD and SDUD are ALTERNATIVE mechanisms in the paper (separate rows of its
+  # Table 2), not a stack. On B-Shop -- which IS this dataset (22,363 users /
+  # 12,101 items) -- FrqUD wins: R@10 0.0683 vs 0.0657. So frqud is the default.
+  #   frqud | sdud | both | none | no_noise
+  # no_noise reproduces the paper's sharpest ablation (R@10 0.0683 -> 0.0283).
+  diger_uncertainty_decay: frqud
+  diger_use_sdud: true      # only takes effect when the mode selects SDUD
+  diger_sdud_lambda: 1.4    # paper grid {1.0, 1.2, 1.4, 1.8, 2.0}
+  # The tokenizer gets its OWN, much lower lr: the paper searches the recommender
+  # over {1e-2 .. 5e-4} but the tokenizer over {1e-4 .. 1e-6}. At the
+  # recommender's rate the identifier space is rewritten faster than the
+  # recommender can learn to read it. null disables the split (an ablation).
+  diger_tokenizer_lr: 1.0e-4
+  diger_tokenizer_weight_decay: null
+  # 0 = commit hard codes ONLY at train end. Raising this refreshes the model's
+  # ids mid-run but NOT the dataloader's labels unless workers are rebuilt --
+  # see the diger_generation_model docstring before changing it.
+  diger_commit_every_n_epochs: 0
+  # k-means seeding of the codebooks. NOT optional in practice: from a random
+  # codebook 11,845 of beauty's 12,101 items land in ONE c0..c2 bucket, which
+  # starves the recommender of identifier signal and overflows the dedup digit.
+  diger_init_codebooks: true
+  diger_init_seed: 0
+  # Stage 1: fit the tokenizer encoder/decoder as a plain autoencoder before
+  # seeding the codebooks. REQUIRED -- a random 2048-512-256-128-32 encoder maps
+  # all 12,101 beauty items to mean pairwise cosine 0.99995 (raw features:
+  # 0.8617), so k-means on top partitions noise and the first gradient step
+  # erases it. DIGER removes the FREEZE after stage 1, not stage 1 itself.
+  diger_pretrain_steps: 2000
+  diger_pretrain_lr: 1.0e-3
+  tokenizer_kwargs:
+    # Match the repo's OWN RQ-VAE (rqvae_train_flat.yaml): 2048-768-256-128-64
+    # with a BatchNorm1d + normalize front. DIGER's tokenizer IS an RQ-VAE, so it
+    # should be the same one, not an ad-hoc variant.
+    latent_dim: 64
+    encoder_hidden: [768, 256, 128]
+    # REQUIRED. Without standardizing the 2048-dim content features first, any
+    # deep encoder collapses the catalog to mean pairwise cosine 0.99995 and the
+    # codebook is fitted on noise. With it: 0.82 (raw features are 0.86).
+    # standardize = fixed (x-mean)/std fitted once from the frozen catalog.
+    # Preferred over the repo RQ-VAE's batchnorm here because the features never
+    # change, and batchnorm's eval-mode running stats start as an identity --
+    # which would make the FIRST commit fit ids on collapsed latents.
+    input_norm: standardize
+    tau: 2.0              # Gumbel-Softmax temperature (paper: tuned to 2.0)
+    frq_decay_ratio: 2.0  # FrqUD threshold r (paper grid {1.0 .. 3.0})
+    ema_beta: 0.25        # usage-frequency EMA (paper: 0.25 everywhere)
+    commitment_weight: 0.25
+    similarity: neg_l2    # neg_l2 | cosine
+    # Match the repo's RQ-KMeans recursion (r^1 = normalize(z),
+    # r^(l+1) = normalize(r^l - c)). Required here: without it the latents sit in
+    # a ball of radius ~2e-3 and the paper's 1e-4 tokenizer lr collapses the
+    # codebook within a handful of steps.
+    normalize_inputs: true
+    normalize_residuals: false   # RQ-VAE convention (RQ-KMeans uses true)
+  feature_to_model_input_map:
+    sequence_data: input_ids
+    user_id: user_id
+  postprocessor: null
+  aggregator: null
+  loss_function: ${loss.loss_function}
+  optimizer: ${optim.optimizer}
+  scheduler: ${optim.scheduler}
+  evaluator: ${eval.evaluator}
+  weight_tying: true
+  compile: false
+  decoder:
+    _target_: transformers.models.t5.modeling_t5.T5Stack
+    config:
+      _target_: transformers.models.t5.configuration_t5.T5Config
+      vocab_size: ${model.huggingface_model.config.vocab_size}
+      d_model: ${model.huggingface_model.config.d_model}
+      num_heads: ${model.huggingface_model.config.num_heads}
+      dropout_rate: 0.15
+      d_ff: ${model.huggingface_model.config.d_ff}
+      d_kv: ${model.huggingface_model.config.d_kv}
+      num_layers: 4
+      is_decoder: true
+      is_encoder_decoder: false
+    embed_tokens:
+      _target_: torch.nn.Embedding
+      num_embeddings: ${model.huggingface_model.config.vocab_size}
+      embedding_dim: ${model.huggingface_model.config.d_model}
+  num_hierarchies: ${num_hierarchies}
+  num_user_bins: null
+  codebooks: ${data_loading.train_dataloader_config.dataloader.dataset_config.semantic_id_map.sequence_data}
+  # Input-side item-token aggregation ("Longer IDs for finer-grained
+  # neighborhoods", Jul 3). For long RQ IDs (num_hierarchies in {8, 16}) the
+  # encoder would otherwise see num_hierarchies token positions per history item.
+  # When enabled, each item's token embeddings are merged into ONE encoder input
+  # vector (the decoder still generates the full num_hierarchies-token ID).
+  #   null / none  -> OFF: per-token + separator-token layout (original TIGER)
+  #   mean         -> option 1: mean pooling -> ONE vector per item
+  #   attentive    -> option 2: ACERec Attentive Token Merger (arXiv 2602.13573):
+  #                   learnable positional embeddings + k learnable latent queries
+  #                   + cross-attention + MLP f_out -> k latent tokens per item
+  #                   (compression num_hierarchies -> k; default k=4). The paper's
+  #                   per-item Intent Token is OFF by default (it is a prediction
+  #                   anchor in ACERec's decoder; redundant under TIGER's separate
+  #                   autoregressive decoder). Set intent_token:true for parity.
+  # For attentive, pass a mapping to tune it, e.g. via Hydra:
+  #   'model.item_token_aggregation={type:attentive,num_query_tokens:4,num_heads:8,dropout:0.0,mlp_ratio:4,positional_embedding:true,intent_token:false,content_adaptive_queries:false}'
+  # NOTE: eval/unlearn configs must mirror this so the checkpoint schema matches.
+  item_token_aggregation: null
+  mlp_layers: 2
+  # Product-Key Memory (PKM) layers on selected T5 feed-forward sub-layers.
+  # pkm_layers selects which FFNs to target:
+  #   null                                  -> no PKM
+  #   all                                   -> every FFN in encoder and decoder
+  #   {encoder: <sel>, decoder: <sel>}      -> per-subtree, each <sel> is
+  #                                            null | all | [block_ids]
+  # pkm_mode controls how the PKM relates to the FFN:
+  #   replace -> swap the FFN for a PKM
+  #   add     -> keep the FFN and run a PKM in parallel on the same input,
+  #              summing their outputs
+  # NOTE: in 'replace' mode the targeted layers are excluded from the
+  # mlp_layers bloating above. The value store holds pkm_params.n_keys ** 2
+  # vectors of size d_model, so n_keys is the dominant capacity/parameter knob.
+  #
+  # DEFAULT: no PKM. Enable it explicitly via a Hydra override, e.g.
+  #   'model.pkm_layers={encoder:null,decoder:[0,1]}'
+  # or via the PKM_DECODER / PKM_ENCODER env knobs in run_tiger_train.sh.
+  pkm_layers: null
+  pkm_mode: replace
+  pkm_params:
+    # Product-key dim = d_model (=k_dim): two sub-keys of d_model/2 each are
+    # concatenated into one product key of size d_model. Value dim is fixed to
+    # d_model by the layer wrapper.
+    k_dim: ${model.huggingface_model.config.d_model}
+    heads: 4            # independent reading heads (outputs summed)
+    knn: 32             # memory slots read per head
+    n_keys: 512         # sub-keys per half -> n_keys**2 total values
+    query_batchnorm: false
+    input_dropout: 0.0
+    query_dropout: 0.0
+    value_dropout: 0.0
+    sparse: false
+    # Value-table init. normal (default) = N(0, v_dim**-0.5) * value_init_scale;
+    # zeros = the memory is an exact NO-OP at step 0.
+    #   post-hoc ADD adapter  -> zeros (LoRA convention: start at the trained
+    #     model, learn a pure correction).
+    #   post-hoc REPLACE      -> zeros deletes the FFN rather than randomising
+    #     it, a cleaner start for a rebuild than injecting noise.
+    # CAVEAT: with all-zero values, d(out)/d(scores)=0, so query_proj and keys
+    # get NO gradient at step 0 (values still learn). Since collapse is a
+    # ROUTING failure, prefer value_init_scale=0.01 over exact zeros whenever
+    # the memory must ALSO learn to route (i.e. trained-in).
+    value_init: normal
+    value_init_scale: 1.0
+    # --- anti-collapse knobs (see WORKFLOW_PKM.md section H/M) ---
+    # Trained-in PKMs COLLAPSE: every token and head selects the same 32 slots
+    # (0.012-0.049% utilisation, measured across all 8 encoder/decoder layouts).
+    # query_norm: none (default) | batchnorm | layernorm.
+    #   batchnorm uses track_running_stats=False, so batch stats apply at train
+    #   AND eval -- the padding-corrupted running stats that motivated leaving
+    #   query_batchnorm=false never exist. Measured: it drives the token-SHARED
+    #   query component to exactly 0 and roughly DOUBLES routing diversity, but
+    #   is only a PARTIAL fix on its own. Caveat: eval becomes batch-composition
+    #   dependent, and it ADDS q_norm.weight/bias to the state_dict (so such a
+    #   ckpt only loads into a query_norm model, and vice versa).
+    #   layernorm cannot remove a token-shared direction -- measured slightly
+    #   WORSE than none. Kept only for completeness.
+    query_norm: none
+    # Dense-ish warm-up: read warmup_knn slots per head for the first
+    # warmup_steps TRAINING forward passes, then revert to knn. At init the
+    # values are random, so routing barely affects the loss -> no gradient
+    # pressure on the query net -> it collapses, after which only the surviving
+    # slots train and the collapse self-reinforces. Touching many more slots
+    # early makes slot CONTENTS meaningful while the router can still move.
+    # 0 disables. Adds nothing to the state_dict.
+    warmup_knn: 0
+    warmup_steps: 0
+  # Optional separate optimizer param group for the PKM parameters (memory
+  # keys/values + query net). null (default) => PKM shares the single global
+  # optimizer group. Set a dict of per-group optimizer kwargs to give PKM its
+  # own lr / weight_decay, e.g. to try a higher-lr SGD-style update on the
+  # memory: 'model.pkm_param_group={lr:0.05,weight_decay:0.0}'. The optimizer
+  # *class* is the shared one from optim.optimizer (override _target_ to SGD to
+  # try SGD): both groups use that class, PKM just gets these overrides.
+  pkm_param_group: null
+callbacks:
+  model_checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: checkpoint_{epoch:03d}_{step:06d}
+    monitor: val/recall@5
+    verbose: true
+    # Keep a 'last.ckpt' alongside the best-by-val ckpt: the stable resume
+    # anchor for the 2-day-wall resume chains (best-by-val can be much older
+    # than the latest training state).
+    save_last: true
+    save_top_k: 1
+    mode: max
+    auto_insert_metric_name: true
+    save_weights_only: false
+    every_n_train_steps: null
+    train_time_interval: null
+    every_n_epochs: null
+    save_on_train_epoch_end: false
+  early_stopping:
+    _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: ${callbacks.model_checkpoint.monitor}
+    min_delta: 0.0
+    patience: 10
+    verbose: true
+    mode: ${callbacks.model_checkpoint.mode}
+    strict: true
+    check_finite: true
+    stopping_threshold: null
+    divergence_threshold: null
+    check_on_train_epoch_end: false
+  model_summary:
+    _target_: lightning.pytorch.callbacks.RichModelSummary
+    max_depth: -1
+  restart_job:
+    _target_: src.utils.restart_job.RestartAndLoadCheckpointCallback
+    metadata_dir: ${paths.metadata_dir}
+  # Save/restore python/numpy/torch/CUDA RNG states in checkpoints so a run
+  # resumed via ckpt_path continues reproducibly (Lightning does not persist
+  # RNG states itself). Needed for the multi-sbatch-job resume chains that work
+  # around the 2-day wall limit (RESUME_FROM in run_tiger_train.sh).
+  rng_state:
+    _target_: src.utils.rng_state_callback.RngStateCallback
+logger:
+  csv:
+    _target_: lightning.pytorch.loggers.csv_logs.CSVLogger
+    save_dir: ${paths.output_dir}
+    name: csv/
+    prefix: ''
+trainer:
+  _target_: lightning.pytorch.trainer.Trainer
+  default_root_dir: ${paths.output_dir}
+  min_steps: 1
+  max_steps: 320000
+  max_epochs: 10
+  accelerator: gpu
+  devices: -1
+  num_nodes: 1
+  precision: 32-true
+  enable_progress_bar: false
+  log_every_n_steps: 100
+  val_check_interval: 1600
+  deterministic: false
+  accumulate_grad_batches: 16
+  profiler:
+    _target_: lightning.pytorch.profilers.PassThroughProfiler
+  strategy: ddp
+  sync_batchnorm: true
+  num_sanity_val_steps: 0
+  min_epochs: 0
+paths:
+  root_dir: .
+  data_dir: ${data_dir}
+  log_dir: ${paths.root_dir}/logs
+  output_dir: ${hydra:runtime.output_dir}
+  work_dir: ${hydra:runtime.cwd}
+  profile_dir: ${hydra:run.dir}/profile_output
+  metadata_dir: ${paths.output_dir}/metadata
+extras:
+  ignore_warnings: false
+  enforce_tags: true
+  print_config_warnings: true
+  print_config: true
+loss:
+  loss_function:
+    _target_: torch.nn.CrossEntropyLoss
+optim:
+  optimizer:
+    _target_: torch.optim.Adam
+    _partial_: true
+    lr: 0.001
+    weight_decay: 0.0001
+  scheduler: null
+eval:
+  evaluator:
+    _target_: src.components.eval_metrics.SIDRetrievalEvaluator
+    top_k_list:
+    - 5
+    - 10
+    metrics:
+      ndcg:
+        _target_: src.components.eval_metrics.NDCG
+        _partial_: true
+      recall:
+        _target_: src.components.eval_metrics.Recall
+        _partial_: true
+    # Spam-exposure metrics (SH@k, ASI@k). Skipped automatically if the
+    # forget_manifest is absent (e.g. clean dataset) -- point spam_forget_manifest
+    # at the poison dataset's manifest to measure clean-model baselines too.
+    spam_metrics:
+      SH:
+        _target_: src.components.eval_metrics.SpamHitRate
+        _partial_: true
+      ASI:
+        _target_: src.components.eval_metrics.AvgSpamItems
+        _partial_: true
+      TPM:
+        _target_: src.components.eval_metrics.TargetProbMass
+        _partial_: true
+    forget_manifest_path: ${spam_forget_manifest}
+    semantic_id_path: ${semantic_id_path}
+    num_hierarchies: ${num_hierarchies}
+

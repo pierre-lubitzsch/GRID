@@ -160,8 +160,19 @@ echo "[$(date -Is)] Merge complete: ${PICKLE_DIR}/merged_predictions_tensor.pt"
 # non-default RKMEANS_HIER would silently OVERWRITE it with a different-L tensor,
 # so install those to the per-L dir embeddings/<dataset>_L<L>/ instead (same
 # layout run_generate_sid.sh uses).
-if [ "${RKMEANS_HIER}" = "3" ]; then
+# The same reasoning applies to the QUANTIZER: the canonical tensor is the
+# RKMEANS one that every recorded TIGER run, unlearning sweep and results table
+# reads. An rqvae/rvq tensor at the same L would overwrite it in place and
+# silently re-point all of them at a DIFFERENT identifier space -- with no error
+# and no way to tell from the run dirs. Install those beside it instead.
+if [ "${RKMEANS_HIER}" = "3" ] && [ "${QUANTIZER}" = "rkmeans" ]; then
   bash "${GRID_DIR}/scripts/install_semantic_id_tensor.sh" "${DATASET}" "${PICKLE_DIR}/merged_predictions_tensor.pt"
+elif [ "${QUANTIZER}" != "rkmeans" ]; then
+  DEST_DIR="embeddings/${DATASET}_${QUANTIZER}"
+  [ "${RKMEANS_HIER}" = "3" ] || DEST_DIR="${DEST_DIR}_L$(( RKMEANS_HIER + 1 ))"
+  mkdir -p "${DEST_DIR}"
+  cp -f "${PICKLE_DIR}/merged_predictions_tensor.pt" "${DEST_DIR}/merged_predictions_tensor.pt"
+  echo "Installed ${QUANTIZER} tensor -> ${DEST_DIR}/merged_predictions_tensor.pt (canonical embeddings/${DATASET}/ left untouched)"
 else
   L=$(( RKMEANS_HIER + 1 ))
   DEST_DIR="embeddings/${DATASET}_L${L}"

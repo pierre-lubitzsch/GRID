@@ -220,6 +220,18 @@ unlearning:
   # that says so explicitly.
   code_lr_scale: 1.0
   adaptive_code_lr_scale: 1.0
+  # Multiplier on the learning rate for the STABLE (coarse) code positions
+  # [0, stable_codes) only: SID table rows [0, stable_codes*K) and the decoder
+  # heads decoder_mlp[:stable_codes]. Mirror of adaptive_code_lr_scale.
+  #
+  # Why it exists: adaptive_code_lr_scale measured inert across 270 runs on all
+  # three strata, because the adaptive TAIL barely moves anyway (mean |delta|
+  # 3.0e-04 vs 5.9e-04 on the stable rows, and the last hierarchy is only a
+  # dedup digit). The coarse codes are the ones ~47 items share on average at
+  # width 256, so they are where a code update is genuinely non-local -- and the
+  # adaptive knob never touched them. Composes with code_lr_scale and
+  # adaptive_code_lr_scale; 1.0 (default) preserves current behaviour exactly.
+  stable_code_lr_scale: 1.0
 
   # Kookmin (gradient-guided reinitialization + scaled retain repair)
   kookmin_init_rate: 0.01

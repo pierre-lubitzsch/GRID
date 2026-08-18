@@ -180,7 +180,30 @@ def unified_unlearn(
         if restrict_adaptive_codes:
             conflict = "restrict_adaptive_codes=True"
         elif update_positions:
-            conflict = f"update_positions={list(update_positions)}"
+            # Refuse only when the scale would have NOTHING to act on. aclr
+            # covers the adaptive tail [stable_codes, H); sclr covers the stable
+            # prefix [0, stable_codes). If update_positions still contains
+            # positions from the relevant half, the scale is a genuine relative
+            # rate between the halves that remain trainable, not a disguised lr
+            # change -- e.g. update_positions=[0,1,2] with stable_codes=2 keeps
+            # level 2 trainable, so aclr really does damp it against levels 0,1.
+            # Compare, do not materialise: `pos & set(range(stable_codes, 1e9))`
+            # allocates a ONE-BILLION-element set (tens of GB) and hangs the job
+            # before it can raise anything useful. A predicate is O(|pos|).
+            pos = {int(p) for p in update_positions}
+            sc = int(stable_codes)
+            adaptive_pos = {p for p in pos if p >= sc}
+            stable_pos = {p for p in pos if p < sc}
+            if scale_adaptive and not (adaptive_pos and stable_pos):
+                conflict = (
+                    f"update_positions={sorted(pos)} leaves no adaptive/stable "
+                    "split for adaptive_code_lr_scale to act across"
+                )
+            if scale_stable and not (adaptive_pos and stable_pos):
+                conflict = (
+                    f"update_positions={sorted(pos)} leaves no adaptive/stable "
+                    "split for stable_code_lr_scale to act across"
+                )
         elif str(update_scope).lower() != "all":
             conflict = f"update_scope={update_scope!r}"
         if conflict is not None:

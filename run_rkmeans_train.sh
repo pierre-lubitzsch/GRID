@@ -31,7 +31,18 @@ if ! resolve_grid_dataset "${DATASET}"; then
 fi
 
 if [ -z "${EMBEDDING_PATH}" ]; then
-  EMBEDDING_PATH="$(ls -t logs/inference/runs/*/*/pickle/merged_predictions_tensor.pt 2>/dev/null | head -n1 || true)"
+  # Resolve the DENSE CONTENT embeddings for THIS dataset. Two traps here, both
+  # hit in practice (job 10451266 trained "beauty" on food's tensor):
+  #  * no dataset filter -> `ls -t` returns whatever ran most recently, which is
+  #    another dataset's embeddings whenever two builds overlap;
+  #  * `logs/inference/runs/*/*` also matches `sid/<ds>_.../`, which holds the
+  #    OUTPUT semantic ids ([L, N] ints), not the [N, D] input embeddings. Feeding
+  #    those in dies deep inside the dataloader with an opaque IndexError.
+  # Prefer the canonical per-dataset tensor, then this dataset's embeddings runs.
+  EMBEDDING_PATH="embeddings/${DATASET}_merged_predictions_tensor_latest.pt"
+  if [ ! -f "${EMBEDDING_PATH}" ]; then
+    EMBEDDING_PATH="$(ls -t logs/inference/runs/embeddings/${DATASET}_*/pickle/merged_predictions_tensor.pt 2>/dev/null | head -n1 || true)"
+  fi
 fi
 if [ ! -f "${EMBEDDING_PATH}" ]; then
   echo "Embedding file not found: ${EMBEDDING_PATH:-<empty>}"
@@ -49,6 +60,23 @@ CODEBOOK_WIDTH="${CODEBOOK_WIDTH:-256}"
 echo "[$(date -Is)] Starting rkmeans train on dataset=${DATASET}"
 echo "Using data_dir=${GRID_DATA_DIR}"
 echo "Using embedding_path=${EMBEDDING_PATH}"
+# Shape guard: content embeddings are [N_items, D] with D in the hundreds/thousands.
+# A semantic-id tensor is [L, N] with L ~ 3-4. Catch the mix-up HERE, with a
+# readable message, instead of as an IndexError inside a dataloader worker.
+python3 - "${EMBEDDING_PATH}" "${DATASET}" <<'PYEOF' || exit 1
+import sys, torch
+t = torch.load(sys.argv[1], map_location="cpu")
+if isinstance(t, dict):
+    t = next(iter(t.values()))
+t = torch.as_tensor(t)
+if t.dim() != 2 or min(t.shape) < 16:
+    raise SystemExit(
+        f"embedding_path {sys.argv[1]} has shape {tuple(t.shape)}, which is not a "
+        f"[N_items, D] content-embedding tensor for '{sys.argv[2]}'. A [L, N] "
+        "semantic-id tensor from logs/inference/runs/sid/ is the usual mix-up."
+    )
+print(f"  embedding tensor OK: {tuple(t.shape)} ({t.dtype})")
+PYEOF
 echo "Codebooks: num_hierarchies=${RKMEANS_HIER} codebook_width=${CODEBOOK_WIDTH} (final ID length = ${RKMEANS_HIER}+1 after dedup)"
 
 LOCAL_CKPT_DIR="${TMPDIR:-/tmp}/rkmeans_ckpts_${SLURM_JOB_ID:-$$}"
