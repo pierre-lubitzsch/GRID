@@ -188,6 +188,24 @@ if [ "${POISON_METHOD}" = "clone_inject" ] && [ "${CLONE_INJECT_COUNT:-1}" != "1
   _MTOK="${_MTOK}x${CLONE_INJECT_COUNT}"
 fi
 UNLEARN_RUN_TAG="${UNLEARN_RUN_TAG:-${_DATASET_SLUG}${_MTOK}_${_PCT_LABEL}_n${N_TARGET_ITEMS}_${ALGORITHM}}"
+# Prefix the MODEL token so a non-tiger run can never land on a tiger run's dir.
+# Sweeps pass UNLEARN_RUN_TAG explicitly and would otherwise have to remember to
+# include it; the run-dir duplicate guard keys on this tag, so a collision either
+# silently skips the run or double-counts it in every extractor. Empty for tiger,
+# so all recorded tags are unchanged.
+# shellcheck source=scripts/resolve_model.sh
+source "${GRID_DIR:-$PWD}/scripts/resolve_model.sh"
+resolve_model "${MODEL:-tiger}" || exit 1
+case "${UNLEARN_RUN_TAG}" in
+  "${GRID_MODEL_TAG}"*) ;;                       # already prefixed
+  *) UNLEARN_RUN_TAG="${GRID_MODEL_TAG}${UNLEARN_RUN_TAG}" ;;
+esac
+# NOTE for anyone adding a non-tiger sweep: the sweep drivers run their OWN
+# duplicate guard with `find logs/unlearn/runs -name "*_bs1_<tag>"` using the tag
+# they pass in. Since this line prefixes the tag afterwards, that guard would be
+# blind for a non-tiger model and happily resubmit duplicates. Build the guard's
+# tag as "${GRID_MODEL_TAG}${tag}" in the sweep too. Inert for tiger (empty tag),
+# which is why no existing sweep needs changing.
 UNLEARN_OUTPUT_DIR="$(unlearn_build_output_dir "${GRID_DIR}" "${REQUEST_BATCH_SIZE}")"
 unlearn_allocate_output_dir "${UNLEARN_OUTPUT_DIR}"
 

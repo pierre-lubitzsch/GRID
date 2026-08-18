@@ -568,6 +568,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             # Extra multiplier on the ADAPTIVE tail [stable_codes, H) only, on
             # top of code_lr_scale. 1.0 = one code group (previous behaviour).
             adaptive_code_lr_scale=float(cfg.get("adaptive_code_lr_scale", 1.0)),
+            stable_code_lr_scale=float(cfg.get("stable_code_lr_scale", 1.0)),
             device=device,
         )
         info["wall_seconds"] = time.time() - t0

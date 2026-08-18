@@ -64,6 +64,15 @@ GRID_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "${GRID_DIR}"
 mkdir -p logs
 
+# MODEL selects the recommender ARCHITECTURE (tiger default | diger | ...). It
+# resolves to the experiment config; see scripts/resolve_model.sh and
+# src/models/registry.py. MODEL=tiger reproduces every previously recorded run
+# byte for byte -- same experiment config, empty run-tag token.
+# shellcheck source=scripts/resolve_model.sh
+source "${GRID_DIR}/scripts/resolve_model.sh"
+if ! resolve_model "${MODEL:-tiger}"; then
+  exit 1
+fi
 # shellcheck source=scripts/resolve_grid_dataset.sh
 source "${GRID_DIR}/scripts/resolve_grid_dataset.sh"
 if ! resolve_grid_dataset "${DATASET}"; then
@@ -109,7 +118,8 @@ fi
 # Build a unique, informative run directory: date/time_jobID_dataset_variant[_pctX_nY]
 JOB_ID="${SLURM_JOB_ID:-local$$}"
 TS="$(date +%Y-%m-%d/%H-%M-%S)"
-RUN_LABEL="${DATASET}_${VARIANT}"
+# GRID_MODEL_TAG is EMPTY for tiger, so every existing run-dir name is unchanged.
+RUN_LABEL="${GRID_MODEL_TAG}${DATASET}_${VARIANT}"
 if [ "${VARIANT}" = "poison" ]; then
   PCT_LABEL="$(python3 -c "r=${POISONING_RATIO}; print(f'pct{int(round(r*100))}')")"
   # Tag the poison method (empty for bandwagon) so runs are self-describing.
@@ -347,12 +357,28 @@ if [ "${#EXTRA_OVERRIDES[@]}" -gt 0 ] || [ "$#" -ge 6 ]; then
   echo "Extra Hydra overrides: ${EXTRA_OVERRIDES[*]:-} ${*:6}"
 fi
 
+# DIGER needs the DENSE content embeddings its tokenizer indexes (the same
+# features the quantizer was fit on). Default to the dataset's canonical dense
+# tensor; override with ITEM_CONTENT_EMBEDDINGS.
+MODEL_OVERRIDES=()
+if [ "${GRID_MODEL_NAME}" = "diger" ]; then
+  ICE="${ITEM_CONTENT_EMBEDDINGS:-embeddings/${DATASET}_merged_predictions_tensor_latest.pt}"
+  if [ ! -f "${ICE}" ]; then
+    echo "MODEL=diger needs item content embeddings but '${ICE}' does not exist." >&2
+    echo "Set ITEM_CONTENT_EMBEDDINGS=<path to the dense [N, D] tensor>." >&2
+    exit 1
+  fi
+  echo "Using item_content_embeddings_path=${ICE}"
+  MODEL_OVERRIDES+=("item_content_embeddings_path='${ICE}'")
+fi
+
 python -u -m src.train \
-  experiment=tiger_train_flat \
+  experiment="${GRID_TRAIN_EXPERIMENT}" \
   data_dir="${DATA_DIR}" \
   "semantic_id_path='${SEMANTIC_ID_PATH}'" \
   num_hierarchies="${NUM_HIER}" \
   hydra.run.dir="${HYDRA_RUN_DIR}" \
+  ${MODEL_OVERRIDES[@]+"${MODEL_OVERRIDES[@]}"} \
   ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"} \
   "${@:6}"
 

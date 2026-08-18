@@ -17,6 +17,7 @@ from src.components.unlearning.target_params import (
     resolve_scope_params,
     select_adaptive_code_params,
     split_adaptive_code_params,
+    split_stable_code_params,
     split_code_params,
     select_code_position_params,
     select_pkm_params,
@@ -68,6 +69,7 @@ def unified_unlearn(
     optimizer: str = "adam",
     code_lr_scale: float = 1.0,
     adaptive_code_lr_scale: float = 1.0,
+    stable_code_lr_scale: float = 1.0,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Optimize unified objective.
@@ -160,12 +162,17 @@ def unified_unlearn(
     # group, i.e. exactly the code_lr_scale behaviour. Validated up front, before
     # any parameter selection, so a contradictory config fails on its own terms
     # rather than on a downstream restriction error.
+    if float(stable_code_lr_scale) < 0.0:
+        raise ValueError(
+            f"stable_code_lr_scale must be >= 0, got {stable_code_lr_scale!r}"
+        )
     if float(adaptive_code_lr_scale) < 0.0:
         raise ValueError(
             f"adaptive_code_lr_scale must be >= 0, got {adaptive_code_lr_scale!r}"
         )
+    scale_stable = float(stable_code_lr_scale) != 1.0
     scale_adaptive = float(adaptive_code_lr_scale) != 1.0
-    if scale_adaptive:
+    if scale_adaptive or scale_stable:
         # In every restriction mode the non-adaptive half of the model is already
         # frozen, so a *relative* adaptive rate degenerates into a plain lr
         # change and the run would be mislabelled. Refuse rather than mislead.
@@ -327,17 +334,41 @@ def unified_unlearn(
     code_ids = {id(p) for p in code_params}
     adaptive_tensors: List[nn.Parameter] = []
     adaptive_row_masks: Dict[int, torch.Tensor] = {}
-    if scale_adaptive:
+    if scale_adaptive or scale_stable:
+        # Always resolve the ADAPTIVE mask when either scale is active: it is
+        # what tells stable rows from adaptive rows on the single shared SID
+        # table, and the combined row rescale below needs it even when only the
+        # stable scale is set (otherwise that knob would silently skip the table
+        # and only reach the decoder heads).
         adaptive_tensors, adaptive_row_masks = split_adaptive_code_params(
             model, params, stable_codes=int(stable_codes)
         )
-        if not adaptive_tensors and not adaptive_row_masks:
+        if scale_adaptive and not adaptive_tensors and not adaptive_row_masks:
             raise ValueError(
                 "adaptive_code_lr_scale != 1.0 but no adaptive code parameters "
                 "were found (no SID table and no decoder_mlp heads); the knob "
                 "would silently do nothing."
             )
-    adaptive_ids = {id(p) for p in adaptive_tensors}
+    adaptive_ids = {id(p) for p in adaptive_tensors} if scale_adaptive else set()
+
+    # Stable-prefix counterpart: the COARSE codes [0, stable_codes). Measuring
+    # adaptive_code_lr_scale across 270 runs found it inert, because the tail
+    # barely moves anyway (mean |delta| 3.0e-04 vs 5.9e-04 on the stable rows,
+    # and the last hierarchy is only a dedup digit). The coarse codes are the
+    # ones ~47 items share at width 256, so this is the half where a code update
+    # is genuinely non-local.
+    stable_tensors: List[nn.Parameter] = []
+    stable_row_masks: Dict[int, torch.Tensor] = {}
+    if scale_stable:
+        stable_tensors, stable_row_masks = split_stable_code_params(
+            model, params, stable_codes=int(stable_codes)
+        )
+        if not stable_tensors and not stable_row_masks:
+            raise ValueError(
+                "stable_code_lr_scale != 1.0 but no stable code parameters were "
+                "found; the knob would silently do nothing."
+            )
+    stable_ids = {id(p) for p in stable_tensors}
 
     if not code_params and float(code_lr_scale) != 1.0:
         log.warning(
@@ -354,6 +385,8 @@ def unified_unlearn(
             m *= float(code_lr_scale)
         if id(p) in adaptive_ids:
             m *= float(adaptive_code_lr_scale)
+        if id(p) in stable_ids:
+            m *= float(stable_code_lr_scale)
         multiplier[id(p)] = m
 
     by_mult: Dict[float, List[nn.Parameter]] = {}
@@ -382,8 +415,13 @@ def unified_unlearn(
             if p is None:
                 continue
             # 1.0 on stable rows (keep this group's rate), scale on adaptive rows.
+            # mask is 1.0 on ADAPTIVE rows. Give those adaptive_code_lr_scale
+            # and the remaining (stable) rows stable_code_lr_scale, so the two
+            # knobs compose on the single shared table. With sclr=1.0 this is
+            # exactly the previous expression.
             row_lr_scale[pid] = (
-                1.0 - mask + mask * float(adaptive_code_lr_scale)
+                mask * float(adaptive_code_lr_scale)
+                + (1.0 - mask) * float(stable_code_lr_scale)
             ).to(dtype=p.dtype)
             row_scaled_params[pid] = p
         log.info(
@@ -579,6 +617,7 @@ def unified_unlearn(
         "lr": float(lr),
         "code_lr_scale": float(code_lr_scale),
         "adaptive_code_lr_scale": float(adaptive_code_lr_scale),
+        "stable_code_lr_scale": float(stable_code_lr_scale),
         "adaptive_code_lr_stable_codes": (
             int(stable_codes) if scale_adaptive else None
         ),

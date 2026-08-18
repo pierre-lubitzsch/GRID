@@ -306,6 +306,38 @@ model:
     # the memory must ALSO learn to route (i.e. trained-in).
     value_init: normal
     value_init_scale: 1.0
+    # --- anti-collapse knobs (see WORKFLOW_PKM.md section H/M) ---
+    # Trained-in PKMs COLLAPSE: every token and head selects the same 32 slots
+    # (0.012-0.049% utilisation, measured across all 8 encoder/decoder layouts).
+    # query_norm: none (default) | batchnorm | layernorm.
+    #   batchnorm uses track_running_stats=False, so batch stats apply at train
+    #   AND eval -- the padding-corrupted running stats that motivated leaving
+    #   query_batchnorm=false never exist. Measured: it drives the token-SHARED
+    #   query component to exactly 0 and roughly DOUBLES routing diversity, but
+    #   is only a PARTIAL fix on its own. Caveat: eval becomes batch-composition
+    #   dependent, and it ADDS q_norm.weight/bias to the state_dict (so such a
+    #   ckpt only loads into a query_norm model, and vice versa).
+    #   layernorm cannot remove a token-shared direction -- measured slightly
+    #   WORSE than none. Kept only for completeness.
+    query_norm: none
+    # Dense-ish warm-up: read warmup_knn slots per head for the first
+    # warmup_steps TRAINING forward passes, then revert to knn. At init the
+    # values are random, so routing barely affects the loss -> no gradient
+    # pressure on the query net -> it collapses, after which only the surviving
+    # slots train and the collapse self-reinforces. Touching many more slots
+    # early makes slot CONTENTS meaningful while the router can still move.
+    # 0 disables. Adds nothing to the state_dict.
+    warmup_knn: 0
+    # warmup_noise is the PREFERRED warm-up: during the window it adds Gaussian
+    # noise (scaled by each sub-key half's own score std) to the routing scores,
+    # so selection VARIES across steps and gradient spreads over many slots --
+    # at the SAME cost as normal. Measured on a collapsing toy: 33/4096 slots
+    # baseline -> 1776 at noise 0.5 -> 4082 at noise 2.0.
+    # Prefer this over warmup_knn: lookup cost scales as knn**2, and knn=256
+    # overflowed topk with 'CUDA error: illegal memory access' (job 10449833),
+    # so warmup_knn is now hard-capped at 64.
+    warmup_noise: 0.0
+    warmup_steps: 0
   # Optional separate optimizer param group for the PKM parameters (memory
   # keys/values + query net). null (default) => PKM shares the single global
   # optimizer group. Set a dict of per-group optimizer kwargs to give PKM its

@@ -47,6 +47,6 @@ python -u -m src.diagnose_pkm_slots \
   "semantic_id_path='${SID}'" \
   "ckpt_path='${CKPT}'" \
   num_hierarchies="${NUM_HIER:-4}" \
-  ${PKM_OVR} model.pkm_mode=${PKM_MODE:-replace} \
+  ${PKM_OVR} model.pkm_mode=${PKM_MODE:-replace} ${EXTRA_OVR:-} \
   hydra.run.dir="${OUT}"
 echo "[$(date -Is)] done -> ${OUT}/pkm_slot_diagnostics.json"

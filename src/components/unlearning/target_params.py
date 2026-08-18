@@ -595,3 +595,62 @@ def split_adaptive_code_params(
             row_masks[id(weight)] = mask
 
     return tensors, row_masks
+
+def split_stable_code_params(
+    model: nn.Module,
+    params: List[nn.Parameter],
+    *,
+    stable_codes: int,
+) -> Tuple[List[nn.Parameter], Dict[int, torch.Tensor]]:
+    """The *stable-prefix* counterpart of :func:`split_adaptive_code_params`.
+
+    Returns the parameters belonging exclusively to the COARSE hierarchies
+    ``[0, stable_codes)`` -- the decoder heads ``decoder.decoder_mlp[:stable_codes]``
+    -- plus a row mask selecting the stable rows ``[0, stable_codes * K)`` of the
+    shared SID embedding table.
+
+    Why this exists: measuring ``adaptive_code_lr_scale`` across 270 runs showed
+    it changes nothing, because the adaptive tail barely moves in the first place
+    (mean |delta| 3.0e-04 on the tail vs 5.9e-04 on the stable rows, and the last
+    hierarchy is only a dedup digit). The coarse codes are the ones ~47 items
+    share on average at width 256, so they are where a code update is genuinely
+    non-local -- and they were never constrained by the adaptive knob. This makes
+    that half addressable.
+    """
+    num_hierarchies = getattr(model, "num_hierarchies", None)
+    codebook_size = getattr(model, "num_embeddings_per_hierarchy", None)
+    if num_hierarchies is None or codebook_size is None:
+        raise TypeError(
+            "split_stable_code_params requires a SemanticIDEncoderDecoder with "
+            "num_hierarchies / num_embeddings_per_hierarchy attributes"
+        )
+    num_hierarchies = int(num_hierarchies)
+    codebook_size = int(codebook_size)
+    stable_codes = int(stable_codes)
+    if not 1 <= stable_codes < num_hierarchies:
+        raise ValueError(
+            f"stable_codes={stable_codes} must satisfy 1 <= stable_codes < "
+            f"num_hierarchies={num_hierarchies}"
+        )
+
+    in_update = {id(p) for p in params}
+    tensors: List[nn.Parameter] = []
+    row_masks: Dict[int, torch.Tensor] = {}
+
+    decoder = getattr(model, "decoder", None)
+    decoder_mlp = getattr(decoder, "decoder_mlp", None) if decoder is not None else None
+    if decoder_mlp is not None:
+        for h in range(0, min(stable_codes, len(decoder_mlp))):
+            for prm in decoder_mlp[h].parameters():
+                if id(prm) in in_update:
+                    tensors.append(prm)
+
+    sid_table = getattr(model, "item_sid_embedding_table_encoder", None)
+    if sid_table is not None:
+        weight = sid_table.weight
+        if id(weight) in in_update:
+            mask = torch.zeros_like(weight)
+            mask[: stable_codes * codebook_size, :] = 1.0
+            row_masks[id(weight)] = mask
+
+    return tensors, row_masks

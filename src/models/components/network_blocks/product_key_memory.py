@@ -70,6 +70,32 @@ class HashingMemory(nn.Module):
         value_init_scale: multiplier on the ``normal`` std. ``1.0`` reproduces
             the reference init; e.g. ``0.01`` gives a near-no-op start that still
             keeps the routing gradients alive.
+        query_norm: anti-collapse normalisation of the query, applied BEFORE the
+            product-key lookup. ``none`` (default) reproduces prior behaviour.
+
+            ``batchnorm`` normalises each query dimension across the batch with
+            ``track_running_stats=False``, so batch statistics are used at train
+            AND eval time. This is the mechanism Lample et al. use to spread
+            memory usage, and it is the ONLY one that removes a component shared
+            by every token -- exactly the failure we measured (every token and
+            head selecting the identical 32 slots). ``query_batchnorm=True``
+            (the stock BatchNorm) was avoided here because its RUNNING stats are
+            corrupted by TIGER's variable padding; dropping the running stats
+            removes that objection at the cost of making eval batch-composition
+            dependent (deterministic for our fixed eval batches).
+
+            ``layernorm`` normalises per token across dims. Cheaper and
+            padding-safe, but it CANNOT remove a token-shared constant
+            direction, so it is the weaker option for this failure mode.
+        warmup_knn / warmup_steps: for the first ``warmup_steps`` forward passes
+            in training mode, read ``warmup_knn`` slots per head instead of
+            ``knn``. Rationale: at init the values are random, so which slots the
+            router picks barely changes the loss -> almost no gradient pressure on
+            the query projection -> it collapses to a near-constant, after which
+            only the surviving slots ever train and the collapse self-reinforces.
+            Touching many more slots early makes slot CONTENTS meaningful, so
+            routing choices start to matter while the router can still move.
+            ``warmup_knn=0`` (default) disables this.
     """
 
     def __init__(
@@ -87,6 +113,10 @@ class HashingMemory(nn.Module):
         sparse: bool = False,
         value_init: str = "normal",
         value_init_scale: float = 1.0,
+        query_norm: str = "none",
+        warmup_knn: int = 0,
+        warmup_noise: float = 0.0,
+        warmup_steps: int = 0,
     ) -> None:
         super().__init__()
 
@@ -130,6 +160,43 @@ class HashingMemory(nn.Module):
         # The counter BUFFERS are created lazily by enable_access_counting();
         # assigning them here as plain attributes would make register_buffer raise.
         self._count_access = False
+
+        # anti-collapse query normalisation (see the class docstring)
+        self.query_norm = str(query_norm).strip().lower()
+        if self.query_norm not in ("none", "batchnorm", "layernorm"):
+            raise ValueError(
+                f"query_norm must be none|batchnorm|layernorm, got {query_norm!r}"
+            )
+        if self.query_norm == "batchnorm":
+            # track_running_stats=False -> batch stats at train AND eval, so the
+            # padding-corrupted running stats that motivated disabling BatchNorm
+            # never exist.
+            self.q_norm = nn.BatchNorm1d(self.k_dim, track_running_stats=False)
+        elif self.query_norm == "layernorm":
+            self.q_norm = nn.LayerNorm(self.k_dim)
+        else:
+            self.q_norm = None
+
+        # dense-ish warm-up: read more slots per head for the first N steps
+        self.warmup_knn = int(warmup_knn or 0)
+        self.warmup_steps = int(warmup_steps or 0)
+        # Cost of the lookup scales as knn**2 (the cartesian product over the two
+        # sub-key halves), so a large warmup_knn is not just slow: at knn=256 the
+        # candidate tensor is (rows, 65536), which overflowed int32 indexing in
+        # topk and aborted with 'CUDA error: illegal memory access' (job
+        # 10449833). Cap it well below that and prefer warmup_noise instead.
+        _MAX_WARMUP_KNN = 64
+        if self.warmup_knn and self.warmup_knn > min(self.n_keys, _MAX_WARMUP_KNN):
+            raise ValueError(
+                f"warmup_knn={self.warmup_knn} is too large: the lookup builds a "
+                f"knn**2 candidate tensor, so values above {_MAX_WARMUP_KNN} "
+                f"overflow topk. Use warmup_noise for a cheap warm-up instead."
+            )
+        self.warmup_noise = float(warmup_noise or 0.0)
+        # persistent=False: a step counter must not change the checkpoint schema.
+        self.register_buffer(
+            "_pkm_step", torch.zeros((), dtype=torch.long), persistent=False
+        )
 
         # query network (linear projection, optionally followed by batchnorm)
         self.query_proj = nn.Sequential(
@@ -181,6 +248,19 @@ class HashingMemory(nn.Module):
             )
         return self._access_count.detach().clone(), self._access_mass.detach().clone()
 
+    def _in_warmup(self) -> bool:
+        return bool(
+            self.training
+            and self.warmup_steps
+            and int(self._pkm_step.item()) < self.warmup_steps
+        )
+
+    def _effective_knn(self) -> int:
+        """``warmup_knn`` while training inside the warm-up window, else ``knn``."""
+        if self.warmup_knn and self._in_warmup():
+            return self.warmup_knn
+        return self.knn
+
     def initialize_keys(self) -> None:
         """Create two sub-key sets per head.
 
@@ -204,7 +284,7 @@ class HashingMemory(nn.Module):
         """Generate scores and indices for a single head (vectorized pq_fast)."""
         assert query.dim() == 2 and query.size(1) == self.k_dim
         bs = query.size(0)
-        knn = self.knn
+        knn = self._effective_knn()
         half = self.k_dim // 2
         n_keys = len(subkeys[0])
 
@@ -215,6 +295,18 @@ class HashingMemory(nn.Module):
         # compute indices with associated scores
         scores1 = F.linear(q1, subkeys[0], bias=None)  # (bs, n_keys)
         scores2 = F.linear(q2, subkeys[1], bias=None)  # (bs, n_keys)
+
+        if self.warmup_noise and self._in_warmup():
+            # Noisy top-k gating (Shazeer et al.): perturb the sub-key scores so
+            # selection VARIES across steps. Over the warm-up window this spreads
+            # gradient over many slots, making slot CONTENTS meaningful while the
+            # router can still move -- without the knn**2 blow-up of raising knn.
+            # Scaled by each half's own score std so it is dimensionless.
+            for _s in (scores1, scores2):
+                _s.add_(
+                    torch.randn_like(_s)
+                    * (self.warmup_noise * _s.detach().std().clamp_min(1e-6))
+                )
         scores1, indices1 = scores1.topk(knn, dim=1)  # (bs, knn)
         scores2, indices2 = scores2.topk(knn, dim=1)  # (bs, knn)
 
@@ -242,10 +334,11 @@ class HashingMemory(nn.Module):
         assert query.dim() == 2 and query.size(1) == self.k_dim
         query = query.view(-1, self.heads, self.k_dim)
         bs = len(query)
+        knn = self._effective_knn()
         outputs = [self._get_indices(query[:, i], self.keys[i]) for i in range(self.heads)]
-        s = torch.cat([s.view(bs, 1, self.knn) for s, _ in outputs], 1)  # (bs, heads, knn)
-        i = torch.cat([i.view(bs, 1, self.knn) for _, i in outputs], 1)  # (bs, heads, knn)
-        return s.view(-1, self.knn), i.view(-1, self.knn)
+        s = torch.cat([s.view(bs, 1, knn) for s, _ in outputs], 1)  # (bs, heads, knn)
+        i = torch.cat([i.view(bs, 1, knn) for _, i in outputs], 1)  # (bs, heads, knn)
+        return s.view(-1, knn), i.view(-1, knn)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Read from the memory.
@@ -260,6 +353,8 @@ class HashingMemory(nn.Module):
         input = F.dropout(input, p=self.input_dropout, training=self.training)  # (..., i_dim)
         query = self.query_proj(input.contiguous().view(-1, self.input_dim))  # (bs, heads*k_dim)
         query = query.view(bs * self.heads, self.k_dim)  # (bs*heads, k_dim)
+        if self.q_norm is not None:
+            query = self.q_norm(query)
         query = F.dropout(query, p=self.query_dropout, training=self.training)  # (bs*heads, k_dim)
         assert query.shape == (bs * self.heads, self.k_dim)
 
@@ -268,8 +363,9 @@ class HashingMemory(nn.Module):
         scores = F.softmax(scores.float(), dim=-1).type_as(scores)  # (bs*heads, knn)
 
         # merge heads / knn (since we sum heads)
-        indices = indices.view(bs, self.heads * self.knn)  # (bs, heads*knn)
-        scores = scores.view(bs, self.heads * self.knn)  # (bs, heads*knn)
+        _knn = self._effective_knn()
+        indices = indices.view(bs, self.heads * _knn)  # (bs, heads*knn)
+        scores = scores.view(bs, self.heads * _knn)  # (bs, heads*knn)
 
         if self._count_access:
             # Read-only bookkeeping: detached, no autograd, no effect on output.
@@ -285,6 +381,9 @@ class HashingMemory(nn.Module):
         # weighted sum of values
         output = self.values(indices, per_sample_weights=scores)  # (bs, v_dim)
         output = F.dropout(output, p=self.value_dropout, training=self.training)  # (bs, v_dim)
+
+        if (self.warmup_knn or self.warmup_noise) and self.training:
+            self._pkm_step += 1
 
         # reshape output
         if len(prefix_shape) >= 2:
