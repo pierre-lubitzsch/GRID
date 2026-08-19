@@ -82,6 +82,23 @@ class RQFrontEnd:
     project: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
 
+def _torch_load(ckpt_path: str) -> dict:
+    """``torch.load`` that survives being called outside a running Hydra app.
+
+    These checkpoints pickle Lightning hyper-parameters that reference project
+    modules, and unpickling imports them. Reached cold (a bare script, a test),
+    that import lands mid-way through ``src.data.loading.components.interfaces``
+    and raises a circular-import ImportError that has nothing to do with the
+    checkpoint. Importing ``src.utils`` first resolves the cycle; inside a normal
+    run it is already imported and this is a no-op.
+    """
+    try:
+        import src.utils  # noqa: F401
+    except ImportError:  # pragma: no cover - best effort, load may still work
+        pass
+    return torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+
 def load_rq_centroids(
     ckpt_path: str,
     n_levels: Optional[int] = None,
@@ -93,7 +110,7 @@ def load_rq_centroids(
     level order. ``n_levels`` truncates (the semantic levels are ``H - 1``; the
     final id digit is a dedup counter with no codebook).
     """
-    obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    obj = _torch_load(ckpt_path)
     state = obj.get("state_dict", obj)
     prefix, suffix = "quantization_layer_list.", ".centroids"
     # The middle segment must be JUST the level index. RQ-VAE checkpoints also
@@ -156,7 +173,7 @@ def load_rq_quantizer(
     ``assign()`` did. In train mode it would use batch statistics and produce a
     different latent for every call.
     """
-    obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    obj = _torch_load(ckpt_path)
     state = obj.get("state_dict", obj)
     centroids = load_rq_centroids(ckpt_path, n_levels=n_levels, device=device)
 

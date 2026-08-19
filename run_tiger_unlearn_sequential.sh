@@ -399,3 +399,37 @@ if [ "${UNLEARN_RUN_POST_EVAL}" = "true" ]; then
 else
   echo "Post-unlearn eval skipped (UNLEARN_RUN_POST_EVAL=${UNLEARN_RUN_POST_EVAL})"
 fi
+
+# ---------------------------------------------------------------------------
+# Checkpoint retention.
+#
+# Each sequential run writes ~0.96 GB of unlearned_*.ckpt (~3.8 GB each for a
+# PKM-in-all-blocks model). The main grid is ~2,280 runs, i.e. ~3.4 TB against
+# ~1.3 TB of free space across scratch and projects -- so the default is to keep
+# the metrics and drop the weights. Re-running one cell costs a single ~7 min
+# job; running out of disk mid-sweep killed 129 of 168 jobs on 2026-07-31.
+#
+# UNLEARN_KEEP_CKPT=1 keeps them (needed when the checkpoint itself is the
+# artifact: a follow-up eval, a diagnostic, a resume).
+#
+# The deletion is GATED ON metrics.csv EXISTING. A failed run has no metrics and
+# keeps its checkpoint for debugging; it is also the run-dir signature the sweeps
+# use to detect and re-submit failures.
+UNLEARN_KEEP_CKPT="${UNLEARN_KEEP_CKPT:-0}"
+case "${UNLEARN_KEEP_CKPT}" in
+  1|true|yes|on)
+    echo "Keeping unlearned checkpoints (UNLEARN_KEEP_CKPT=${UNLEARN_KEEP_CKPT})" ;;
+  *)
+    _METRICS="${UNLEARN_OUTPUT_DIR}/eval/csv/version_0/metrics.csv"
+    if [ ! -f "${_METRICS}" ]; then
+      echo "Keeping unlearned checkpoints: ${_METRICS} absent (run failed or post-eval was skipped)"
+    else
+      # -type f so the unlearned.ckpt SYMLINK is not counted or unlinked before
+      # its target; the symlink is removed separately below.
+      _N=$(find "${UNLEARN_OUTPUT_DIR}/checkpoints" -maxdepth 1 -type f -name 'unlearned_*.ckpt' 2>/dev/null | wc -l)
+      _BYTES=$(find "${UNLEARN_OUTPUT_DIR}/checkpoints" -maxdepth 1 -type f -name 'unlearned_*.ckpt' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{printf "%.2f", s/1073741824}')
+      find "${UNLEARN_OUTPUT_DIR}/checkpoints" -maxdepth 1 -type f -name 'unlearned_*.ckpt' -delete 2>/dev/null || true
+      find "${UNLEARN_OUTPUT_DIR}/checkpoints" -maxdepth 1 -xtype l -name 'unlearned*.ckpt' -delete 2>/dev/null || true
+      echo "Deleted ${_N} unlearned checkpoint(s), ${_BYTES:-0} GiB (UNLEARN_KEEP_CKPT=0; metrics.csv retained)"
+    fi ;;
+esac
