@@ -28,23 +28,58 @@ Verified on beauty w16: this reproduces 100.00% of stored codes at every level,
 while dropping either normalization drops it to 31-84%. ``assert_reproduces_sids``
 pins that, and callers should run it before trusting a codebook.
 
-NOTE ON AVAILABILITY. The centroids come from the RQ-KMeans training checkpoint.
-The original width-256 / L=4 beauty codebook checkpoint no longer exists, so
-faithful TRACER cannot run on those models -- centroids cannot be recovered from
-(z, codes) alone because the quantizer applies a learned normalization/encoder
-before matching (best-effort reconstruction tops out at ~95/89/86% per level).
-Use an identifier space whose codebook checkpoint survives (w16, w8l6, L8, L16).
+TWO QUANTIZERS, TWO RECIPES. ``load_rq_quantizer`` reads the codebooks AND the
+residual recipe off the checkpoint, auto-detecting which quantizer produced it:
+RQ-KMeans matches in the raw 2048-d space with both normalizations on, RQ-VAE
+matches in its 64-d encoder latent with ``normalize_residuals: false``. Never
+pick those flags by hand -- pass the returned :class:`RQFrontEnd` through.
+
+NOTE ON AVAILABILITY. The centroids come from the quantizer's training
+checkpoint. The original width-256 / L=4 beauty RQ-KMeans checkpoint no longer
+exists, so faithful TRACER cannot run on the models built from it -- centroids
+cannot be recovered from (z, codes) alone (best-effort reconstruction tops out at
+~95/89/86% per level). Use an identifier space whose codebook checkpoint
+survives: any RQ-VAE space (``embeddings/<ds>_rqvae``, checkpoints under
+``logs/train/runs/codebook/<ds>_rqvae_<jobid>/``), or w16 / w8l6 / L8 / L16.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Sequence
+import os
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class RQFrontEnd:
+    """Everything the residual recursion needs from a quantizer checkpoint.
+
+    The two quantizers in this repo share ``ResidualQuantization`` but sit in
+    DIFFERENT spaces, and the residual recipe differs with them:
+
+    * ``rkmeans`` -- codebooks in the raw 2048-d embedding space, no encoder,
+      ``normalize_inputs`` and ``normalize_residuals`` both on.
+    * ``rqvae``  -- codebooks in the 64-d ENCODER LATENT space, reached through
+      ``normalization_layer`` (BatchNorm1d + L2 normalize) then ``encoder``
+      (MLP 2048-768-256-128-64), and ``normalize_residuals: false``.
+
+    Getting this wrong does not raise: it silently changes every distance in
+    Eq. 6, so ``phi=0`` stops reproducing the stored ids and TRACER reassigns
+    part of the catalog before any unlearning happens. That is what
+    :func:`assert_reproduces_sids` exists to catch.
+    """
+
+    centroids: List[torch.Tensor]
+    quantizer: str
+    normalize_inputs: bool = True
+    normalize_residuals: bool = True
+    project: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
 
 def load_rq_centroids(
@@ -61,10 +96,17 @@ def load_rq_centroids(
     obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = obj.get("state_dict", obj)
     prefix, suffix = "quantization_layer_list.", ".centroids"
+    # The middle segment must be JUST the level index. RQ-VAE checkpoints also
+    # carry 'quantization_layer_list.<l>.initializer.clustering_module.centroids'
+    # (the k-means seeding state, not the live codebook), which matches the same
+    # prefix/suffix pair and would otherwise crash the int() or, worse, be picked
+    # up as the codebook.
     idx = sorted(
-        int(k[len(prefix) : -len(suffix)])
+        int(mid)
         for k in state
-        if k.startswith(prefix) and k.endswith(suffix)
+        if k.startswith(prefix)
+        and k.endswith(suffix)
+        and (mid := k[len(prefix) : -len(suffix)]).isdigit()
     )
     if not idx:
         raise ValueError(f"no '{prefix}*{suffix}' entries in {ckpt_path}")
@@ -83,10 +125,113 @@ def load_rq_centroids(
     return cents
 
 
+def _has_frontend(state: dict) -> bool:
+    """True when the checkpoint carries a learned normalization/encoder front end.
+
+    RQ-KMeans leaves both as ``nn.Identity`` (no parameters), so the absence of
+    these keys is what distinguishes the two quantizers without having to trust
+    a config flag.
+    """
+    return any(
+        k.startswith("normalization_layer.") or k.startswith("encoder.") for k in state
+    )
+
+
+def load_rq_quantizer(
+    ckpt_path: str,
+    n_levels: Optional[int] = None,
+    device: Optional[torch.device] = None,
+) -> RQFrontEnd:
+    """Load the codebooks AND the residual recipe from a quantizer checkpoint.
+
+    Auto-detects rkmeans vs rqvae from the checkpoint contents rather than from a
+    caller-supplied flag. For rqvae the ``normalization_layer`` + ``encoder``
+    modules are rebuilt by instantiating the run's own ``.hydra/config.yaml``
+    (``ResidualQuantization.save_hyperparameters`` ignores both modules, so they
+    cannot be recovered from ``hyper_parameters`` alone) and loading the
+    checkpoint weights into them.
+
+    The front end runs under ``eval()``: its BatchNorm1d must use the running
+    statistics fitted on the frozen catalog, exactly as the quantizer's own
+    ``assign()`` did. In train mode it would use batch statistics and produce a
+    different latent for every call.
+    """
+    obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = obj.get("state_dict", obj)
+    centroids = load_rq_centroids(ckpt_path, n_levels=n_levels, device=device)
+
+    if not _has_frontend(state):
+        log.info("[tracer] quantizer=rkmeans (no encoder in %s)", ckpt_path)
+        return RQFrontEnd(
+            centroids=centroids,
+            quantizer="rkmeans",
+            normalize_inputs=True,
+            normalize_residuals=True,
+            project=None,
+        )
+
+    import hydra
+    from omegaconf import OmegaConf
+
+    run_dir = os.path.dirname(os.path.dirname(os.path.abspath(ckpt_path)))
+    cfg_path = os.path.join(run_dir, ".hydra", "config.yaml")
+    if not os.path.isfile(cfg_path):
+        raise ValueError(
+            f"{ckpt_path} has an encoder front end (quantizer=rqvae) but its "
+            f"Hydra config is missing at {cfg_path}. The encoder cannot be "
+            "rebuilt from the checkpoint alone, because ResidualQuantization "
+            "excludes normalization_layer/encoder from save_hyperparameters. "
+            "Point tracer at a codebook run that kept its .hydra/ directory."
+        )
+    model_cfg = OmegaConf.load(cfg_path).model
+    module = hydra.utils.instantiate(model_cfg)
+    missing, unexpected = module.load_state_dict(state, strict=False)
+    if any(k.startswith(("normalization_layer.", "encoder.")) for k in missing):
+        raise ValueError(
+            f"{ckpt_path} is missing front-end weights after instantiate: "
+            f"{[k for k in missing if k.startswith(('normalization_layer.', 'encoder.'))][:5]}"
+        )
+    module.eval()
+    norm_layer, encoder = module.normalization_layer, module.encoder
+    if device is not None:
+        norm_layer = norm_layer.to(device)
+        encoder = encoder.to(device)
+
+    def project(x: torch.Tensor) -> torch.Tensor:
+        # float32, matching the precision the quantizer itself assigned in; the
+        # caller casts to float64 for the residual recursion afterwards.
+        with torch.no_grad():
+            p = next(encoder.parameters())
+            return encoder(norm_layer(x.to(device=p.device, dtype=p.dtype)))
+
+    normalize_residuals = bool(
+        obj.get("hyper_parameters", {}).get("normalize_residuals", False)
+    )
+    log.info(
+        "[tracer] quantizer=rqvae (encoder front end from %s, "
+        "normalize_residuals=%s, codebook dim=%d)",
+        cfg_path,
+        normalize_residuals,
+        centroids[0].shape[1],
+    )
+    return RQFrontEnd(
+        centroids=centroids,
+        quantizer="rqvae",
+        # normalization_layer already ends in NormalizeLayer, so an extra
+        # F.normalize on the latent would be a second, different projection.
+        normalize_inputs=False,
+        normalize_residuals=normalize_residuals,
+        project=project,
+    )
+
+
 def compute_residuals(
     z: torch.Tensor,
     centroids: Sequence[torch.Tensor],
     codes: torch.Tensor,
+    project: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    normalize_inputs: bool = True,
+    normalize_residuals: bool = True,
 ) -> List[torch.Tensor]:
     """Per-level residuals ``r_i^l`` under the stored assignment.
 
@@ -94,19 +239,27 @@ def compute_residuals(
     ``[L, N]`` (or ``[H, N]``; only the first ``len(centroids)`` rows are used).
     Returns ``L`` tensors of shape ``[N, D]``.
 
-    Follows the normalize-in / normalize-residual recursion documented above --
-    the residual fed to level ``l`` is what ``phi`` perturbs, so getting this
-    wrong silently changes every distance in Eq. 6.
+    The defaults are the RQ-KMeans recipe (normalize the input, normalize every
+    residual). ``project`` maps the raw embeddings into the codebook's own space
+    first, which is what RQ-VAE needs; use :func:`load_rq_quantizer` to get the
+    three settings from the checkpoint instead of choosing them by hand. Getting
+    them wrong silently changes every distance in Eq. 6.
     """
+    if project is not None:
+        z = project(z)
     # float64 throughout: the recursion compounds, and the entrypoints set
     # matmul precision to "medium" (see assignment_logits). Residuals are frozen
     # buffers, so the extra precision costs nothing at training time.
-    r = F.normalize(z.double(), dim=-1)
+    r = z.double()
+    if normalize_inputs:
+        r = F.normalize(r, dim=-1)
     out: List[torch.Tensor] = []
     for lvl, c in enumerate(centroids):
         out.append(r)
         s = codes[lvl].long().to(r.device)
-        r = F.normalize(r - c.to(r.device).double()[s], dim=-1)
+        r = r - c.to(r.device).double()[s]
+        if normalize_residuals:
+            r = F.normalize(r, dim=-1)
     return out
 
 
@@ -210,6 +363,9 @@ def assert_reproduces_sids(
     centroids: Sequence[torch.Tensor],
     codes: torch.Tensor,
     tol: float = 1.0,
+    project: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    normalize_inputs: bool = True,
+    normalize_residuals: bool = True,
 ) -> List[float]:
     """Check that ``phi = 0`` reproduces the stored semantic ids.
 
@@ -220,7 +376,14 @@ def assert_reproduces_sids(
     Returns the per-level agreement fraction; raises if any level is below
     ``tol`` (default 1.0 == exact).
     """
-    residuals = compute_residuals(z, centroids, codes)
+    residuals = compute_residuals(
+        z,
+        centroids,
+        codes,
+        project=project,
+        normalize_inputs=normalize_inputs,
+        normalize_residuals=normalize_residuals,
+    )
     agree: List[float] = []
     for lvl, (r, c) in enumerate(zip(residuals, centroids)):
         pred = hard_assignment(r, c.to(r.device))
@@ -233,7 +396,8 @@ def assert_reproduces_sids(
             f"phi=0 reproduces only {worst * 100:.2f}% of stored codes "
             f"(per level: {[round(a * 100, 2) for a in agree]}). The centroids do "
             "not match this SID tensor, so TRACER would reassign items before any "
-            "unlearning. Check that the RQ-KMeans checkpoint is the one this "
-            "semantic_id_path was generated from."
+            "unlearning. Check that the codebook checkpoint is the one this "
+            "semantic_id_path was generated from, and that the residual recipe "
+            "came from load_rq_quantizer rather than being chosen by hand."
         )
     return agree

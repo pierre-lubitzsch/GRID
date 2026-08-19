@@ -320,6 +320,9 @@ unlearning:
   # width-256/L4 beauty codebook no longer exists, so use an identifier space
   # whose checkpoint survives (w16 -> job 10268457, w8l6 -> 10268458).
   # Also requires unlearning.embedding_path (pre-quantization item embeddings).
+  # See tiger_unlearn_scif_flat.yaml: tracer_codebook_ckpt is the current name
+  # (either quantizer), tracer_rqkmeans_ckpt the accepted alias.
+  tracer_codebook_ckpt: null
   tracer_rqkmeans_ckpt: null
   tracer_levels: null          # null -> num_hierarchies - 1 (last digit is dedup)
   tracer_temperature: 0.005    # paper's band is 0.003-0.009

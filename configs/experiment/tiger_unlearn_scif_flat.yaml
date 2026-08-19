@@ -317,6 +317,11 @@ unlearning:
   # width-256/L4 beauty codebook no longer exists, so use an identifier space
   # whose checkpoint survives (w16 -> job 10268457, w8l6 -> 10268458).
   # Also requires unlearning.embedding_path (pre-quantization item embeddings).
+  # Current name (either quantizer); tracer_rqkmeans_ckpt is kept as an accepted
+  # alias so recorded rkmeans runs reproduce. load_rq_quantizer auto-detects
+  # rkmeans vs rqvae from the checkpoint and picks the matching residual recipe,
+  # so there is no quantizer flag to set (and none to get wrong).
+  tracer_codebook_ckpt: null
   tracer_rqkmeans_ckpt: null
   tracer_levels: null          # null -> num_hierarchies - 1 (last digit is dedup)
   tracer_temperature: 0.005    # paper's band is 0.003-0.009
@@ -670,6 +675,14 @@ model:
     # the memory must ALSO learn to route (i.e. trained-in).
     value_init: normal
     value_init_scale: 1.0
+    # anti-collapse query normalisation; must exist here too or the
+    query_norm: none
+    # slot diagnostic (experiment=tiger_unlearn_scif_flat) cannot override it
+    warmup_knn: 0
+    # -- Hydra struct mode rejects unknown keys. See tiger_train_flat.yaml
+    warmup_noise: 0.0
+    # for the full documentation of each knob.
+    warmup_steps: 0
 
 # Callbacks: keep a model-summary, drop everything fit-related --------------
 # `defaults: callbacks: default` inherits a model_checkpoint/early_stopping

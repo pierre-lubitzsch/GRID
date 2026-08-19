@@ -108,11 +108,7 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
                 "without them there is nothing to tokenize and the model would "
                 "silently degenerate to plain TIGER."
             )
-        content = torch.as_tensor(item_content_embeddings).float()
-        if content.dim() != 2:
-            raise ValueError(
-                f"item_content_embeddings must be 2-D [N, D], got {tuple(content.shape)}"
-            )
+        content = self._as_content_matrix(item_content_embeddings)
         n_items = int(self.codebooks.size(0)) if self.codebooks is not None else None
         if n_items is not None and content.size(0) != n_items:
             raise ValueError(
@@ -192,6 +188,69 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
         self._diger_injected = 0
         if not hasattr(self, "_adaptive_sorted_keys"):
             self._build_code_to_item_index()
+
+    @staticmethod
+    def _as_content_matrix(obj: Any) -> torch.Tensor:
+        """Coerce a content-embedding artifact to ``[N, D]`` in ITEM-ID order.
+
+        The repo ships two shapes and Hydra hands whichever it finds straight to
+        the constructor, so this has to accept both:
+
+        * a bare ``[N, D]`` tensor (``embeddings/beauty_..._latest.pt``), and
+        * a dict ``{"embeddings": [N, D], "item_ids": [N]}``
+          (``logs/inference/runs/embeddings/<ds>_*/pickle/...``).
+
+        Passing the dict through ``torch.as_tensor`` raises "Could not infer
+        dtype of dict", which is what killed the first four toys runs.
+
+        ROW ORDER IS THE REAL HAZARD. ``item_ids`` is the alignment key, and row
+        i of ``embeddings`` is only item i if those ids happen to be ``arange``.
+        They are for the toys artifact, but relying on that would silently
+        mis-pair every item's content with another item's semantic id the first
+        time an artifact is written in a different order. So reorder explicitly.
+        """
+        if isinstance(obj, dict):
+            emb = obj.get("embeddings")
+            if emb is None:
+                tensors = [v for v in obj.values() if torch.is_tensor(v) and v.dim() == 2]
+                if len(tensors) != 1:
+                    raise ValueError(
+                        "item_content_embeddings dict has no 'embeddings' key and "
+                        f"{len(tensors)} 2-D tensors; cannot tell which is the "
+                        f"content matrix (keys: {sorted(obj)})"
+                    )
+                emb = tensors[0]
+            emb = torch.as_tensor(emb).float()
+            ids = obj.get("item_ids")
+            if ids is not None:
+                ids = torch.as_tensor(ids).long().flatten()
+                if ids.numel() != emb.size(0):
+                    raise ValueError(
+                        f"item_ids has {ids.numel()} entries but embeddings has "
+                        f"{emb.size(0)} rows"
+                    )
+                n = emb.size(0)
+                if int(ids.unique().numel()) != n:
+                    raise ValueError("item_ids contains duplicates")
+                if int(ids.min()) != 0 or int(ids.max()) != n - 1:
+                    raise ValueError(
+                        f"item_ids must cover 0..{n - 1} exactly, got range "
+                        f"[{int(ids.min())}, {int(ids.max())}]"
+                    )
+                if not torch.equal(ids, torch.arange(n, dtype=ids.dtype)):
+                    log.info(
+                        "[diger] content embeddings were not stored in item-id "
+                        "order; reordering %d rows by item_ids.", n
+                    )
+                    emb = emb[torch.argsort(ids)]
+            content = emb
+        else:
+            content = torch.as_tensor(obj).float()
+        if content.dim() != 2:
+            raise ValueError(
+                f"item_content_embeddings must be 2-D [N, D], got {tuple(content.shape)}"
+            )
+        return content
 
     # ------------------------------------------------------------- injection
     def _inject_soft_sid_embeddings(
@@ -414,6 +473,29 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
         if callable(parent):
             parent()
         self.tokenizer.step_frequency_ema()
+        # Cheap health probe, once per epoch. commit_semantic_ids() RAISES if the
+        # codebook has collapsed, and it only runs at train end -- so without
+        # this a multi-hour run can die at the finish line with no warning. One
+        # assign() over the catalog is negligible next to an epoch.
+        try:
+            codes = self.tokenizer.assign(self.item_content)
+            n_lvl = codes.size(1)
+            uniq_l0 = int(codes[:, 0].unique().numel())
+            prefix = codes[:, : max(1, n_lvl)]
+            _, counts = torch.unique(prefix, dim=0, return_counts=True)
+            worst = int(counts.max())
+            log.info(
+                "[diger] epoch %d health: level-0 codes used %d/%d, largest "
+                "full-prefix bucket %d (vocab %d), latent dispersion %.4f%s",
+                int(self.current_epoch), uniq_l0,
+                int(self.num_embeddings_per_hierarchy), worst,
+                int(self.num_embeddings_per_hierarchy),
+                self.tokenizer.latent_dispersion(self.item_content),
+                "  <-- COLLAPSING, commit will fail"
+                if worst >= int(self.num_embeddings_per_hierarchy) else "",
+            )
+        except Exception as exc:  # never let a probe kill training
+            log.warning("[diger] health probe failed: %s", exc)
         every = self.diger_commit_every_n_epochs
         if every > 0 and (int(self.current_epoch) + 1) % every == 0:
             changed = self.commit_semantic_ids()

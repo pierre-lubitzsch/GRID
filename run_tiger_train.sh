@@ -170,6 +170,37 @@ fi
 # Optional free-form label suffix (e.g. "_det_seed7") so multi-seed / variant
 # sweeps produce self-describing, non-colliding run dirs.
 RUN_LABEL="${RUN_LABEL}${RUN_LABEL_SUFFIX:-}"
+# --- duplicate guard --------------------------------------------------------
+# Training runs are expensive and were previously unguarded, so re-submitting the
+# same configuration silently trained it twice and left two run dirs that every
+# dataset-keyed lookup then had to disambiguate by hand. Skip when a run with the
+# SAME label already produced a checkpoint. FORCE=1 overrides.
+#
+# The match is anchored on the FULL label, and other models' runs are filtered
+# out: a tiger label like `beauty_clean` is also a suffix of
+# `..._diger_beauty_clean`, so an unfiltered glob would make tiger skip because
+# DIGER had already run.
+#
+# LIMITATION, stated because it bites: a run dir only exists once the job
+# STARTS, so this cannot see an identical job still PENDING in the queue. Check
+# `squeue` before re-submitting a config you may already have queued.
+if [ "${FORCE:-0}" != "1" ]; then
+  _dupes="$(ls -1d logs/train/runs/*/*_"${RUN_LABEL}" 2>/dev/null || true)"
+  if [ -n "${GRID_MODEL_TAG}" ]; then
+    _keep="${_dupes}"
+  else
+    _keep="$(printf '%s\n' "${_dupes}" | grep -vE "$(grid_other_model_regex)" || true)"
+  fi
+  for _d in ${_keep}; do
+    if ls "${_d}"/checkpoints/*.ckpt >/dev/null 2>&1; then
+      echo "[skip] a completed run with label '${RUN_LABEL}' already exists:"
+      echo "       ${_d}"
+      echo "       Set FORCE=1 to train it again."
+      exit 0
+    fi
+  done
+fi
+
 HYDRA_RUN_DIR="logs/train/runs/${TS}_job${JOB_ID}_${RUN_LABEL}"
 
 # Optional Hydra overrides. PKM is gated entirely by PKM_MODE:

@@ -580,12 +580,15 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
     def _run_tracer(self, **kwargs: Any) -> Dict[str, Any]:
         """TRACER (arXiv:2606.07688) -- token reassignment, as a baseline.
 
-        Needs the RQ-KMeans codebook the semantic ids were built from
-        (``unlearning.tracer_rqkmeans_ckpt``) plus the pre-quantization item
-        embeddings (``unlearning.embedding_path``); ``phi=0`` is asserted to
-        reproduce the stored codes before anything is trained, because a codebook
-        that does not match the SID tensor would silently reassign items before
-        unlearning even starts.
+        Needs the codebook the semantic ids were built from
+        (``unlearning.tracer_codebook_ckpt``, alias ``tracer_rqkmeans_ckpt``) plus
+        the pre-quantization item embeddings (``unlearning.embedding_path``).
+        Either quantizer works: ``load_rq_quantizer`` detects rkmeans vs rqvae
+        from the checkpoint and returns the matching residual recipe (rqvae
+        matches in its 64-d encoder latent, rkmeans in the raw embedding space).
+        ``phi=0`` is asserted to reproduce the stored codes before anything is
+        trained, because a codebook that does not match the SID tensor would
+        silently reassign items before unlearning even starts.
         """
         import torch as _torch
 
@@ -593,7 +596,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         from src.components.unlearning.tracer_tokenizer import (
             assert_reproduces_sids,
             compute_residuals,
-            load_rq_centroids,
+            load_rq_quantizer,
         )
         from src.components.unlearning.neighborhood_sampler import load_dense_embeddings
 
@@ -602,13 +605,17 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         cfg = kwargs["unlearning_cfg"]
         t0 = time.time()
 
-        ckpt = cfg.get("tracer_rqkmeans_ckpt")
+        # tracer_rqkmeans_ckpt is the historical name, kept as an alias so the
+        # recorded rkmeans runs reproduce; tracer_codebook_ckpt is the current
+        # one, because the checkpoint may equally be an RQ-VAE codebook.
+        ckpt = cfg.get("tracer_codebook_ckpt") or cfg.get("tracer_rqkmeans_ckpt")
         if not ckpt:
             raise ValueError(
-                "algorithm=tracer requires unlearning.tracer_rqkmeans_ckpt (the "
-                "RQ-KMeans checkpoint holding the codeword centroids). The "
-                "original width-256/L4 beauty codebook no longer exists, so use "
-                "an identifier space whose checkpoint survives (w16, w8l6, L8)."
+                "algorithm=tracer requires unlearning.tracer_codebook_ckpt (the "
+                "RQ-KMeans or RQ-VAE checkpoint holding the codeword centroids). "
+                "The original width-256/L4 beauty RQ-KMeans codebook no longer "
+                "exists, so use an identifier space whose checkpoint survives: "
+                "any <ds>_rqvae space, or w16 / w8l6 / L8."
             )
         emb_path = cfg.get("embedding_path")
         if not emb_path:
@@ -616,8 +623,14 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
 
         num_hierarchies = int(kwargs.get("num_hierarchies") or self.num_hierarchies)
         n_levels = int(cfg.get("tracer_levels") or (num_hierarchies - 1))
-        centroids = load_rq_centroids(str(ckpt), n_levels=n_levels)
-        centroids = _torch.stack([c for c in centroids])              # [L, K, D]
+        front = load_rq_quantizer(str(ckpt), n_levels=n_levels)
+        centroids = _torch.stack([c for c in front.centroids])         # [L, K, D]
+        # The residual recipe travels with the checkpoint, never with the caller.
+        res_kwargs = dict(
+            project=front.project,
+            normalize_inputs=front.normalize_inputs,
+            normalize_residuals=front.normalize_residuals,
+        )
 
         codes = self.codebooks.t().to(_torch.long).cpu()               # [H, N]
         n_items = int(codes.shape[1])
@@ -650,7 +663,9 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             )
 
         # Correctness anchor: refuses unless phi=0 reproduces every stored code.
-        assert_reproduces_sids(z, [centroids[i] for i in range(n_levels)], codes)
+        assert_reproduces_sids(
+            z, [centroids[i] for i in range(n_levels)], codes, **res_kwargs
+        )
 
         # Target items live under ctx["meta"], not ctx itself -- reading the
         # wrong key made this look like "no targets" and tripped the
@@ -666,7 +681,9 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         keep[concept] = False
         retain_items = all_items[keep]
 
-        res_levels = compute_residuals(z, [centroids[i] for i in range(n_levels)], codes)
+        res_levels = compute_residuals(
+            z, [centroids[i] for i in range(n_levels)], codes, **res_kwargs
+        )
         residuals = _torch.stack([r[concept] for r in res_levels], dim=1)  # [M, L, D]
 
         # L_Coh's P(i_T) -- BUILT HERE, BY TRACER, ON PURPOSE.
@@ -733,7 +750,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             device=device,
         )
         info["wall_seconds"] = time.time() - t0
-        info["tracer_rqkmeans_ckpt"] = str(ckpt)
+        info["tracer_codebook_ckpt"] = str(ckpt)
+        info["tracer_quantizer"] = front.quantizer
         # Audit trail for P(i_T): the exact neighbour item ids TRACER used.
         info["tracer_coherence_neighbor_items"] = neighbor_items_log
         info["tracer_coherence_metric"] = "cosine_topk_on_concept_items"
