@@ -74,6 +74,14 @@ unlearning:
   # --- RQ-ID diagnostics (python -m src.diagnose_rq_ids) ---
   # both | positions | code_sharing. Read-only; no weight update.
   diagnostics_mode: both
+  # --- collateral-drift diagnosis (src/measure_collateral_drift.py) -----------
+  # Read-only. ckpt_path is the PRE-unlearning model; this is the POST one.
+  drift_unlearned_ckpt: null
+  drift_n_queries: 8          # retain query batches to score over
+  drift_control_items: 600    # sampled non-sharing items, the comparison group
+  drift_item_chunk: 64
+  # per-item position profile (src/item_position_profile.py)
+  profile_max_items: 2000
 
   # Optimizer for EVERY unlearning algorithm that runs a first-order loop
   # (seif, kookmin, fanchuan, neg_train, finetune, unified, tracer).
@@ -86,6 +94,26 @@ unlearning:
   # Mirrors the OPTIMIZER env var on run_tiger_train.sh, so one name means the
   # same thing for training, retraining and unlearning.
   optimizer: adam
+
+  # Per-algorithm overrides, declared as null so they are SETTABLE without
+  # changing anything by default. Hydra runs in struct mode, so an undeclared
+  # key cannot be set on the command line: `unlearning.kookmin_optimizer=sgd`
+  # used to abort the job instead of choosing an optimizer. null is falsy, so
+  # _resolve_optimizer falls through to `optimizer` above exactly as an
+  # undeclared key did -- declaring these changes no current run.
+  #
+  # CAUTION for the optimizer ablation: a per-algorithm key set to a CONCRETE
+  # value shadows `optimizer` entirely. tiger_unlearn_scif_flat.yaml pins
+  # unified_optimizer: adam, finetune_optimizer: adam and tracer_optimizer: sgd,
+  # so `unlearning.optimizer=sgd` does NOT reach those three algorithms; set
+  # their per-algorithm keys directly (as the plan's ablation does for unified).
+  seif_optimizer: null
+  kookmin_optimizer: null
+  fanchuan_optimizer: null
+  neg_train_optimizer: null
+  finetune_optimizer: null
+  unified_optimizer: null
+  tracer_optimizer: null
 
   # Fine-tune baseline
   finetune_steps: 500

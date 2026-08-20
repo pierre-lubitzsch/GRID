@@ -132,6 +132,14 @@ unlearning:
   # same thing for training, retraining and unlearning.
   optimizer: adam
 
+  # Declared as null so they are settable under Hydra struct mode while
+  # changing nothing by default (null is falsy, so the generic `optimizer`
+  # above still applies). See configs/unlearning_defaults.yaml.
+  seif_optimizer: null
+  kookmin_optimizer: null
+  fanchuan_optimizer: null
+  neg_train_optimizer: null
+
   # adam (default) | adamw | sgd, for algorithm=unified. See finetune_optimizer.
   unified_optimizer: adam
 
@@ -220,6 +228,14 @@ unlearning:
   # --- RQ-ID diagnostics (python -m src.diagnose_rq_ids) ---
   # both | positions | code_sharing. Read-only; no weight update.
   diagnostics_mode: both
+  # --- collateral-drift diagnosis (src/measure_collateral_drift.py) -----------
+  # Read-only. ckpt_path is the PRE-unlearning model; this is the POST one.
+  drift_unlearned_ckpt: null
+  drift_n_queries: 8          # retain query batches to score over
+  drift_control_items: 600    # sampled non-sharing items, the comparison group
+  drift_item_chunk: 64
+  # per-item position profile (src/item_position_profile.py)
+  profile_max_items: 2000
 
   finetune_steps: 500
   finetune_lr: 0.001
