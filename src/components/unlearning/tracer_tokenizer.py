@@ -214,12 +214,26 @@ def load_rq_quantizer(
         norm_layer = norm_layer.to(device)
         encoder = encoder.to(device)
 
-    def project(x: torch.Tensor) -> torch.Tensor:
+    def project(x: torch.Tensor, chunk: int = 8192) -> torch.Tensor:
         # float32, matching the precision the quantizer itself assigned in; the
         # caller casts to float64 for the residual recursion afterwards.
+        #
+        # CHUNKED. Callers hand this the whole catalog, and food_k5 is 167,428 x
+        # 2048; running that through BatchNorm + a 2048-768-256-128-64 MLP in one
+        # shot allocates several GB of intermediates and was killed twice on a
+        # login node. Chunking is exact here, NOT an approximation: the front end
+        # runs under eval(), so BatchNorm uses the frozen running statistics and
+        # every row is transformed independently of the others in its batch.
         with torch.no_grad():
             p = next(encoder.parameters())
-            return encoder(norm_layer(x.to(device=p.device, dtype=p.dtype)))
+            if len(x) <= chunk:
+                return encoder(norm_layer(x.to(device=p.device, dtype=p.dtype)))
+            return torch.cat(
+                [
+                    encoder(norm_layer(x[i : i + chunk].to(device=p.device, dtype=p.dtype)))
+                    for i in range(0, len(x), chunk)
+                ]
+            )
 
     normalize_residuals = bool(
         obj.get("hyper_parameters", {}).get("normalize_residuals", False)
@@ -300,7 +314,16 @@ def assignment_logits(
     whole method is "perturb an existing assignment", that is a silent
     reassignment of ~170 items before any unlearning happens.
     """
-    d2 = torch.cdist(residual.double(), centroids.double()).pow(2)
+    r64, c64 = residual.double(), centroids.double()
+    # [N, K] in float64 is 343 MB at N=167k, K=256, and callers may hold several
+    # of these at once. Chunk the rows when the catalog is large; the result is
+    # bit-identical, cdist being row-independent.
+    if r64.shape[0] > 65536:
+        d2 = torch.cat(
+            [torch.cdist(r64[i : i + 65536], c64).pow(2) for i in range(0, r64.shape[0], 65536)]
+        )
+    else:
+        d2 = torch.cdist(r64, c64).pow(2)
     scores = (-d2).to(residual.dtype)
     if phi is not None:
         scores = scores + phi

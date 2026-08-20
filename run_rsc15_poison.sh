@@ -82,7 +82,19 @@ if [ -z "${STATS_INTER+x}" ]; then
 fi
 N_CLEAN_USERS="${N_CLEAN_USERS:-}"
 if [ -z "${N_CLEAN_USERS}" ] && [ -f "${CLEAN_DIR}/dataset_meta.json" ]; then
-  N_CLEAN_USERS="$(python3 -c "import json; print(json.load(open('${CLEAN_DIR}/dataset_meta.json'))['splits']['training'])")"
+  # Not every dataset_meta.json carries `splits`: the rsc15 converter writes it,
+  # convert_amazon_2023.py (food*) does not, and beauty/toys/sports have no
+  # dataset_meta.json at all. A bare ['splits']['training'] KeyErrors on the
+  # middle case and killed all 15 food_k5 cells. Fall back to EMPTY rather than
+  # to n_users: empty is exactly what beauty/toys/sports already do, and it makes
+  # bandwagon.py count the training users itself. Guessing the count wrong would
+  # silently change the number of injected spam users, i.e. the poison ratio.
+  N_CLEAN_USERS="$(python3 -c "
+import json, sys
+m = json.load(open('${CLEAN_DIR}/dataset_meta.json'))
+v = (m.get('splits') or {}).get('training')
+sys.stdout.write(str(v) if v else '')
+" 2>/dev/null || true)"
 fi
 
 BW_ARGS=(

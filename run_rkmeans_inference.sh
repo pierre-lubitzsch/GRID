@@ -12,7 +12,13 @@ set -euo pipefail
 # Step 3b: run RKMeans inference using a trained checkpoint from Step 3a.
 #
 # Usage:
-#   sbatch run_rkmeans_inference.sh <ckpt_path> [dataset] [embedding_path]
+#   sbatch run_rkmeans_inference.sh <ckpt_path> [dataset] [embedding_path] [hydra overrides...]
+#
+# Extra args are forwarded to Hydra, mirroring run_rkmeans_train.sh. Assignment is
+# argmin over 256 centroids and needs no GPU, so when the pgpu queue is full this
+# can be run on the compute partition instead:
+#   sbatch --partition=compute --gres=NONE --time=02:00:00 \
+#     run_rkmeans_inference.sh <ckpt> <ds> <emb> trainer.accelerator=cpu trainer.devices=1
 # Example:
 #   sbatch run_rkmeans_inference.sh checkpoints/last.ckpt beauty
 
@@ -101,7 +107,8 @@ python -u -m src.inference \
   num_hierarchies="${RKMEANS_HIER}" \
   codebook_width="${CODEBOOK_WIDTH}" \
   "ckpt_path='${CKPT_PATH}'" \
-  callbacks.pickle_writer.should_merge_files_on_main=false
+  callbacks.pickle_writer.should_merge_files_on_main=false \
+  "${@:4}"
 
 echo "[$(date -Is)] rkmeans inference finished, merging pickle shards..."
 
