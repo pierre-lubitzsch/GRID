@@ -87,7 +87,10 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
         self.top_k_for_generation = top_k_for_generation
         self.forbidden_sids: Optional[Set[Tuple[int, ...]]] = None
         self.filter_mode: str = "global"
-        self.user_forbidden_items: Optional[Dict[int, Set[int]]] = None
+        # user_id -> forbidden SID tuples, used only by filter_mode
+        # "user_dependent". Kept as SIDs (not item ids) because the decode-time
+        # check compares against the beam's emitted codes.
+        self.user_forbidden_sids: Optional[Dict[int, Set[Tuple[int, ...]]]] = None
 
     def _inject_sep_token_between_sids(
         self,
@@ -271,6 +274,7 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
         past_key_values: Union[EncoderDecoderCache, None],
         hierarchy: int,
         batch_size: int,
+        user_id: Optional[torch.Tensor] = None,
     ):
         """
         Perform one step of beam search.
@@ -282,6 +286,10 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
             past_key_values: The cache for past key values.
             hierarchy: The current hierarchy level.
             batch_size: The size of the batch.
+            user_id: Per-row user ids of the ORIGINAL batch (shape ``[B]``),
+                needed only by ``filter_mode="user_dependent"``. Beams are laid
+                out ``b * top_k + k`` by the ``repeat_interleave`` in
+                :meth:`generate`, so ``user_id`` is expanded the same way here.
 
         Returns:
             The updated generated IDs and the marginal probabilities.
@@ -317,18 +325,42 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
                 ).reshape(-1, self.num_embeddings_per_hierarchy)
             candidate_logits[~valid_prefix_mask] = float("-inf")
 
-        # Decode-time filter: mask logits completing a forbidden SID at final hierarchy.
+        # Decode-time filter: mask logits completing a forbidden SID at the final
+        # hierarchy. This is the only point at which a full identifier exists, so
+        # the beam has already committed to the first num_hierarchies-1 codes; a
+        # prefix whose every legal continuation is forbidden is left with nothing.
+        # That cascade is a property of the identifier space, not of this code.
         if (
-            self.forbidden_sids
-            and generated_ids is not None
+            generated_ids is not None
             and hierarchy == self.num_hierarchies - 1
+            and (self.forbidden_sids or self.user_forbidden_sids)
         ):
             batch_beams = generated_ids.reshape(-1, hierarchy)
-            for beam_idx in range(batch_beams.size(0)):
+            n_beams = batch_beams.size(0)
+            per_beam_forbidden: List[Optional[Set[Tuple[int, ...]]]]
+            if str(self.filter_mode) == "user_dependent":
+                if user_id is None:
+                    raise ValueError(
+                        "filter_mode='user_dependent' needs user_id in generate(); "
+                        "got None, which would mask nothing and be recorded as a "
+                        "per-user filter."
+                    )
+                top_k = max(1, n_beams // max(1, int(user_id.numel())))
+                uids = (
+                    user_id.reshape(-1).repeat_interleave(top_k).tolist()
+                )
+                per_beam_forbidden = [
+                    self.user_forbidden_sids.get(int(u)) for u in uids[:n_beams]
+                ]
+            else:
+                per_beam_forbidden = [self.forbidden_sids] * n_beams
+            for beam_idx in range(n_beams):
+                forbidden = per_beam_forbidden[beam_idx]
+                if not forbidden:
+                    continue
                 prefix = batch_beams[beam_idx].tolist()
                 for tok in range(self.num_embeddings_per_hierarchy):
-                    sid = tuple(prefix + [tok])
-                    if sid in self.forbidden_sids:
+                    if tuple(prefix + [tok]) in forbidden:
                         candidate_logits[beam_idx, tok] = float("-inf")
 
         candidate_logits = torch.nn.functional.softmax(candidate_logits, dim=-1)
@@ -664,11 +696,34 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         *,
         forbidden_sids: Optional[Set[Tuple[int, ...]]] = None,
         filter_mode: str = "global",
-        user_forbidden_items: Optional[Dict[int, Set[int]]] = None,
+        user_forbidden_sids: Optional[Dict[int, Set[Tuple[int, ...]]]] = None,
     ) -> None:
+        """Install the decode-time mask used by the ``filter`` unlearning baseline.
+
+        NOTE this is NOT checkpoint state: it lives on the module only. A process
+        that loads a checkpoint produced by the filter baseline (which performs no
+        weight update, so the checkpoint is identical to its source) and does not
+        call this method is evaluating the UNFILTERED model. That is exactly how
+        the filter baseline came to be mis-measured; ``scripts/eval_ckpt_on_test``
+        now reinstalls the mask from ``filter_mask.json`` via ``decode_filter_mask``.
+
+        ``filter_mode="user_dependent"`` requires ``user_forbidden_sids``; a
+        per-user mode with no per-user map would silently degrade to the global
+        one, so it is refused.
+        """
+        filter_mode = str(filter_mode).strip().lower()
+        if filter_mode not in ("global", "user_dependent"):
+            raise ValueError(
+                f"filter_mode must be 'global'|'user_dependent', got {filter_mode!r}"
+            )
+        if filter_mode == "user_dependent" and not user_forbidden_sids:
+            raise ValueError(
+                "filter_mode='user_dependent' needs user_forbidden_sids; without "
+                "it the filter would mask globally and be recorded as per-user."
+            )
         self.forbidden_sids = forbidden_sids
         self.filter_mode = filter_mode
-        self.user_forbidden_items = user_forbidden_items
+        self.user_forbidden_sids = user_forbidden_sids
 
     def _pkm_parameters(self) -> List[torch.nn.Parameter]:
         """All trainable parameters that live inside installed PKM (HashingMemory)
@@ -2174,6 +2229,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 past_key_values=past_key_values,
                 hierarchy=hierarchy,
                 batch_size=input_ids.size(0),
+                user_id=user_id,
             )
 
         return generated_ids, marginal_log_prob

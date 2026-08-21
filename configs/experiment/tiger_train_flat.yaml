@@ -8,6 +8,11 @@ sequence_length: 120
 # for poison datasets). For a clean-baseline run, override with the matching
 # poison dataset's manifest. Missing file -> SH/ASI silently skipped.
 spam_forget_manifest: ${data_dir}/forget_manifest.json
+# Decode-time mask for the `filter` unlearning baseline (filter_mask.json, written
+# at the unlearn run root). That baseline performs no weight update, so its mask is
+# module state and NOT in the checkpoint: leaving this null when evaluating a filter
+# run measures the UNFILTERED model. Null for every other algorithm.
+decode_filter_mask: null
 
 task_name: train
 id: ${now:%Y-%m-%d}/${now:%H-%M-%S}

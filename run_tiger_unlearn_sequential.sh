@@ -374,12 +374,29 @@ if [ "${UNLEARN_RUN_POST_EVAL}" = "true" ]; then
     else
       echo "WARNING: ${DATA_DIR}/forget_manifest.json not found — SH/ASI will be skipped in eval"
     fi
+    # The filter baseline changes NO weights: it masks forbidden semantic ids at
+    # decode time, and that mask lives on the module, not in unlearned.ckpt. The
+    # eval below is a separate process, so without this the filter arms report the
+    # unfiltered poisoned model (which is what they did before 2026-08-21).
+    FILTER_MASK_ARGS=()
+    FILTER_MASK="${UNLEARN_OUTPUT_DIR}/filter_mask.json"
+    if [ "${ALGORITHM}" = "filter" ]; then
+      if [ -f "${FILTER_MASK}" ]; then
+        FILTER_MASK_ARGS+=("decode_filter_mask='${FILTER_MASK}'")
+        echo "Decode filter: ${FILTER_MASK}"
+      else
+        echo "ERROR: algorithm=filter but ${FILTER_MASK} is missing; the eval would" >&2
+        echo "       silently measure the UNFILTERED model. Refusing to run it." >&2
+        exit 1
+      fi
+    fi
     python -u -m scripts.eval_ckpt_on_test \
       experiment=tiger_train_flat \
       data_dir="${UNLEARN_EVAL_DATA_DIR}" \
       "semantic_id_path='${SEMANTIC_ID_PATH}'" \
       "ckpt_path='${FINAL_CKPT}'" \
       "${SPAM_MANIFEST_ARGS[@]}" \
+      ${FILTER_MASK_ARGS[@]+"${FILTER_MASK_ARGS[@]}"} \
       num_hierarchies="${NUM_HIER}" \
       ${SEQ_OVR[@]+"${SEQ_OVR[@]}"} \
       seed="${UNLEARN_SEED}" \

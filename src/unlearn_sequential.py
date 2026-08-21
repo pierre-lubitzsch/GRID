@@ -29,6 +29,10 @@ from src.models.modules.semantic_id.tiger_unlearning_module import (  # noqa: E4
     TigerUnlearningModule,
     save_unlearned_checkpoint,
 )
+from src.components.unlearning.filter_utils import (  # noqa: E402
+    merge_filter_masks,
+    save_filter_mask,
+)
 from src.utils import RankedLogger, extras  # noqa: E402
 from src.utils.custom_hydra_resolvers import *  # noqa: E402, F401, F403
 from src.utils.launcher_utils import pipeline_launcher  # noqa: E402
@@ -292,6 +296,12 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
         os.makedirs(ckpt_dir, exist_ok=True)
         per_request: List[Dict[str, Any]] = []
         prev_ckpt_path: Optional[str] = None
+        # The filter baseline installs a decode mask on the module and performs no
+        # weight update, so the mask is NOT in the checkpoint. Request dirs are
+        # deleted when cleanup_request_dirs is on, which used to take the
+        # per-request filter_mask.json with them; the union is persisted at the run
+        # root so the post-unlearn eval can reinstall it via decode_filter_mask.
+        filter_masks: List[Dict[str, Any]] = []
 
         for k, forget_uids in enumerate(request_batches):
             batch_label = f"batch {k + 1}/{n_batches}"
@@ -332,6 +342,9 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
                 output_dir=request_dir,
                 forget_manifest_path=manifest_path,
             )
+
+            if scif_info.get("filter_mask"):
+                filter_masks.append(scif_info.pop("filter_mask"))
 
             ckpt_path_k = os.path.join(ckpt_dir, f"unlearned_{k}.ckpt")
             if k in ckpt_request_indices:
@@ -394,6 +407,24 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
                 f"[seq] {batch_label} done ({pct}% complete)"
             )
 
+        # Union of the per-request masks, at a path the post-unlearn eval can find.
+        merged_filter_mask_path: Optional[str] = None
+        if filter_masks:
+            merged = merge_filter_masks(filter_masks)
+            if merged is not None:
+                merged_filter_mask_path = save_filter_mask(
+                    merged, os.path.join(out_root, "filter_mask.json")
+                )
+                command_line_logger.info(
+                    f"[seq] filter mask written to {merged_filter_mask_path} "
+                    f"(mode={merged['filter_mode']}, "
+                    f"{len(merged['forbidden_item_ids'])} items, "
+                    f"{len(merged.get('user_forget_items') or {})} users, "
+                    f"union over {merged['n_merged_requests']} requests). "
+                    "Pass decode_filter_mask=<that path> to the eval, or it "
+                    "measures the unfiltered model."
+                )
+
         final_ckpt = os.path.join(ckpt_dir, "unlearned.ckpt")
         last_request_ckpt = os.path.join(
             ckpt_dir, f"unlearned_{len(request_batches) - 1}.ckpt"
@@ -438,6 +469,7 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
             "checkpoint_fractions": checkpoint_fractions,
             "checkpoint_request_indices": sorted(ckpt_request_indices),
             "cleanup_request_dirs": cleanup_request_dirs,
+            "filter_mask_path": merged_filter_mask_path,
             "data_dir": os.path.abspath(data_dir),
             "forget_subdir": forget_subdir,
             "retain_subdir": retain_subdir,

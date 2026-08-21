@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -70,6 +70,74 @@ def forbidden_sids_from_codebook(
         if 0 <= i < cb.shape[0]:
             forbidden.add(tuple(int(x) for x in cb[i].tolist()))
     return forbidden
+
+
+def user_forbidden_sids_from_codebook(
+    codebook: torch.Tensor,
+    user_forget_items: Optional[Dict[Any, Iterable[int]]],
+) -> Dict[int, Set[Tuple[int, ...]]]:
+    """``user_id -> forbidden SID tuples``, for ``filter_mode='user_dependent'``.
+
+    Mirrors :func:`forbidden_sids_from_codebook` but keeps the per-user
+    partition, which is what makes the user-dependent mode different from the
+    global one at decode time. Keys are coerced to ``int`` because a mask that
+    has been through JSON has string keys.
+    """
+    if not user_forget_items:
+        return {}
+    cb = codebook.long()
+    if cb.shape[0] < cb.shape[1]:
+        cb = cb.t()
+    out: Dict[int, Set[Tuple[int, ...]]] = {}
+    for uid, items in user_forget_items.items():
+        sids = {
+            tuple(int(x) for x in cb[int(i)].tolist())
+            for i in items
+            if 0 <= int(i) < cb.shape[0]
+        }
+        if sids:
+            out[int(uid)] = sids
+    return out
+
+
+def merge_filter_masks(
+    masks: Sequence[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Union of a sequence of masks, for the sequential (per-request) driver.
+
+    Request ``k`` only sees its own users, but the model that is finally
+    evaluated has been asked to delete everything up to and including the last
+    request, so the mask the post-unlearn eval applies must be the union. Global
+    masks union their item lists; user-dependent masks union per user. Mixing
+    modes is refused rather than silently resolved: the two make different
+    claims about what the deployed system does.
+    """
+    masks = [m for m in masks if m]
+    if not masks:
+        return None
+    modes = {str(m.get("filter_mode", "global")) for m in masks}
+    if len(modes) > 1:
+        raise ValueError(f"cannot merge filter masks of differing modes: {sorted(modes)}")
+    specs = {str(m.get("deletion_spec")) for m in masks}
+    if len(specs) > 1:
+        raise ValueError(f"cannot merge filter masks of differing deletion specs: {sorted(specs)}")
+    forbidden: Set[int] = set()
+    per_user: Dict[str, Set[int]] = {}
+    for m in masks:
+        forbidden.update(int(x) for x in m.get("forbidden_item_ids") or [])
+        for uid, items in (m.get("user_forget_items") or {}).items():
+            per_user.setdefault(str(int(uid)), set()).update(int(x) for x in items)
+    return {
+        "filter_mode": modes.pop(),
+        "deletion_spec": specs.pop(),
+        "forbidden_item_ids": sorted(forbidden),
+        "user_forget_items": (
+            {uid: sorted(items) for uid, items in sorted(per_user.items(), key=lambda kv: int(kv[0]))}
+            if per_user
+            else None
+        ),
+        "n_merged_requests": len(masks),
+    }
 
 
 def scan_user_forget_items(forget_dir: str) -> Dict[int, Set[int]]:

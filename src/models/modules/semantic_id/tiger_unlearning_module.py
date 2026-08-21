@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from src.components.unlearning.filter_utils import (
     build_filter_mask,
     forbidden_sids_from_codebook,
+    user_forbidden_sids_from_codebook,
     save_filter_mask,
     scan_user_forget_items,
 )
@@ -1103,6 +1104,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             filter_mode=filter_mode,
             user_forget_items=user_map,
         )
+        installed = False
         if semantic_id_path:
             codebook = load_codebook(semantic_id_path)
             forbidden_sids = forbidden_sids_from_codebook(
@@ -1111,7 +1113,15 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             self.set_decode_filter(
                 forbidden_sids=forbidden_sids,
                 filter_mode=filter_mode,
-                user_forbidden_items=user_map,
+                user_forbidden_sids=user_forbidden_sids_from_codebook(
+                    codebook, user_map
+                ),
+            )
+            installed = True
+        else:
+            log.warning(
+                "[filter] semantic_id_path is unset, so no decode mask was "
+                "installed: this run measures the UNFILTERED model."
             )
         mask_path = os.path.join(output_dir or ".", "filter_mask.json")
         save_filter_mask(mask, mask_path)
@@ -1120,7 +1130,14 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             "deletion_spec": deletion_spec,
             "filter_mode": filter_mode,
             "filter_mask_path": os.path.abspath(mask_path),
+            # The mask is module state, not checkpoint state, so a downstream
+            # process must reinstall it (see decode_filter_mask in
+            # scripts/eval_ckpt_on_test). Carried in the info dict so the
+            # sequential driver can persist the union at the run root.
+            "filter_mask": mask,
+            "decode_filter_installed": installed,
             "n_forbidden_items": len(mask["forbidden_item_ids"]),
+            "n_filtered_users": len(user_map or {}),
             "forget_size_input": forget_size_hint,
             "visible_forget_items": sorted(visible_forget),
         }
