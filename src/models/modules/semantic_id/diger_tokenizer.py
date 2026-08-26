@@ -146,6 +146,9 @@ class DigerTokenizer(nn.Module):
         commitment_weight: float = 0.25,
         similarity: str = "neg_l2",
         use_gumbel_noise: bool = True,
+        sigma_scaled_noise: bool = False,
+        sigma_ema_beta: float = 0.1,
+        balance_weight: float = 0.0,
         normalize_inputs: bool = True,
         normalize_residuals: bool = False,
         input_norm: str = "batchnorm",
@@ -172,6 +175,16 @@ class DigerTokenizer(nn.Module):
         # falls 0.0683 -> 0.0283. Kept as an explicit flag so that ablation is
         # runnable rather than encoded as a magic frq_decay_ratio.
         self.use_gumbel_noise = bool(use_gumbel_noise)
+        # SDUD: sigma is the STANDARD DEVIATION OF THE GUMBEL NOISE (paper Sec 4.2:
+        # "Gumbel noise's standard deviation sigma controls the stochasticity of SID
+        # assignment ... sigma ~ 0 yields near-deterministic assignments"), annealed
+        # by sigma* = max(0, sqrt(L_gen) - lambda). It is NOT a reweighting of L_gen.
+        #
+        # Off by default so frqud-only runs (the default mode) are bit-identical to
+        # before; the model turns it on for uncertainty_decay in {sdud, both}.
+        self.sigma_scaled_noise = bool(sigma_scaled_noise)
+        self.sigma_ema_beta = float(sigma_ema_beta)
+        self.balance_weight = float(balance_weight)
         # Match THIS REPO's RQ-KMeans, which sets normalize_inputs /
         # normalize_residuals True by default and whose recursion
         #   r^1 = normalize(z);  r^(l+1) = normalize(r^l - c_{s^l})
@@ -212,6 +225,8 @@ class DigerTokenizer(nn.Module):
         # so act as an identity until enough training-mode batches have gone
         # through. The ids committed early would then be fitted on collapsed
         # latents, silently.
+        # 1.0 = unscaled, i.e. exactly the pre-SDUD noise magnitude.
+        self.register_buffer("noise_sigma", torch.ones(()))
         self.register_buffer("_in_mean", torch.zeros(self.content_dim))
         self.register_buffer("_in_std", torch.ones(self.content_dim))
         self.register_buffer("_in_fitted", torch.zeros((), dtype=torch.long))
@@ -290,7 +305,36 @@ class DigerTokenizer(nn.Module):
             return torch.zeros_like(logits)
         u = torch.rand_like(logits).clamp_(min=1e-9, max=1.0 - 1e-7)
         g = -torch.log(-torch.log(u))
-        return g * hot.to(logits.dtype).unsqueeze(0)
+        noise = g * hot.to(logits.dtype).unsqueeze(0)
+        if self.sigma_scaled_noise:
+            # SDUD: sigma IS the noise standard deviation (paper Eq. 9 / Sec 4.2).
+            noise = noise * self.noise_sigma
+        return noise
+
+    @torch.no_grad()
+    def update_noise_sigma(self, l_gen: torch.Tensor, lam: float) -> torch.Tensor:
+        """Anneal the Gumbel-noise sigma toward the paper's SDUD equilibrium.
+
+            sigma* = max(0, sqrt(L_gen) - lambda)                      (paper Eq. 9)
+
+        Two implementation points the closed form does not settle:
+
+        ONE STEP OF LAG IS UNAVOIDABLE. The noise is sampled inside the forward
+        pass, before ``L_gen`` for that step exists. So the sigma used at step t is
+        derived from the loss at step t-1. Harmless -- this is an annealing
+        schedule, not a per-sample quantity -- but it means sigma is never exactly
+        the current optimum, and an implementation that "fixed" the lag by
+        recomputing sigma after the forward would be scaling nothing.
+
+        EMA, NOT THE RAW VALUE. ``sqrt(L_gen)`` of a single minibatch is noisy, and
+        feeding that straight into the noise scale makes exploration jitter with
+        batch composition rather than with training progress. ``sigma_ema_beta``
+        smooths it; beta=1.0 recovers the raw closed form.
+        """
+        target = torch.clamp(l_gen.detach().float().sqrt() - float(lam), min=0.0)
+        b = self.sigma_ema_beta
+        self.noise_sigma.mul_(1.0 - b).add_(b * target.to(self.noise_sigma.device))
+        return self.noise_sigma
 
     # ---------------------------------------------------------------- forward
     def forward(self, content: torch.Tensor) -> TokenizerOutput:
@@ -324,6 +368,18 @@ class DigerTokenizer(nn.Module):
             # e_hard is detached here so the codebook's gradient for the SELECTED
             # codeword comes from the VQ term below (the RQ-VAE convention)
             # rather than from two paths at once.
+            #
+            # DO NOT "FIX" THIS TO STE-ON-THE-ONE-HOT. Because the gradient reaches
+            # the codebook through `e_soft = y @ codebook`, d/d(codebook) is `y` --
+            # every entry updated, weighted by its Gumbel-Softmax probability. That
+            # is DIGER's defining choice (paper Sec 4.1 / Fig 3: "STE ... gradients
+            # only backpropagate to the selected indices (Hard Update). DIGER ...
+            # employs Soft Update, allowing gradients to flow to all codebook
+            # weighted by their Gumbel-Softmax probabilities", e-bar = sum_i y_i e_i).
+            # The authors' reference repo does STE on the one-hot instead
+            # (`Ind = hard - soft.detach() + soft; x_q = Ind @ W`), which sends the
+            # recommendation gradient to the selected row ONLY -- i.e. the Hard
+            # Update the paper is arguing against. Ours follows the paper.
             e_st = e_hard.detach() + (e_soft - e_soft.detach())
             # Standard VQ terms, on the hard selection (the ST path already
             # carries the recommender's gradient into the codebook).
@@ -342,6 +398,15 @@ class DigerTokenizer(nn.Module):
             residual = residual - e_st
             if self.normalize_residuals:
                 residual = nn.functional.normalize(residual, dim=-1)
+            if self.balance_weight > 0.0:
+                # Code-collapse pressure: push the batch-mean assignment toward
+                # uniform. NOT part of the paper -- neither a balance loss nor
+                # Sinkhorn appears in it; the authors' repo reaches for Sinkhorn
+                # instead. Default 0.0, so this is inert unless asked for.
+                avg = y.mean(dim=0)
+                vq = vq + self.balance_weight * (
+                    avg - 1.0 / self.codebook_size
+                ).abs().sum()
             codes.append(hard)
             probs.append(y)
             if self.training:

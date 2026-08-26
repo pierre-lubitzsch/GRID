@@ -5,7 +5,19 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:nvidia_h200:2
 #SBATCH --partition=pgpu
-#SBATCH --time=2-00:00:00
+#SBATCH --time=12:00:00
+# 12h, not the previous 2 days. Measured over 250 completed tiger_train jobs
+# since 2026-08-01 on beauty/toys/sports: median 5.18h, p90 7.08h, p99 8.78h,
+# max 9.46h -- so this is ~27% above the worst observed case.
+#
+# Two reasons the old 2-day request was actively harmful: a maintenance
+# reservation refuses any job whose walltime crosses it outright
+# ("ReqNodeNotAvail, Reserved for maintenance"), and long requests backfill
+# badly on a small partition.
+#
+# EXCEPTIONS that need an override: food_k5 (~24.6h, deferred from the grid on
+# exactly this cost) and rsc15 (dropped). Use `sbatch --time=...`, which beats
+# this directive.
 
 # Resource notes:
 # * --gres=gpu:nvidia_h200:2 + --partition=pgpu: requests 2 H200s (s-sc-pgpu[11-16]).
@@ -380,7 +392,11 @@ case "${ITEM_TOKEN_AGG_LC}" in
     ;;
 esac
 
-echo "[$(date -Is)] Starting tiger train (tiger_train_flat) dataset=${DATASET} variant=${VARIANT}"
+# Print the RESOLVED experiment, not a hardcoded name: with MODEL=diger this
+# line used to claim "tiger_train_flat" while line 407 correctly launched
+# diger_train_flat, which is maximally confusing in exactly the situation where
+# you are debugging the model axis.
+echo "[$(date -Is)] Starting ${MODEL:-tiger} train (${GRID_TRAIN_EXPERIMENT}) dataset=${DATASET} variant=${VARIANT}"
 echo "Using data_dir=${DATA_DIR}"
 echo "Using semantic_id_path=${SEMANTIC_ID_PATH}"
 echo "Run dir: ${HYDRA_RUN_DIR}"

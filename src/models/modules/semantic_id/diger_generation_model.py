@@ -59,6 +59,11 @@ from src.models.modules.semantic_id.tiger_generation_model import (
 
 log = logging.getLogger(__name__)
 
+# How many training steps to observe before concluding that injection never
+# fires. Large enough that an unlucky run of all-padding micro-batches cannot
+# trip it, small enough to catch a genuinely broken run early.
+_DIGER_NOAUX_GRACE_STEPS = 50
+
 
 class DigerEncoderDecoder(SemanticIDEncoderDecoder):
     """TIGER backbone + :class:`DigerTokenizer`, trained jointly.
@@ -175,6 +180,12 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
             )
         mode = self.diger_uncertainty_decay
         self.diger_use_sdud = bool(diger_use_sdud) and mode in ("sdud", "both")
+        # SDUD's sigma is the GUMBEL NOISE STANDARD DEVIATION (paper Sec 4.2), not a
+        # weight on L_gen. Until 2026-08-25 this was computed for the L_sigma term
+        # and then thrown away, so `sdud`/`both` annealed the loss weight and left
+        # the noise magnitude fixed -- the exploration schedule the paper describes
+        # never actually happened. Wire it to the tokenizer.
+        self.tokenizer.sigma_scaled_noise = self.diger_use_sdud
         if mode in ("sdud", "none"):
             # No frequency gate: explore everywhere.
             self.tokenizer.frq_decay_ratio = 0.0
@@ -186,6 +197,11 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
         )
         self._diger_aux: Dict[str, torch.Tensor] = {}
         self._diger_injected = 0
+        # Injection-rate bookkeeping. A single training step with no resolvable
+        # item block is NORMAL (a batch can be all padding), so the condition
+        # worth warning about is "never fires", not "did not fire once".
+        self._diger_steps = 0
+        self._diger_steps_injected = 0
         if not hasattr(self, "_adaptive_sorted_keys"):
             self._build_code_to_item_index()
 
@@ -333,19 +349,46 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
         n = max(1, self._diger_injected)
         vq = self._diger_aux.get("vq")
         recon = self._diger_aux.get("recon")
+        if self.training:
+            self._diger_steps += 1
+            if vq is not None:
+                self._diger_steps_injected += 1
         if vq is None:
-            # No item block was identifiable, so the tokenizer contributed
-            # nothing this step. Warn once -- silently training plain TIGER
-            # under a DIGER config is the failure mode worth catching early.
-            if not getattr(self, "_diger_noaux_warned", False):
+            # No item block was identifiable THIS step, which on its own is
+            # unremarkable: a beauty batch is ~93% padding, so an occasional
+            # micro-batch resolves nothing. The failure worth catching is the
+            # tokenizer NEVER receiving gradient, i.e. silently training plain
+            # TIGER under a DIGER config.
+            #
+            # Warning on the first miss (the previous behaviour) permanently
+            # mislabels healthy runs: SMOKE4 emitted it once and still finished
+            # with train/diger_vq=3.20 and train/diger_recon=0.52, which are
+            # only logged when injection DID fire.
+            if (
+                self.training
+                and not getattr(self, "_diger_noaux_warned", False)
+                and self._diger_steps >= _DIGER_NOAUX_GRACE_STEPS
+                and self._diger_steps_injected == 0
+            ):
                 self._diger_noaux_warned = True
                 log.warning(
-                    "[diger] no soft-SID injection fired in a training step; the "
-                    "tokenizer is receiving no gradient. Check that codebooks/"
-                    "item_content are aligned to the batch's item ids."
+                    "[diger] soft-SID injection has not fired in ANY of the "
+                    "first %d training steps; the tokenizer is receiving no "
+                    "gradient and this run is plain TIGER with extra loss "
+                    "terms. Check that codebooks/item_content are aligned to "
+                    "the batch's item ids (src/diagnose_diger.py reports the "
+                    "resolve rate on one real batch).",
+                    self._diger_steps,
                 )
             return model_output, loss
-        gen = sdud_loss(loss, lam=self.diger_sdud_lambda) if self.diger_use_sdud else loss
+        if self.diger_use_sdud:
+            gen = sdud_loss(loss, lam=self.diger_sdud_lambda)
+            if self.training:
+                # Sets the noise sigma used by the NEXT forward pass; see
+                # DigerTokenizer.update_noise_sigma on the one-step lag.
+                self.tokenizer.update_noise_sigma(loss, self.diger_sdud_lambda)
+        else:
+            gen = loss
         total = (
             gen
             + self.diger_lambda_vq * (vq / n)
@@ -358,6 +401,9 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
                     "train/diger_vq": (vq / n).detach(),
                     "train/diger_recon": (recon / n).detach(),
                     "train/diger_hot_frac": self.tokenizer.hot_code_fraction().mean(),
+                    # The exploration schedule. Should start near sqrt(L_gen) and
+                    # decay toward 0; flat at 1.0 means sigma is not wired.
+                    "train/diger_noise_sigma": self.tokenizer.noise_sigma.detach(),
                 },
                 on_step=True,
                 on_epoch=False,
@@ -496,6 +542,14 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
             )
         except Exception as exc:  # never let a probe kill training
             log.warning("[diger] health probe failed: %s", exc)
+        if self._diger_steps:
+            rate = 100.0 * self._diger_steps_injected / self._diger_steps
+            log.info(
+                "[diger] epoch %d: soft-SID injection fired on %d/%d training "
+                "steps (%.1f%%)",
+                int(self.current_epoch), self._diger_steps_injected,
+                self._diger_steps, rate,
+            )
         every = self.diger_commit_every_n_epochs
         if every > 0 and (int(self.current_epoch) + 1) % every == 0:
             changed = self.commit_semantic_ids()

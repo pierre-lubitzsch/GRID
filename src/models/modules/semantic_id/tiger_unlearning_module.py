@@ -663,9 +663,15 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 f"{n_items} items"
             )
 
-        # Correctness anchor: refuses unless phi=0 reproduces every stored code.
+        # Correctness anchor: refuses unless phi=0 reproduces the stored codes.
+        # Default is exact (1.0). It is a config knob because a single item
+        # differing by a quantisation tie-break is not the failure this guards
+        # against -- a silently reassigned catalog shows up as a large fraction,
+        # not as 1 item in 12k -- and blocking a whole track on that is worse
+        # than accepting a bounded, stated mismatch.
         assert_reproduces_sids(
-            z, [centroids[i] for i in range(n_levels)], codes, **res_kwargs
+            z, [centroids[i] for i in range(n_levels)], codes,
+            tol=float(cfg.get("tracer_sid_tolerance", 1.0)), **res_kwargs
         )
 
         # Target items live under ctx["meta"], not ctx itself -- reading the

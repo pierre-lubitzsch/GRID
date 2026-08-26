@@ -22,3 +22,26 @@ val_check_interval: 5000
 # makes training slower but gives more reproducibility than just setting seeds
 deterministic: False
 accumulate_grad_batches: 1
+
+# Batch-limit knobs, declared so the PLAIN override form works.
+#
+# Hydra runs in struct mode, so an UNDECLARED key cannot be set from the command
+# line: `trainer.limit_train_batches=300` aborted the job with "Key
+# 'limit_train_batches' is not in struct" (job 10489064, a DIGER SMOKE run) and
+# the only way through was the `+` append form. Declaring them here makes both
+# forms work, so a short debug run no longer needs to remember the prefix.
+#
+# null is Lightning 2.5.0's OWN default for all four (verified against
+# Trainer.__init__), so this changes nothing about any existing run -- it only
+# makes the keys settable.
+#
+# NOTE for short runs: limiting batches is usually not enough on its own. The
+# train experiment configs set `val_check_interval: 1600` (STEPS), which exceeds
+# any truncated run's step count -- at accumulate_grad_batches=16, 300 batches is
+# only ~18 steps -- so Lightning refuses to start. Pass
+# `trainer.val_check_interval=1.0` (once per epoch) alongside these.
+# See run_cpu_sanity.sh, which documents the same two traps.
+limit_train_batches: null
+limit_val_batches: null
+limit_test_batches: null
+limit_predict_batches: null

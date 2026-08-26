@@ -288,6 +288,23 @@ model:
     # codebook within a handful of steps.
     normalize_inputs: true
     normalize_residuals: false   # RQ-VAE convention (RQ-KMeans uses true)
+    # --- SDUD: sigma is the GUMBEL NOISE STD, not a loss weight -------------
+    # Paper Sec 4.2: "Gumbel noise's standard deviation sigma controls the
+    # stochasticity of SID assignment ... sigma ~ 0 yields near-deterministic
+    # assignments", annealed by sigma* = max(0, sqrt(L_gen) - lambda) (Eq. 9).
+    # Enabled automatically by unlearning-style modes sdud/both via
+    # diger_uncertainty_decay -- do NOT set sigma_scaled_noise here.
+    #
+    # EMA smoothing on sigma*. sqrt(L_gen) of one minibatch is noisy, so feeding
+    # it raw makes exploration jitter with batch composition instead of training
+    # progress. 1.0 = raw closed form, no smoothing.
+    sigma_ema_beta: 0.1
+    # --- code-collapse pressure (NOT in the paper) ---------------------------
+    # |mean_batch(y) - 1/K|_1 per level, added to L_vq. The paper has neither a
+    # balance loss nor Sinkhorn; the authors' repo uses Sinkhorn instead. 0.0 =
+    # off, which is the paper-faithful setting. Raise it only if the code
+    # histogram shows collapse (watch train/diger_hot_frac).
+    balance_weight: 0.0
   feature_to_model_input_map:
     sequence_data: input_ids
     user_id: user_id
@@ -479,7 +496,16 @@ trainer:
   accumulate_grad_batches: 16
   profiler:
     _target_: lightning.pytorch.profilers.PassThroughProfiler
-  strategy: ddp
+  # DIGER's tokenizer is CONDITIONALLY used: _inject_soft_sid_embeddings only
+  # runs the tokenizer on item blocks that _codes_to_item_ids resolves, and a
+  # real beauty batch is ~93% padding (sessions average ~7 items against a
+  # 30-item window), so a step whose micro-batch resolves nothing leaves the
+  # tokenizer's 17 tensors without gradient. Plain `ddp` sets
+  # find_unused_parameters=False and hard-errors on exactly that:
+  #   "Parameter indices which did not receive grad for rank 0: 127 ... 143"
+  # which is the 17 tokenizer tensors, and is what killed the 2026-08-20 runs
+  # before they reached a single validation.
+  strategy: ddp_find_unused_parameters_true
   sync_batchnorm: true
   num_sanity_val_steps: 0
   min_epochs: 0

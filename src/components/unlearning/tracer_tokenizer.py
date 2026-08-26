@@ -432,11 +432,18 @@ def assert_reproduces_sids(
         log.info("[tracer] level %d: phi=0 reproduces %.2f%% of stored codes", lvl, a * 100)
     worst = min(agree)
     if worst < tol:
+        n = int(codes[0].numel())
+        miss = [int(round((1.0 - a) * n)) for a in agree]
         raise ValueError(
             f"phi=0 reproduces only {worst * 100:.2f}% of stored codes "
-            f"(per level: {[round(a * 100, 2) for a in agree]}). The centroids do "
-            "not match this SID tensor, so TRACER would reassign items before any "
-            "unlearning. Check that the codebook checkpoint is the one this "
+            f"({max(miss)} of {n} items mismatch at the worst level; per level "
+            f"{miss} items = {[round(a * 100, 2) for a in agree]}%). "
+            "A handful of items usually means a quantisation TIE-BREAK, not a "
+            "wrong codebook -- raise unlearning.tracer_sid_tolerance slightly "
+            "(e.g. 0.999) to accept it, having checked the count is small. A "
+            "large fraction means the centroids do "
+            "not match this SID tensor, so TRACER would reassign items before "
+            "any unlearning. Check that the codebook checkpoint is the one this "
             "semantic_id_path was generated from, and that the residual recipe "
             "came from load_rq_quantizer rather than being chosen by hand."
         )

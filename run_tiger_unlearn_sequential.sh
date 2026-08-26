@@ -6,7 +6,21 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:nvidia_h200:2
 #SBATCH --partition=pgpu
-#SBATCH --time=1-00:00:00
+# 2h. Most beauty/toys/sports spam cells finish in 7-20 min, but the tail is
+# long: `bw_tgtmid_scif_d0.1_n0.5_useed3` took 31:47 and
+# `bw_tgtunpopular_fanchuan_t1.15_lr0.001_useed3` 27:26, so 1h left too little
+# margin for the slower datasets and algorithms. Override per submission with
+# `sbatch --time=...`, which beats this directive -- the sweep exposes that as
+# UNLEARN_TIME.
+#SBATCH --time=02:00:00
+# 2h. Measured over 221 completed runs on beauty/toys/sports: unified 6.2m
+# median / 9.9m max, unified WITH the neighbourhood term 5.2m / 8.2m (the term
+# is not the cost), tracer 45.6m / 49.0m. TRACER is the binding case at 2.4x
+# headroom; everything else has 12x. Shorter limits backfill far better and, with the
+# 2026-08-27 maintenance reservation, a 1-day request is refused outright
+# ("ReqNodeNotAvail, Reserved for maintenance") while a 6h one still schedules.
+# food_k5 and rsc15 are the exceptions that need more; neither is in the active
+# grid (food_k5 deferred on cost, rsc15 dropped).
 
 set -euo pipefail
 

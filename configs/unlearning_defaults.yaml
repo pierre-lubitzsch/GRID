@@ -113,6 +113,12 @@ unlearning:
   neg_train_optimizer: null
   finetune_optimizer: null
   unified_optimizer: null
+  # Minimum fraction of stored codes that phi=0 must reproduce before TRACER
+  # will run. 1.0 = exact, and that is the default: the check exists to catch a
+  # codebook that does not belong to this SID tensor. Lower it only for a
+  # mismatch you have counted and understood (toys/rqvae: 1 item of 11,924, a
+  # tie-break), never to make an unexplained failure go away.
+  tracer_sid_tolerance: 1.0
   tracer_optimizer: null
 
   # Fine-tune baseline

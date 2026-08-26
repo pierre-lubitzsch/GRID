@@ -341,6 +341,12 @@ unlearning:
   tracer_rqkmeans_ckpt: null
   tracer_levels: null          # null -> num_hierarchies - 1 (last digit is dedup)
   tracer_temperature: 0.005    # paper's band is 0.003-0.009
+  # Minimum fraction of stored codes that phi=0 must reproduce before TRACER
+  # will run. 1.0 = exact, and that is the default: the check exists to catch a
+  # codebook that does not belong to this SID tensor. Lower it only for a
+  # mismatch you have counted and understood (toys/rqvae: 1 item of 11,924, a
+  # tie-break), never to make an unexplained failure go away.
+  tracer_sid_tolerance: 1.0
   tracer_lambda_forget: 1.0    # l1
   tracer_lambda_coherence: 1.0 # l2
   tracer_lambda_reg: 0.001     # l3, the L1 on phi
