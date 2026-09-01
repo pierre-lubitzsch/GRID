@@ -74,6 +74,28 @@ _MODELS: Dict[str, ModelSpec] = {
         ),
         differentiable_ids=True,
     ),
+    "letter": ModelSpec(
+        name="letter",
+        target=(
+            "src.models.modules.semantic_id.letter_generation_model"
+            ".LetterEncoderDecoder"
+        ),
+        train_experiment="letter_train_flat",
+        inference_experiment="letter_inference_flat",
+        unlearn_experiment="letter_unlearn_scif_flat",
+        run_tag_prefix="letter_",
+        description=(
+            "LETTER (arXiv:2405.07314): TIGER backbone over semantic IDs from a "
+            "LEARNABLE tokenizer -- an RQ-VAE regularised by a collaborative "
+            "InfoNCE term and a codebook diversity term, with Sinkhorn-balanced "
+            "assignment on the final level."
+        ),
+        # False, and the distinction matters: LETTER's tokenizer is learnable but
+        # trained in its OWN stage, so the ids are frozen before the recommender
+        # starts and an unlearning update cannot move them. Only DIGER's joint
+        # tokenizer needs its ids re-committed after unlearning.
+        differentiable_ids=False,
+    ),
 }
 
 

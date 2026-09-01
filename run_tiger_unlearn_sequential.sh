@@ -214,6 +214,10 @@ case "${UNLEARN_RUN_TAG}" in
   "${GRID_MODEL_TAG}"*) ;;                       # already prefixed
   *) UNLEARN_RUN_TAG="${GRID_MODEL_TAG}${UNLEARN_RUN_TAG}" ;;
 esac
+# Map the tiger experiment chosen above onto this MODEL's own config. Identity
+# for MODEL=tiger, so every recorded sequential run reproduces unchanged; fails
+# loudly (rather than three screens into Hydra) if the model has no such config.
+EXPERIMENT="$(grid_model_config "${EXPERIMENT}")" || exit 1
 # NOTE for anyone adding a non-tiger sweep: the sweep drivers run their OWN
 # duplicate guard with `find logs/unlearn/runs -name "*_bs1_<tag>"` using the tag
 # they pass in. Since this line prefixes the tag afterwards, that guard would be
@@ -405,7 +409,7 @@ if [ "${UNLEARN_RUN_POST_EVAL}" = "true" ]; then
       fi
     fi
     python -u -m scripts.eval_ckpt_on_test \
-      experiment=tiger_train_flat \
+      experiment="$(grid_model_config tiger_train_flat)" \
       data_dir="${UNLEARN_EVAL_DATA_DIR}" \
       "semantic_id_path='${SEMANTIC_ID_PATH}'" \
       "ckpt_path='${FINAL_CKPT}'" \

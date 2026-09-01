@@ -72,6 +72,14 @@ GRID_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "${GRID_DIR}"
 mkdir -p logs
 
+# MODEL selects the recommender ARCHITECTURE (tiger default | diger | letter).
+# grid_model_config maps the tiger experiment names below onto that model's own
+# configs; for MODEL=tiger it is the identity, so every recorded run is
+# unchanged. See scripts/resolve_model.sh and src/models/registry.py.
+# shellcheck source=scripts/resolve_model.sh
+source "${GRID_DIR}/scripts/resolve_model.sh"
+resolve_model "${MODEL:-tiger}" || exit 1
+
 # shellcheck source=scripts/unlearn_run_dir.sh
 source "${GRID_DIR}/scripts/unlearn_run_dir.sh"
 UNLEARN_OUTPUT_DIR="$(unlearn_build_output_dir "${GRID_DIR}")"
@@ -123,7 +131,7 @@ fi
 
 # Hydra: quote values that contain '=' (Lightning checkpoint filenames).
 python -u -m src.unlearn \
-  experiment=tiger_unlearn_scif_flat \
+  experiment="$(grid_model_config tiger_unlearn_scif_flat)" \
   data_dir="${DATA_DIR}" \
   "semantic_id_path='${SEMANTIC_ID_PATH}'" \
   "ckpt_path='${CKPT_PATH}'" \

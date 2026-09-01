@@ -216,3 +216,105 @@ class RotationTrickQuantization(QuantizationStrategy):
             batch, embeddings
         )  # batch_size x embedding_dim
         return ids, embeddings, reconstruction_loss_embeddings
+
+
+@torch.no_grad()
+def sinkhorn(
+    distances: torch.Tensor, epsilon: float, n_iters: int
+) -> torch.Tensor:
+    """Sinkhorn-Knopp normalisation of ``exp(-distances / epsilon)``.
+
+    Ported verbatim from LETTER's ``RQ-VAE/models/layers.py`` (which in turn
+    follows SwAV): alternately normalise columns to ``1/B`` and rows to ``1/K``
+    so the result is a doubly-stochastic transport plan, then rescale by ``B``
+    so each sample's row sums to 1.
+
+    Args:
+        distances: ``[B, K]`` distances from samples to codes.
+        epsilon: entropic regularisation. Smaller = closer to a hard balanced
+            assignment, and also closer to numerical overflow.
+        n_iters: Sinkhorn iterations.
+
+    Returns:
+        ``[B, K]`` soft assignment; ``argmax`` over dim 1 gives the balanced
+        code for each sample.
+    """
+    q = torch.exp(-distances / epsilon)
+    b, k = q.shape[0], q.shape[1]
+    q = q / q.sum(-1, keepdim=True).sum(-2, keepdim=True)
+    for _ in range(n_iters):
+        q = q / torch.sum(q, dim=1, keepdim=True)
+        q = q / b
+        q = q / torch.sum(q, dim=0, keepdim=True)
+        q = q / k
+    return q * b
+
+
+def center_distances_for_constraint(distances: torch.Tensor) -> torch.Tensor:
+    """Rescale distances to roughly ``[-1, 1]`` before Sinkhorn.
+
+    ``exp(-d / epsilon)`` with ``epsilon ~ 3e-3`` underflows to exactly zero for
+    any un-centred squared-Euclidean distance, which makes every row of ``Q``
+    all-zero and the resulting ``argmax`` a constant. LETTER centres first for
+    exactly this reason; without it the balanced assignment silently degenerates
+    to "everything gets code 0".
+    """
+    max_distance = distances.max()
+    min_distance = distances.min()
+    middle = (max_distance + min_distance) / 2
+    amplitude = max_distance - middle + 1e-5
+    return (distances - middle) / amplitude
+
+
+class SinkhornQuantization(STEQuantization):
+    """STE quantization with Sinkhorn-balanced code assignment (LETTER).
+
+    LETTER uses this on the LAST codebook level (``sk_epsilons`` defaults to
+    ``[0, 0, 0, 0.003]``) to spread items evenly over that level's codes rather
+    than letting a nearest-neighbour rule pile them onto a few popular codes.
+    Balanced assignment is one of the paper's three "code assignment diversity"
+    mechanisms, alongside the diversity loss.
+
+    ``epsilon <= 0`` degrades to plain :class:`STEQuantization`, which is how the
+    non-final levels are configured. Assignment is balanced WITHIN A BATCH, so
+    the effect depends on batch size; it is also training-time only in the sense
+    that :meth:`BaseClusteringModule.predict_step` (used for the final ID
+    assignment) always takes the ``argmin``, matching LETTER's ``use_sk=False``
+    at tokenization time.
+    """
+
+    def __init__(
+        self,
+        epsilon: float = 0.0,
+        n_iters: int = 50,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+        self.n_iters = n_iters
+
+    def quantize(
+        self,
+        codebook: torch.Tensor,
+        batch: torch.Tensor,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.epsilon <= 0:
+            return super().quantize(codebook=codebook, batch=batch, **kwargs)
+
+        distances = self.distance_function.compute(batch, codebook)
+        q = sinkhorn(
+            center_distances_for_constraint(distances).double(),
+            self.epsilon,
+            self.n_iters,
+        )
+        if torch.isnan(q).any() or torch.isinf(q).any():
+            # Fall back rather than emit a constant id: a NaN row argmaxes to 0
+            # for every sample, which looks like a working codebook that has
+            # collapsed.
+            ids = torch.argmin(distances, dim=-1)
+        else:
+            ids = torch.argmax(q, dim=-1)
+        embeddings = codebook[ids]
+        reconstruction_loss_embeddings = batch + (embeddings - batch).detach()
+        return ids, embeddings, reconstruction_loss_embeddings

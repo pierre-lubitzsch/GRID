@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -161,24 +161,75 @@ class CustomSpamMetric(CustomMeanReductionMetric):
     ``is_spam_label`` (B,) whether the ground-truth label is itself a target.
     """
 
-    def __init__(self, top_k: int, num_targets: int = 1, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        top_k: int,
+        num_targets: int = 1,
+        forget_user_ids: Optional[Sequence[int]] = None,
+        user_scope: str = "all",
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.top_k = top_k
         self.num_targets = max(1, int(num_targets))
+        # User scope. A sensitive deletion is a request by SPECIFIC users, so a
+        # single population-wide number cannot express whether the request was
+        # honoured: with 14 requesting users out of 22,363, at most 0.06% of a
+        # global SH@k drop can come from them, so a 39% drop is ~96% removal for
+        # users who never asked. Scoping the same metric to the two populations
+        # separates deletion efficacy from collateral over-removal:
+        #   "forget" -> should fall to ~0 (the request was honoured)
+        #   "retain" -> should stay at base (everyone else still wants the item)
+        if user_scope not in ("all", "forget", "retain"):
+            raise ValueError(
+                f"user_scope must be one of all/forget/retain, got {user_scope!r}"
+            )
+        self.user_scope = user_scope
+        if user_scope != "all" and not forget_user_ids:
+            raise ValueError(
+                f"user_scope={user_scope!r} requires a non-empty forget_user_ids"
+            )
+        self.register_buffer(
+            "forget_user_ids",
+            torch.as_tensor(sorted(set(int(u) for u in (forget_user_ids or []))),
+                            dtype=torch.long),
+            persistent=False,
+        )
+
+    def _scope_mask(
+        self, user_ids: Optional[torch.Tensor], batch_size: int, device
+    ) -> torch.Tensor:
+        """(B,) bool: which examples this metric's user scope counts."""
+        if self.user_scope == "all":
+            return torch.ones(batch_size, dtype=torch.bool, device=device)
+        if user_ids is None:
+            raise ValueError(
+                f"user_scope={self.user_scope!r} needs per-example user_ids, but "
+                "the evaluator passed none. Check that the data config keeps "
+                "user_id (keep_user_id: true) and that eval_step forwards it."
+            )
+        uid = user_ids.reshape(-1).to(device)
+        in_forget = torch.isin(uid, self.forget_user_ids.to(device))
+        return in_forget if self.user_scope == "forget" else ~in_forget
 
     def update(
         self,
         preds: torch.Tensor,
         is_spam_cand: torch.Tensor,
         is_spam_label: torch.Tensor,
+        user_ids: Optional[torch.Tensor] = None,
     ) -> None:
         k = min(self.top_k, preds.size(1))
         topk_idx = torch.topk(preds, k, dim=1)[1]
         spam_in_topk = is_spam_cand.gather(1, topk_idx)  # (B, k) bool
-        self._accumulate(spam_in_topk, is_spam_label.bool())
+        keep = self._scope_mask(user_ids, preds.size(0), preds.device)
+        self._accumulate(spam_in_topk, is_spam_label.bool(), keep)
 
     def _accumulate(
-        self, spam_in_topk: torch.Tensor, is_spam_label: torch.Tensor
+        self,
+        spam_in_topk: torch.Tensor,
+        is_spam_label: torch.Tensor,
+        keep: torch.Tensor,
     ) -> None:
         raise NotImplementedError
 
@@ -187,9 +238,14 @@ class SpamHitRate(CustomSpamMetric):
     """SH@k: fraction of non-target eval examples whose top-k contains a target."""
 
     def _accumulate(
-        self, spam_in_topk: torch.Tensor, is_spam_label: torch.Tensor
+        self,
+        spam_in_topk: torch.Tensor,
+        is_spam_label: torch.Tensor,
+        keep: torch.Tensor,
     ) -> None:
-        nonspam = ~is_spam_label
+        # `keep` restricts BOTH numerator and denominator, so a scoped metric is
+        # the same ratio measured on a subpopulation, not a diluted global one.
+        nonspam = (~is_spam_label) & keep
         hits = spam_in_topk.any(dim=1) & nonspam
         self.metric_values += hits.sum().item()
         self.total_values += nonspam.sum().item()  # denom: # non-target examples
@@ -204,14 +260,18 @@ class AvgSpamItems(CustomSpamMetric):
     """
 
     def _accumulate(
-        self, spam_in_topk: torch.Tensor, is_spam_label: torch.Tensor
+        self,
+        spam_in_topk: torch.Tensor,
+        is_spam_label: torch.Tensor,
+        keep: torch.Tensor,
     ) -> None:
-        nonspam = ~is_spam_label
+        nonspam = (~is_spam_label) & keep
         cap = max(1, min(self.num_targets, self.top_k))
         per_example = spam_in_topk.sum(dim=1).float() / cap
         per_example = per_example * nonspam.float()  # zero out target-labelled
         self.metric_values += per_example.sum().item()
-        self.total_values += is_spam_label.numel()  # denom: |U| (all examples)
+        # denom: |U| within scope (target-labelled examples still counted)
+        self.total_values += int(keep.sum().item())
 
 
 class TargetProbMass(CustomSpamMetric):
@@ -237,13 +297,15 @@ class TargetProbMass(CustomSpamMetric):
         preds: torch.Tensor,
         is_spam_cand: torch.Tensor,
         is_spam_label: torch.Tensor,
+        user_ids: Optional[torch.Tensor] = None,
     ) -> None:
         # preds: (B, C) linear marginal prob of each generated candidate.
         # is_spam_cand: (B, C) bool — candidate's full SID matches a target item.
-        # is_spam_label is unused (TPM is over all queries q ∈ Q).
+        # is_spam_label is unused (TPM is over all queries q ∈ Q in scope).
+        keep = self._scope_mask(user_ids, preds.size(0), preds.device)
         mass = (preds * is_spam_cand.to(preds.dtype)).sum(dim=1)  # (B,)
-        self.metric_values += mass.sum().item()
-        self.total_values += int(preds.size(0))  # denom: |Q| (all queries)
+        self.metric_values += float((mass * keep.to(mass.dtype)).sum().item())
+        self.total_values += int(keep.sum().item())  # denom: |Q| in scope
 
 
 ## Evaluators
@@ -399,6 +461,13 @@ class SIDRetrievalEvaluator(Evaluator):
         # clean/unpoisoned runs without a manifest simply don't emit them.
         self.spam_target_sids: Optional[torch.Tensor] = None
         self.num_spam_targets: int = 0
+        # Users who actually requested the deletion. Present for a sensitive
+        # manifest; absent (or empty) for a spam one, where the "forget users"
+        # are injected fakes that carry no eval examples and the global number is
+        # already the right question.
+        self.forget_user_ids: List[int] = self._load_forget_user_ids(
+            forget_manifest_path
+        )
         if spam_metrics:
             self.spam_target_sids, self.num_spam_targets = self._load_spam_target_sids(
                 forget_manifest_path, semantic_id_path, num_hierarchies
@@ -412,12 +481,58 @@ class SIDRetrievalEvaluator(Evaluator):
                             sync_on_compute=False,
                             compute_with_cache=False,
                         )
+                        # Scoped twins. Registered only when the manifest names
+                        # the requesting users, so spam runs are byte-identical
+                        # to before and no existing table changes.
+                        if self.forget_user_ids:
+                            for scope, suffix in (("forget", "F"), ("retain", "R")):
+                                self.metrics[f"{metric_name}{suffix}@{top_k}"] = (
+                                    metric_object(
+                                        top_k=top_k,
+                                        num_targets=self.num_spam_targets,
+                                        forget_user_ids=self.forget_user_ids,
+                                        user_scope=scope,
+                                        sync_on_compute=False,
+                                        compute_with_cache=False,
+                                    )
+                                )
+                if self.forget_user_ids:
+                    print(
+                        "[SIDRetrievalEvaluator] scoped spam metrics enabled: "
+                        f"{len(self.forget_user_ids)} forget users; emitting "
+                        "<name>F@k (requesting users) and <name>R@k (everyone "
+                        "else) alongside the global <name>@k."
+                    )
             else:
                 print(
                     "[SIDRetrievalEvaluator] spam_metrics requested but no spam "
                     f"targets loaded (forget_manifest_path={forget_manifest_path!r}, "
                     f"semantic_id_path={semantic_id_path!r}); SH/ASI skipped."
                 )
+
+    @staticmethod
+    def _load_forget_user_ids(forget_manifest_path: Optional[str]) -> List[int]:
+        """User ids named by the manifest as having requested the deletion.
+
+        Returns [] when the manifest is missing or records no users, which
+        disables the scoped metrics rather than failing: a spam manifest has no
+        real requesting users, so only the global number is meaningful there.
+        """
+        if not forget_manifest_path or not os.path.isfile(forget_manifest_path):
+            return []
+        try:
+            with open(forget_manifest_path, encoding="utf-8") as f:
+                man = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return []
+        # `spam_user_ids` is the manifest's spelling for both scenarios; for a
+        # sensitive deletion these are the real users who asked.
+        if man.get("scenario") != "sensitive":
+            return []
+        raw = man.get("spam_user_ids") or []
+        if not isinstance(raw, list):
+            return []
+        return sorted({int(u) for u in raw})
 
     @staticmethod
     def _load_spam_target_sids(
@@ -456,6 +571,7 @@ class SIDRetrievalEvaluator(Evaluator):
         marginal_probs: torch.Tensor,
         generated_ids: torch.Tensor,
         labels: torch.Tensor,
+        user_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         batch_size, num_candidates, num_hierarchies = generated_ids.shape
@@ -503,10 +619,12 @@ class SIDRetrievalEvaluator(Evaluator):
                 (lbl.unsqueeze(1) == st.unsqueeze(0)).all(dim=2).any(dim=1)
             )  # (B,) bool
             preds_2d = marginal_probs.reshape(batch_size, num_candidates)
+            uid = None if user_ids is None else user_ids.reshape(batch_size)
             for _, metric_object in self.metrics.items():
                 if isinstance(metric_object, CustomSpamMetric):
                     metric_object.update(
                         preds_2d,
                         is_spam_cand.to(preds.device),
                         is_spam_label.to(preds.device),
+                        user_ids=uid,
                     )

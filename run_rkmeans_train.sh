@@ -90,7 +90,13 @@ mkdir -p "${LOCAL_CKPT_DIR}"
 QUANTIZER="${QUANTIZER:-rkmeans}"
 case "${QUANTIZER}" in
   rkmeans|rqvae|rvq) ;;
-  *) echo "QUANTIZER must be rkmeans|rqvae|rvq, got '${QUANTIZER}'" >&2; exit 1 ;;
+  # LETTER's tokenizer, for training it on its own rather than through the
+  # end-to-end run_letter_sid.sh. It additionally needs cf_embedding_path, which
+  # has to be passed as a trailing Hydra override:
+  #   QUANTIZER=letter_rqvae sbatch run_rkmeans_train.sh beauty '' \
+  #     "cf_embedding_path='embeddings/beauty_cf64.pt'"
+  letter_rqvae) ;;
+  *) echo "QUANTIZER must be rkmeans|rqvae|rvq|letter_rqvae, got '${QUANTIZER}'" >&2; exit 1 ;;
 esac
 # Fail fast with a useful message: not every quantizer has both a train and
 # an inference config (rvq currently has no train counterpart), and a missing

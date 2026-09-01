@@ -518,13 +518,21 @@ def unified_unlearn(
         for j in range(q_forget):
             idx = (step * q_forget + j) % n_forget
             forget_batch = batch_to_device(forget_batches[idx], device)
-            if sequence_forget:
-                l_forget = model._sequence_log_prob(*forget_batch)
-            else:
-                l_forget = -model._batch_loss_from_model_step(forget_batch)
-            forget_term = (float(lambda_forget) * l_forget) / float(q_forget)
-            forget_term.backward()
-            l_forget_avg += float(l_forget.detach().cpu()) / float(q_forget)
+            # Same guard as lambda_sep below: at lambda_f = 0 the term
+            # contributes exactly zero gradient, so computing it and scaling by
+            # zero only buys a wasted forward and backward pass. `forget_batch`
+            # is still needed by the coherence term, so only the loss is
+            # skipped, not the batch. NOTE the reported `l_forget_avg`
+            # diagnostic is then 0 rather than the unweighted forget
+            # log-probability; the term is off, so there is nothing to report.
+            if float(lambda_forget) != 0.0:
+                if sequence_forget:
+                    l_forget = model._sequence_log_prob(*forget_batch)
+                else:
+                    l_forget = -model._batch_loss_from_model_step(forget_batch)
+                forget_term = (float(lambda_forget) * l_forget) / float(q_forget)
+                forget_term.backward()
+                l_forget_avg += float(l_forget.detach().cpu()) / float(q_forget)
 
             # --- Coherence term L_n (TRACER Eq. 9), on the same forget batch ---
             if use_coherence:
@@ -552,14 +560,26 @@ def unified_unlearn(
             retain_batch = batch_to_device(retain_batches[idx], device)
             last_retain_batch = retain_batch
             l_retain = model._batch_loss_from_model_step(retain_batch)
-            l_sep = model.compute_sep_loss(
-                retain_batch,
-                negative_item_ids=sep_negatives_set,
-                temperature=float(sep_temperature),
-                positives=sep_positives,
-                loss_type=sep_loss_type,
-                gen_temperature=float(sep_gen_temperature),
-            )
+            # Skip the separation loss entirely at lambda_s = 0 instead of
+            # computing it and multiplying by zero. Numerically identical (the
+            # gradient contribution is 0 either way) but not free: the
+            # `generative` score costs 1 + |I_f| teacher-forced decoder passes
+            # per retain row, and for a sensitive-category deletion |I_f| is the
+            # whole category (68-202 items here) rather than the single spam
+            # target. That made even the lambda_s = 0 control arms OOM on a
+            # 140 GB H200, so the "term off" baseline could not be measured at
+            # all for that variant.
+            if float(lambda_sep) == 0.0:
+                l_sep = torch.zeros((), device=device)
+            else:
+                l_sep = model.compute_sep_loss(
+                    retain_batch,
+                    negative_item_ids=sep_negatives_set,
+                    temperature=float(sep_temperature),
+                    positives=sep_positives,
+                    loss_type=sep_loss_type,
+                    gen_temperature=float(sep_gen_temperature),
+                )
             retain_side = l_retain + float(lambda_sep) * l_sep
             retain_side = apply_local_repair_losses(
                 model,

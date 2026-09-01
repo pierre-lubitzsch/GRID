@@ -451,11 +451,35 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
             },
         )
 
+        # user_id, when the data config keeps it, lets the evaluator scope the
+        # spam/sensitive metrics to the users who actually requested a deletion
+        # versus everyone else. Absent -> only the global metric is emitted.
+        # SequentialModelInputData carries it as `user_id_list` (which may be a
+        # list of str, not a tensor); the feature map can also leave it in
+        # transformed_sequences. Check both, and coerce to a long tensor.
+        _uid = getattr(model_input, "user_id_list", None)
+        if _uid is None:
+            # collate_fn_train (the eval path) never sets user_id_list; it puts
+            # every field through pad_or_trim_sequence, so user_id arrives as
+            # (B, sequence_length) with the real id in column 0 and padding
+            # after it. Take that column rather than the padded row.
+            _uid = model_input.transformed_sequences.get("user_id")
+        if _uid is not None and not torch.is_tensor(_uid):
+            try:
+                _uid = torch.as_tensor([int(u) for u in _uid], dtype=torch.long)
+            except (TypeError, ValueError):
+                _uid = None  # non-numeric ids cannot be matched to the manifest
+        if _uid is not None and _uid.ndim > 1:
+            _uid = _uid[:, 0]
+        if _uid is not None:
+            _uid = _uid.reshape(-1).long()
+
         self.evaluator(
             marginal_probs=marginal_probs,
             generated_ids=generated_ids,
             # TODO: (lneves) hardcoded for now, will need to change for multiple features
             labels=list(label_data.labels.values())[0].to(marginal_probs.device),
+            user_ids=None if _uid is None else _uid.to(marginal_probs.device),
         )
 
         loss_to_aggregate(loss)

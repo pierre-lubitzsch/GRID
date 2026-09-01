@@ -419,6 +419,33 @@ if [ "${GRID_MODEL_NAME}" = "diger" ]; then
   MODEL_OVERRIDES+=("item_content_embeddings_path='${ICE}'")
 fi
 
+# LETTER's recommender is TIGER's, exactly, at the default temperature. ALL of
+# LETTER lives in the identifier space, so a LETTER run pointed at a TIGER
+# semantic-ID tensor is not a weak LETTER run -- it is a TIGER run wearing a
+# letter_ run tag, and nothing downstream would ever notice. Refuse it.
+#
+# The check is on the path, because that is the only signal available: the
+# tensor itself is an (L, N) int tensor that looks identical whichever tokenizer
+# produced it. Build the LETTER space with run_letter_sid.sh, which writes to
+# embeddings/<dataset>_letter/. Set LETTER_ALLOW_FOREIGN_SIDS=1 for the
+# deliberate ablation "LETTER's loss on TIGER's ids".
+if [ "${GRID_MODEL_NAME}" = "letter" ] && [ "${LETTER_ALLOW_FOREIGN_SIDS:-0}" != "1" ]; then
+  case "${SEMANTIC_ID_PATH}" in
+    *_letter/*|*_letter_*|*letter*) ;;
+    *)
+      echo "MODEL=letter with semantic_id_path='${SEMANTIC_ID_PATH}', which is not" >&2
+      echo "a LETTER identifier space. At the default temperature LETTER's" >&2
+      echo "recommender IS TIGER's, so this would record a TIGER run under a" >&2
+      echo "letter_ tag." >&2
+      echo "  Build one:  sbatch run_letter_sid.sh ${DATASET}" >&2
+      echo "  Then:       MODEL=letter sbatch run_tiger_train.sh ${DATASET} ${VARIANT} \\" >&2
+      echo "                embeddings/${DATASET}_letter/merged_predictions_tensor.pt" >&2
+      echo "  Deliberate? LETTER_ALLOW_FOREIGN_SIDS=1" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 python -u -m src.train \
   experiment="${GRID_TRAIN_EXPERIMENT}" \
   data_dir="${DATA_DIR}" \

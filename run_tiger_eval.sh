@@ -47,6 +47,14 @@ GRID_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "${GRID_DIR}"
 mkdir -p logs
 
+# MODEL selects the recommender ARCHITECTURE (tiger default | diger | letter).
+# grid_model_config maps the tiger experiment names below onto that model's own
+# configs; for MODEL=tiger it is the identity, so every recorded run is
+# unchanged. See scripts/resolve_model.sh and src/models/registry.py.
+# shellcheck source=scripts/resolve_model.sh
+source "${GRID_DIR}/scripts/resolve_model.sh"
+resolve_model "${MODEL:-tiger}" || exit 1
+
 EVAL_SEED="${EVAL_SEED:-2}"
 export PYTHONHASHSEED="${EVAL_SEED}"
 export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:16:8}"
@@ -93,7 +101,7 @@ fi
 # trainer.* overrides force a single-device test loop (mirrors the unlearning
 # experiment's accelerator config so DDP/sync-batchnorm don't kick in).
 python -u -m scripts.eval_ckpt_on_test \
-  experiment=tiger_train_flat \
+  experiment="$(grid_model_config tiger_train_flat)" \
   data_dir="${DATA_DIR}" \
   "semantic_id_path='${SEMANTIC_ID_PATH}'" \
   "ckpt_path='${CKPT_PATH}'" \

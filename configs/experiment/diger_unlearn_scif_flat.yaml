@@ -44,6 +44,24 @@ retain_subdir: training_retain
 
 # Algorithm group ----------------------------------------------------------
 unlearning:
+  # --- backported from tiger_unlearn_scif_flat.yaml (2026-08-31) -------------
+  # This config is a full COPY of the tiger one, not an overlay, so knobs added
+  # there never reach it. These 11 had drifted out. All are inert at the values
+  # below, so nothing about a recorded DIGER run changes; declaring them is what
+  # makes `unlearning.<knob>=...` settable under Hydra struct mode instead of
+  # aborting for MODEL=diger only. See tiger_unlearn_scif_flat.yaml for what
+  # each one means. test_model_registry.py check 9 now pins this.
+  seif_optimizer: null
+  kookmin_optimizer: null
+  fanchuan_optimizer: null
+  neg_train_optimizer: null
+  lambda_p: 0.0
+  drift_unlearned_ckpt: null
+  drift_n_queries: 8
+  drift_control_items: 600
+  drift_item_chunk: 64
+  profile_max_items: 2000
+  tracer_sid_tolerance: 1.0
   algorithm: scif
   deletion_spec: session
   # item_pairs only: ALSO emit the rows where a target item sits in the model's

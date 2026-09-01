@@ -197,6 +197,10 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
         )
         self._diger_aux: Dict[str, torch.Tensor] = {}
         self._diger_injected = 0
+        # Straight-through at the injection site. Off reproduces the pure soft
+        # mixture that measured ~0 nDCG; there is no reason to want that except
+        # to reproduce the bug.
+        self.diger_straight_through = True
         # Injection-rate bookkeeping. A single training step with no resolvable
         # item block is NORMAL (a batch can be all padding), so the condition
         # worth warning about is "never fires", not "did not fire once".
@@ -317,8 +321,26 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
         table = self.get_embedding_table(table_name="encoder").weight
         K = int(self.num_embeddings_per_hierarchy)
         rows = table[: self.diger_levels * K].view(self.diger_levels, K, -1)
-        # e~_v^l = sum_k y_{v,l,k} E_l[k]
+        # e~_v^l = sum_k y_{v,l,k} E_l[k], then STRAIGHT-THROUGH.
+        #
+        # The soft mixture alone is a train/inference mismatch and it is why
+        # DIGER produced ~0 nDCG at every scale: training fed the encoder a
+        # convex combination sum_k y_k E_l[k], while generation feeds it the
+        # single row E_l[argmax_k y_k]. The recommender learned to condition on
+        # inputs it never sees at inference (measured: gen loss 4.4 and val loss
+        # 5.1, i.e. it WAS learning, but val nDCG@10 5.9e-05 against TIGER's
+        # 0.032 on the same identifier space).
+        #
+        # The tokenizer already computes the hard assignment (`out.codes`) with
+        # its own straight-through estimator; this site simply discarded it.
+        # forward = hard row (identical to inference), backward = soft gradient
+        # (so the tokenizer still trains).
         soft = torch.einsum("blk,lkd->bld", out.probs.to(table.dtype), rows)
+        _lv = torch.arange(self.diger_levels, device=rows.device)
+        hard_rows = rows[_lv.unsqueeze(0).expand(out.codes.size(0), -1),
+                         out.codes[:, : self.diger_levels]]        # [b, L, d]
+        if self.diger_straight_through:
+            soft = hard_rows.detach() + (soft - soft.detach())
 
         emb_items = embeds.view(batch, n_items, num_hierarchies, embeds.size(-1)).clone()
         # Explicit integer indices on dims 0/1 -- a mixed bool-mask/slice index
@@ -560,11 +582,36 @@ class DigerEncoderDecoder(SemanticIDEncoderDecoder):
             )
 
     def on_train_end(self) -> None:
+        """Commit the learned ids, and WRITE them so evaluation can use them.
+
+        The commit rewrites `self.codebooks`, but the dataloader keeps the ids it
+        was built with, so any in-run `test` stage that follows scores the model
+        against ids it never trained on. That is not a small effect: the
+        2026-08-26 full run measured val/loss 5.13 before the commit and
+        test/loss 20.22 after it, with test/nDCG@10 exactly 0.0 while val was
+        nonzero.
+
+        Writing the tensor makes the committed ids usable: evaluate in a separate
+        pass with `semantic_id_path` pointing at the file named below. Running
+        `test=True` in the SAME job as the commit is meaningless and its number
+        should not be reported.
+        """
         parent = getattr(super(), "on_train_end", None)
         if callable(parent):
             parent()
         changed = self.commit_semantic_ids()
         log.info("[diger] train end: committed ids, %d items reassigned", changed)
+        try:
+            out_dir = os.path.join(os.getcwd(), "committed_semantic_ids.pt")
+            self.write_semantic_id_tensor(out_dir)
+            log.warning(
+                "[diger] the ids just changed. Any test/* metric produced in "
+                "THIS job scores the model against ids it was not trained on "
+                "and is not interpretable. Re-evaluate with "
+                "semantic_id_path=%s", out_dir,
+            )
+        except Exception as exc:  # never let this kill a finished run
+            log.warning("[diger] could not write committed ids: %s", exc)
 
     # ---------------------------------------------------------------- commit
     @torch.no_grad()
