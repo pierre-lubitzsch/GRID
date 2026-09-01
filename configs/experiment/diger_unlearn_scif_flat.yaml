@@ -306,6 +306,31 @@ unlearning:
   #   l2     raw Euclidean distance — matches the legacy embedding_neighbors
   #          epsilon-ball used by neighborhood-aware retain sampling.
   coherence_embedding_metric: cosine
+  # --- refined ID space (latent refiner) -------------------------------------
+  # coherence_neighbor_method=latent|embedding+latent selects L_n's
+  # neighbourhood in a learned CONTINUOUS space instead of (or as well as) the
+  # pre-quantization one:
+  #
+  #     z_i = MLP([SIDEmb(i), x_i])        scripts/train_latent_refiner.py
+  #
+  # SIDEmb(i) is this checkpoint's own semantic-ID table rows for item i, so z
+  # inherits the geometry the decoder actually reads; x_i re-adds the item-level
+  # detail that quantization discarded. Rationale: a 4-token SID is efficient to
+  # generate but coarse — ~47 items share a coarse code at width 256 and the mean
+  # prefix-2 neighbourhood is 3.16 items with 30.6% of items having none — so
+  # forget and retain signals can share a token path. The SID pipeline is
+  # UNCHANGED; z is a neighbour-selection signal only, never a decoder input.
+  #
+  # Path to the [N, d_z] tensor, row-aligned with the SID codebook. Required by
+  # method=latent|embedding+latent, ignored otherwise.
+  coherence_latent_path: null
+  # Neighbourhood budget for method=embedding+latent.
+  #   full (default) each source contributes neighborhood_count (union <= 2*count)
+  #   matched        one count budget split across the sources (equal-size union)
+  # Report both: `full` asks "does adding N_z help", `matched` asks "is the union
+  # better PER NEIGHBOUR" — a full-only win is confounded with teacher-forcing
+  # more items.
+  coherence_union_size: full
   # Form of L_n.
   #   mass (recommended) -log sum_{p in P(i_T)} p(s_p | H_f). Aggregates the
   #        neighbourhood with logsumexp first: a real log-probability, bounded

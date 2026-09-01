@@ -151,9 +151,32 @@ unlearning:
   coherence_rows: target_only
   # prefix (default) = shared-SID-prefix neighbourhood (width-dependent, can be
   # empty); embedding = fixed-size top-k in the pre-quantization space
-  # (unlearning.embedding_path), never empty, width-independent.
+  # (unlearning.embedding_path), never empty, width-independent;
+  # latent = fixed-size top-k in the REFINED latent space z produced by
+  # scripts/train_latent_refiner.py (unlearning.coherence_latent_path), where
+  # z_i = MLP([SIDEmb(i), x_i]); embedding+latent = the union N_emb ∪ N_z.
+  #
+  # Why a refined space at all: the 4-token SID is generation-friendly but
+  # coarse, so forget and retain signals can share a token path (~47 items share
+  # a coarse code at beauty width 256). z keeps the SID geometry the decoder
+  # reads while re-adding the item-level detail quantization discarded, so N_z
+  # is a finer-grained neighbourhood than either prefix or raw embedding. The
+  # SID pipeline itself is UNCHANGED — z is used for neighbour selection only.
   coherence_neighbor_method: prefix
   coherence_embedding_metric: cosine  # cosine | l2 (embedding method only)
+  # Refined latent tensor [N, d_z], row-aligned with the SID codebook. Required
+  # by coherence_neighbor_method=latent|embedding+latent, ignored otherwise.
+  coherence_latent_path: null
+  # Neighbourhood budget for coherence_neighbor_method=embedding+latent.
+  #   full (default) each source contributes its own neighborhood_count, so the
+  #        union holds up to 2*count items — the literal N_emb ∪ N_z.
+  #   matched  one neighborhood_count budget split between the sources
+  #        (ceil(count/2) embedding + the rest latent), so the union arm is
+  #        compared to the single-source arms at EQUAL neighbourhood size.
+  # Report both: `full` answers "does adding N_z help", `matched` answers
+  # "is the union better per neighbour" — a `full`-only win is confounded with
+  # simply teacher-forcing more items.
+  coherence_union_size: full
   # mass = -log sum_p p(s_p | H_f), bounded and satisfiable (recommended);
   # nll = TRACER Eq. 9 per-neighbour -log p, infeasible optimum (back-compat);
   # suppress = -log(1 - sum_p p), DRAINS the neighbourhood instead of repairing

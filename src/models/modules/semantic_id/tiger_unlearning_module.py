@@ -500,6 +500,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 ),
                 embedding_path=cfg.get("embedding_path"),
                 embedding_metric=str(cfg.get("coherence_embedding_metric", "cosine")),
+                latent_path=cfg.get("coherence_latent_path"),
+                union_size=str(cfg.get("coherence_union_size", "full")),
             )
 
         info = unified_unlearn(
@@ -779,6 +781,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         neighbor_method: str = "prefix",
         embedding_path: Optional[str] = None,
         embedding_metric: str = "cosine",
+        latent_path: Optional[str] = None,
+        union_size: str = "full",
     ) -> List[Optional[Any]]:
         """Per-forget-batch neighbour semantic ids for the coherence loss.
 
@@ -818,16 +822,30 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 f"coherence_rows must be 'target_only'|'all', got {coherence_rows!r}"
             )
         nbr_method = str(neighbor_method).lower()
-        if nbr_method not in ("prefix", "embedding"):
+        if nbr_method not in ("prefix", "embedding", "latent", "embedding+latent"):
             raise ValueError(
-                "coherence_neighbor_method must be 'prefix'|'embedding', got "
+                "coherence_neighbor_method must be "
+                "'prefix'|'embedding'|'latent'|'embedding+latent', got "
                 f"{neighbor_method!r}"
             )
-        if nbr_method == "embedding" and not embedding_path:
+        needs_embedding = nbr_method in ("embedding", "embedding+latent")
+        needs_latent = nbr_method in ("latent", "embedding+latent")
+        if needs_embedding and not embedding_path:
             raise ValueError(
-                "coherence_neighbor_method='embedding' requires "
+                f"coherence_neighbor_method={nbr_method!r} requires "
                 "unlearning.embedding_path (pre-quantization item embeddings, "
                 "e.g. embeddings/beauty_merged_predictions_tensor_latest.pt)."
+            )
+        if needs_latent and not latent_path:
+            raise ValueError(
+                f"coherence_neighbor_method={nbr_method!r} requires "
+                "unlearning.coherence_latent_path (the [N, d_z] refined-latent "
+                "tensor from scripts/train_latent_refiner.py)."
+            )
+        union_mode = str(union_size).lower()
+        if union_mode not in ("full", "matched"):
+            raise ValueError(
+                f"coherence_union_size must be 'full'|'matched', got {union_size!r}"
             )
         eligible = {int(x) for x in (target_items or set())}
         if rows_mode == "target_only" and not eligible:
@@ -858,8 +876,27 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         # regardless of codebook width. Loaded once; the k-NN itself is cached
         # per item below (with coherence_rows='target_only' and n_target=1 that
         # is a single query for the whole run).
+        # Per-source top-k budget. For the union arm `full` gives each source its
+        # own `count` (the literal N_emb ∪ N_z of the plan, so up to 2*count
+        # neighbours), while `matched` splits one `count` budget between them so
+        # the union is compared against the single-source arms at EQUAL
+        # neighbourhood size -- otherwise a union win could just be "more
+        # neighbours" rather than "better neighbours".
+        if nbr_method == "embedding+latent":
+            if union_mode == "full":
+                k_emb = k_lat = count
+            else:
+                k_emb = (count + 1) // 2
+                k_lat = count - k_emb
+        else:
+            k_emb = count if nbr_method == "embedding" else 0
+            k_lat = count if nbr_method == "latent" else 0
+        # Rows to allocate per forget sample: the union arm can return more than
+        # `count`, every other arm is capped at it.
+        count_alloc = (k_emb + k_lat) if nbr_method == "embedding+latent" else count
+
         embeddings = None
-        if nbr_method == "embedding":
+        if needs_embedding:
             embeddings = load_dense_embeddings(embedding_path)
             # We index the embedding matrix BY ROW, because the codebook is
             # indexed 0..N-1 by row and raw item IDs are not valid codebook
@@ -880,10 +917,34 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 "[unified] coherence L_n neighbours: embedding top-k "
                 "(metric=%s, k=%d) from %s [%d items, dim %d]",
                 embedding_metric,
-                count,
+                k_emb,
                 embedding_path,
                 len(embeddings),
                 int(embeddings.shape[1]),
+            )
+
+        # Refined latent space z (scripts/train_latent_refiner.py). Loaded with
+        # the SAME loader as the dense embeddings because it has the same
+        # contract -- a [N, d] tensor whose row i is item i -- so the k-NN below
+        # is literally the same helper, just on a different geometry.
+        latents = None
+        if needs_latent:
+            latents = load_dense_embeddings(latent_path)
+            if len(latents) != num_items:
+                raise ValueError(
+                    f"coherence_latent_path has {len(latents)} items but the "
+                    f"codebook has {num_items}: the refined latent tensor is "
+                    f"indexed BY ROW and must be row-aligned with the codebook. "
+                    f"Check that {latent_path!r} was produced by "
+                    "scripts/train_latent_refiner.py against this SID tensor."
+                )
+            log.info(
+                "[unified] coherence L_n neighbours: latent top-k "
+                "(metric=cosine, k=%d) from %s [%d items, dim %d]",
+                k_lat,
+                latent_path,
+                len(latents),
+                int(latents.shape[1]),
             )
 
         # item id -> neighbour SID rows [k, H] (cached; forget targets repeat).
@@ -891,29 +952,55 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
 
         def _neighbor_rows(item_id: int) -> List[List[int]]:
             if item_id not in neighbor_cache:
-                if nbr_method == "embedding":
-                    # by_row: item_id and the returned neighbours are codebook
-                    # row indices, directly usable as codebook[n] below.
-                    nbr_ids = topk_embedding_neighbors(
-                        item_id,
-                        embeddings,
-                        count,
-                        metric=embedding_metric,
-                        exclude_ids=exclude,
-                        by_row=True,
+                # by_row throughout: item_id and the returned neighbours are
+                # codebook row indices, directly usable as codebook[n] below.
+                nbr_ids: List[int] = []
+                if k_emb > 0:
+                    nbr_ids.extend(
+                        topk_embedding_neighbors(
+                            item_id,
+                            embeddings,
+                            k_emb,
+                            metric=embedding_metric,
+                            exclude_ids=exclude,
+                            by_row=True,
+                        )
                     )
-                else:
-                    nbr_ids = closest_prefix_neighbors(
-                        codebook,
-                        item_id,
-                        count,
-                        neighborhood_prefix_length,
-                        sorted_ids=sorted_ids,
-                        sorted_sids=sorted_sids,
-                        exclude_ids=exclude,
+                if k_lat > 0:
+                    # Cosine on z, matching how N_z is defined in the plan:
+                    # TopK_{i != t} cos(z_t, z_i) over non-forget items.
+                    nbr_ids.extend(
+                        topk_embedding_neighbors(
+                            item_id,
+                            latents,
+                            k_lat,
+                            metric="cosine",
+                            exclude_ids=exclude,
+                            by_row=True,
+                        )
                     )
+                if not (k_emb or k_lat):
+                    nbr_ids = list(
+                        closest_prefix_neighbors(
+                            codebook,
+                            item_id,
+                            count,
+                            neighborhood_prefix_length,
+                            sorted_ids=sorted_ids,
+                            sorted_sids=sorted_sids,
+                            exclude_ids=exclude,
+                        )
+                    )
+                # Set union, order-preserving: an item that both sources rank
+                # must be teacher-forced ONCE, or L_n would double-weight it.
+                seen: Set[int] = set()
+                deduped = []
+                for n in nbr_ids:
+                    if int(n) not in seen:
+                        seen.add(int(n))
+                        deduped.append(int(n))
                 neighbor_cache[item_id] = [
-                    [int(x) for x in codebook[n].tolist()] for n in nbr_ids
+                    [int(x) for x in codebook[n].tolist()] for n in deduped
                 ]
             return neighbor_cache[item_id]
 
@@ -922,13 +1009,14 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         n_eligible = 0
         n_with_neighbors = 0
         n_targets_missing = 0
+        n_neighbors_total = 0
         for model_input, label_data in forget_batches:
             bsz = int(model_input.mask.size(0))
             fut_ids = None
             for label in label_data.labels:
                 fut_ids = label_data.labels[label].reshape(bsz, -1)
-            neighbor_sids = torch.zeros((bsz, count, H), dtype=torch.long)
-            neighbor_mask = torch.zeros((bsz, count), dtype=torch.float32)
+            neighbor_sids = torch.zeros((bsz, count_alloc, H), dtype=torch.long)
+            neighbor_mask = torch.zeros((bsz, count_alloc), dtype=torch.float32)
             for row in range(bsz):
                 n_samples += 1
                 sid_tuple = tuple(int(x) for x in fut_ids[row, :H].tolist())
@@ -944,7 +1032,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 rows = _neighbor_rows(item_id)
                 if rows:
                     n_with_neighbors += 1
-                for c, sid_row in enumerate(rows[:count]):
+                    n_neighbors_total += min(len(rows), count_alloc)
+                for c, sid_row in enumerate(rows[:count_alloc]):
                     neighbor_sids[row, c] = torch.tensor(sid_row, dtype=torch.long)
                     neighbor_mask[row, c] = 1.0
             out.append(
@@ -966,6 +1055,18 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             int(neighborhood_prefix_length) if nbr_method == "prefix" else "n/a",
             n_targets_missing,
         )
+        log.info(
+            "[unified] coherence L_n neighbourhood size: k_emb=%d k_lat=%d "
+            "alloc=%d union_size=%s, realised mean %.2f neighbours per scored "
+            "row (%d total over %d rows with >=1)",
+            k_emb,
+            k_lat,
+            count_alloc,
+            union_mode if nbr_method == "embedding+latent" else "n/a",
+            n_neighbors_total / max(n_with_neighbors, 1),
+            n_neighbors_total,
+            n_with_neighbors,
+        )
         if n_with_neighbors == 0:
             if nbr_method == "prefix":
                 log.warning(
@@ -982,8 +1083,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             else:
                 log.warning(
                     "[unified] coherence L_n is identically ZERO despite "
-                    "embedding top-k neighbours — no eligible forget row was "
-                    "found at all (check coherence_rows/target_items)."
+                    "fixed-size top-k neighbours (method=%s) — no eligible "
+                    "forget row was found at all (check "
+                    "coherence_rows/target_items).",
+                    nbr_method,
                 )
         return out
 
