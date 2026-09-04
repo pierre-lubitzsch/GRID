@@ -30,7 +30,23 @@ def neg_train_unlearn(
     optimizer: str = "adam",
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
-    """Gradient ascent on forget batches with optional retain CE every k steps."""
+    """Gradient ascent on forget batches with optional retain CE every k steps.
+
+    NOTE ``neg_retain_every=1`` is DEGENERATE: ``step % 1 == 0`` always holds, so
+    the retain branch runs every step, the ascent branch never runs, and this
+    reduces to plain fine-tuning on retain. Measured on beauty: SH@10 0.0115 at
+    UR 0.981, matching `finetune` to within noise because it is the same
+    objective by accident.
+
+    This is the ALTERNATING form: one optimizer step per batch, so a retain step
+    can partially undo the preceding ascent step. The SIMULTANEOUS form usually
+    written for this baseline -- ``L_retain - w*CE_forget`` accumulated into one
+    step -- is reached through the unified objective instead, as
+    ``lambda_r=1, lambda_f=w, lambda_s=0, lambda_n=0`` (unified's
+    ``l_forget = -CE``, so a positive ``lambda_f`` IS ascent). Using that path
+    keeps one implementation, so the comparison against unified carries no
+    incidental difference in batching, optimizer or step budget.
+    """
     device = device or next(model.parameters()).device
     if not forget_batches:
         raise ValueError("forget_batches is empty")

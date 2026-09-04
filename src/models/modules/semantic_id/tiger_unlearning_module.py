@@ -508,11 +508,17 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             self,
             ctx["forget_batches"],
             ctx["retain_batches"],
+            code_row_keep=self._resolve_code_row_keep(ctx, cfg, **kwargs),
             steps=int(cfg.get("unified_steps", 500)),
             n_epochs=(
                 int(n_epochs_cfg) if n_epochs_cfg is not None else None
             ),
             lr=float(cfg.get("unified_lr", 1e-4)),
+            # lambda_r weights the retain term. 1.0 = current behaviour.
+            # 0.0 turns repair off, which with lambda_f > 0 is pure gradient
+            # ascent -- so the ascent/descent baselines are special cases of
+            # this objective, not separate implementations.
+            lambda_retain=float(cfg.get("lambda_r", 1.0)),
             lambda_forget=float(cfg.get("lambda_f", 1.0)),
             lambda_sep=float(cfg.get("lambda_s", 0.1)),
             lambda_neighborhood=lambda_neighborhood,
@@ -579,6 +585,110 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         info["optimizer"] = str(cfg.get("unified_optimizer", "adam"))
         info.update(ctx["meta"])
         return info
+
+    def _resolve_code_row_keep(
+        self, ctx: Dict[str, Any], cfg: Any, **kwargs: Any
+    ) -> Optional[torch.Tensor]:
+        """Row mask over the SID embedding table: which CODE ROWS may update.
+
+        ``update_positions`` / ``adaptive_code_lr_scale`` choose which *levels*
+        move; every one of the K rows in a chosen level moves with them. That is
+        a blunt instrument for a deletion: a level-0 code is shared by ~47 items
+        at width 256, so updating the whole block edits the identifier space for
+        thousands of items that were never part of the request.
+
+        This narrows the block to the rows the request actually touches:
+
+        ``all``   every row in the selected levels (previous behaviour)
+        ``forget``            rows ``h*K + code_h(i)`` for i in the forget set
+        ``forget_neighborhood``  the above, plus the same rows for each forget
+                  item's neighbours, so the repair term still has the
+                  parameters it needs to move the neighbourhood back.
+
+        Returns a ``[H*K]`` float mask (1.0 = may update), or None for ``all``.
+        The mask covers ALL levels; composing it with the level restriction is
+        the caller's job, and is what makes "levels 0,1, forget rows only" a
+        single well-defined update.
+        """
+        scope = str(cfg.get("code_row_scope", "all")).strip().lower()
+        if scope in ("all", "", "none"):
+            return None
+        if scope not in ("forget", "forget_neighborhood"):
+            raise ValueError(
+                "code_row_scope must be all | forget | forget_neighborhood, got "
+                f"{scope!r}"
+            )
+
+        codes = self.codebooks.detach().cpu().to(torch.long)            # [N, H]
+        n_items, n_hier = int(codes.shape[0]), int(codes.shape[1])
+        K = int(self.num_embeddings_per_hierarchy)
+
+        items: Set[int] = set(int(i) for i in (ctx.get("visible_forget_items") or []))
+        if not items:
+            items = set(int(i) for i in (ctx["meta"].get("target_items") or []))
+        if not items:
+            raise ValueError(
+                f"code_row_scope={scope} but the request names no forget items"
+            )
+        n_forget = len(items)
+
+        n_neighbors = 0
+        if scope == "forget_neighborhood":
+            from src.components.unlearning.neighborhood_sampler import (
+                build_sorted_sid_index,
+                closest_prefix_neighbors,
+                load_dense_embeddings,
+                topk_embedding_neighbors,
+            )
+
+            count = int(cfg.get("neighborhood_count", 4))
+            method = str(cfg.get("coherence_neighbor_method", "prefix")).lower()
+            neigh: Set[int] = set()
+            if method == "embedding":
+                emb_path = cfg.get("embedding_path")
+                if not emb_path:
+                    raise ValueError(
+                        "code_row_scope=forget_neighborhood with "
+                        "coherence_neighbor_method=embedding needs "
+                        "unlearning.embedding_path"
+                    )
+                embs = load_dense_embeddings(str(emb_path))
+                for i in sorted(items):
+                    neigh.update(
+                        topk_embedding_neighbors(
+                            i, embs, count,
+                            metric=str(cfg.get("coherence_embedding_metric", "cosine")),
+                            exclude_ids=items,
+                        )
+                    )
+            else:
+                sorted_ids = build_sorted_sid_index(codes)
+                prefix_len = int(cfg.get("neighborhood_prefix_length", 2))
+                for i in sorted(items):
+                    neigh.update(
+                        closest_prefix_neighbors(
+                            codes, i, count, prefix_len,
+                            sorted_ids=sorted_ids, exclude_ids=items,
+                        )
+                    )
+            n_neighbors = len(neigh)
+            items |= neigh
+
+        idx = torch.tensor(sorted(items), dtype=torch.long)
+        if int(idx.max()) >= n_items:
+            raise ValueError(
+                f"item id {int(idx.max())} outside the SID tensor ({n_items} items)"
+            )
+        keep = torch.zeros(n_hier * K, dtype=torch.float32)
+        for h in range(n_hier):
+            keep[h * K + codes[idx, h].unique()] = 1.0
+        log.info(
+            "[code-row-scope] %s: %d forget + %d neighbour item(s) -> %d/%d SID "
+            "rows updatable (%.2f%% of the table)",
+            scope, n_forget, n_neighbors, int(keep.sum()), keep.numel(),
+            100.0 * float(keep.sum()) / keep.numel(),
+        )
+        return keep
 
     def _run_tracer(self, **kwargs: Any) -> Dict[str, Any]:
         """TRACER (arXiv:2606.07688) -- token reassignment, as a baseline.

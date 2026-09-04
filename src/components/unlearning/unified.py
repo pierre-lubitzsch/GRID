@@ -35,6 +35,7 @@ def unified_unlearn(
     steps: Optional[int] = 500,
     n_epochs: Optional[int] = None,
     lr: float = 1e-4,
+    lambda_retain: float = 1.0,
     lambda_forget: float = 1.0,
     lambda_sep: float = 0.1,
     lambda_neighborhood: float = 0.0,
@@ -70,6 +71,12 @@ def unified_unlearn(
     code_lr_scale: float = 1.0,
     adaptive_code_lr_scale: float = 1.0,
     stable_code_lr_scale: float = 1.0,
+    # [H*K] float mask over the SID embedding table's rows (1.0 = may update),
+    # from unlearning.code_row_scope. Narrows the LEVEL restriction
+    # (update_positions / adaptive_code_lr_scale) down to the code rows the
+    # request actually touches, so a deletion stops editing the identifier space
+    # of the thousands of items that merely share a coarse code.
+    code_row_keep: Optional[torch.Tensor] = None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Optimize unified objective.
@@ -459,6 +466,40 @@ def unified_unlearn(
             float(lr) * float(code_lr_scale),
         )
 
+    # Compose the code-row scope onto the SID table's row multiplier. It has to
+    # go here, not into .grad: under Adam a zeroed gradient still moves a row via
+    # the momentum buffers, so the only way to truly freeze a row is to cancel
+    # its post-step DELTA -- which is exactly what row_lr_scale already does.
+    if code_row_keep is not None:
+        sid_w = None
+        table = getattr(model, "item_sid_embedding_table_encoder", None)
+        if table is not None:
+            sid_w = getattr(table, "weight", None)
+        if sid_w is None:
+            raise ValueError(
+                "code_row_scope needs model.item_sid_embedding_table_encoder"
+            )
+        if int(code_row_keep.numel()) != int(sid_w.shape[0]):
+            raise ValueError(
+                f"code_row_keep has {int(code_row_keep.numel())} entries but the "
+                f"SID table has {int(sid_w.shape[0])} rows"
+            )
+        pid = id(sid_w)
+        keep_col = code_row_keep.to(device=sid_w.device, dtype=sid_w.dtype).view(-1, 1)
+        if pid in row_lr_scale:
+            row_lr_scale[pid] = row_lr_scale[pid] * keep_col
+        else:
+            # No adaptive/stable row scaling was active, so build the multiplier
+            # from scratch; without this the scope would silently do nothing
+            # whenever adaptive_code_lr_scale and stable_code_lr_scale are 1.0.
+            row_lr_scale[pid] = keep_col.expand_as(sid_w).clone()
+            row_scaled_params[pid] = sid_w
+        log.info(
+            "[unified] code_row_scope: %d/%d SID rows updatable (%.2f%%)",
+            int(code_row_keep.sum()), int(code_row_keep.numel()),
+            100.0 * float(code_row_keep.sum()) / float(code_row_keep.numel()),
+        )
+
     # SGD is the Sparse Memory Finetuning choice: with a sparse/selected update
     # Adam's moment estimates get diluted on the steps where a slot receives no
     # gradient, distorting its effective step size.
@@ -559,7 +600,17 @@ def unified_unlearn(
             idx = (step * q_retain + j) % n_retain
             retain_batch = batch_to_device(retain_batches[idx], device)
             last_retain_batch = retain_batch
-            l_retain = model._batch_loss_from_model_step(retain_batch)
+            # Same short-circuit contract as the other lambdas: at
+            # lambda_retain = 0 the term contributes exactly zero gradient, so
+            # computing it and scaling by zero only buys a wasted forward and
+            # backward pass. That configuration is the pure-ascent baseline
+            # (no repair), so it is a case worth not paying for. The reported
+            # `l_retain_avg` is then 0 rather than the retain CE; the term is
+            # off, so there is nothing to report.
+            if float(lambda_retain) != 0.0:
+                l_retain = model._batch_loss_from_model_step(retain_batch)
+            else:
+                l_retain = torch.zeros((), device=device)
             # Skip the separation loss entirely at lambda_s = 0 instead of
             # computing it and multiplying by zero. Numerically identical (the
             # gradient contribution is 0 either way) but not free: the
@@ -580,7 +631,22 @@ def unified_unlearn(
                     loss_type=sep_loss_type,
                     gen_temperature=float(sep_gen_temperature),
                 )
-            retain_side = l_retain + float(lambda_sep) * l_sep
+            # lambda_retain weights the retain (repair) term. It exists so the
+            # ascent/descent baselines are EXACT special cases of this objective
+            # rather than separate implementations:
+            #
+            #   lambda_r=1, lambda_f=0, lambda_s=0, lambda_n=0  -> finetune
+            #                                                      (retain only)
+            #   lambda_r=1, lambda_f=w, lambda_s=0, lambda_n=0  -> neg_train
+            #        i.e. total = L_retain - w*CE_forget, since l_forget = -CE
+            #   lambda_r=0, lambda_f=w, lambda_s=0, lambda_n=0  -> pure gradient
+            #                                                      ascent, no repair
+            #
+            # Running them through this code path removes every incidental
+            # difference that made the old comparison unfair: same batches, same
+            # batch size, same optimizer, same step budget, and one accumulated
+            # opt.step() instead of alternating updates.
+            retain_side = float(lambda_retain) * l_retain + float(lambda_sep) * l_sep
             retain_side = apply_local_repair_losses(
                 model,
                 base_loss=retain_side,
@@ -588,7 +654,15 @@ def unified_unlearn(
                 neighbor_item_ids=neighbor_ids,
                 batch=retain_batch,
             )
-            (retain_side / float(q_retain)).backward()
+            # With lambda_retain = 0 AND lambda_sep = 0 the retain side is a
+            # constant (both terms short-circuited to grad-less zeros), so it has
+            # no grad_fn and .backward() raises "element 0 of tensors does not
+            # require grad". That configuration is the pure-ascent baseline
+            # (lambda_r=0, lambda_f>0), which is a case we deliberately run --
+            # so guard rather than let it crash. Same guard the coherence term
+            # already uses.
+            if retain_side.requires_grad:
+                (retain_side / float(q_retain)).backward()
             l_retain_avg += float(l_retain.detach().cpu()) / float(q_retain)
             l_sep_avg += float(l_sep.detach().cpu()) / float(q_retain)
 
@@ -683,6 +757,7 @@ def unified_unlearn(
         ),
         "adaptive_adapter": bool(restrict_adaptive_codes and adaptive_adapter),
         "lambda_forget": float(lambda_forget),
+        "lambda_retain": float(lambda_retain),
         "lambda_sep": float(lambda_sep),
         "lambda_neighborhood": float(lambda_neighborhood),
         "coherence_enabled": bool(use_coherence),

@@ -103,6 +103,25 @@ unlearning:
   # SID embedding rows [h*K,(h+1)*K); backbone frozen unless
   # update_positions_backbone=true.
   update_positions: null
+  # --- code-row scope for the unified update (algorithm=unified) -------------
+  # update_positions / adaptive_code_lr_scale choose which code LEVELS move;
+  # every one of the K rows in a chosen level moves with them. That is blunt for
+  # a deletion: a level-0 code is shared by ~47 items at width 256, so updating
+  # the whole block edits the identifier space of thousands of items that were
+  # never part of the request. This narrows the block to the rows the request
+  # actually touches. Composes with the level restriction -- "levels 0,1, forget
+  # rows only" is code_row_scope=forget plus adaptive_code_lr_scale=0.0.
+  #
+  #   all                  every row in the selected levels (DEFAULT, unchanged)
+  #   forget               rows h*K + code_h(i) for i in the forget set
+  #   forget_neighborhood  the above plus each forget item's neighbours, so the
+  #                        repair term keeps the parameters it needs to move the
+  #                        neighbourhood back
+  #
+  # The neighbour set reuses coherence_neighbor_method / neighborhood_count /
+  # neighborhood_prefix_length, so the rows that can move are the same items the
+  # coherence term is scoring.
+  code_row_scope: all
   update_positions_backbone: false
 
   # --- PKM "modular stabilizer" update scope (algorithm=unified) ---
@@ -230,6 +249,16 @@ unlearning:
   diagnostics_mode: both
   # --- collateral-drift diagnosis (src/measure_collateral_drift.py) -----------
   # Read-only. ckpt_path is the PRE-unlearning model; this is the POST one.
+  # How the collateral-drift measurement defines "neighbour".
+  #   prefix    (default) shared code-prefix length. The bucket SIZE depends on
+  #             the codebook, not the experiment: 64 / 70 / 36 items for the
+  #             beauty unpopular / mid / popular targets, so the neighbour bar
+  #             is a different sample size per stratum.
+  #   embedding k nearest items by cosine in the pre-quantization embedding
+  #             space -- exactly k per stratum, and the same space L_n samples
+  #             from (coherence_neighbor_method=embedding).
+  drift_neighbor_mode: prefix
+  drift_neighbor_k: 32
   drift_unlearned_ckpt: null
   drift_n_queries: 8          # retain query batches to score over
   drift_control_items: 600    # sampled non-sharing items, the comparison group
@@ -460,6 +489,17 @@ unlearning:
   #   seif:    number of repair epochs (overrides seif_repair_epochs).
   # null → each algorithm uses its own per-algorithm default.
   n_epochs: null
+  # lambda_r: weight on the RETAIN (repair) term. 1.0 = current behaviour.
+  # Exists so the ascent/descent baselines are exact special cases of this
+  # objective instead of separate implementations, which removes every
+  # incidental difference (batching, optimizer, step budget, one accumulated
+  # update vs alternating updates) from the comparison:
+  #   lambda_r=1 lambda_f=0 lambda_s=0 lambda_n=0  -> finetune (retain only)
+  #   lambda_r=1 lambda_f=w lambda_s=0 lambda_n=0  -> neg_train, simultaneous
+  #                                                   form (l_forget = -CE, so
+  #                                                   lambda_f > 0 is ascent)
+  #   lambda_r=0 lambda_f=w lambda_s=0 lambda_n=0  -> pure ascent, no repair
+  lambda_r: 1.0
   unified_lr: 1.0e-4
   # Stable-Adaptive Semantic IDs (unlearning-aware ID design; wired for
   # algorithm=unified). When adaptive_codes=true, the update is confined to the
