@@ -20,7 +20,17 @@ def build_filter_mask(
     """Build a serialisable decode mask specification."""
     mode = str(filter_mode).strip().lower()
     if mode == "global":
-        if deletion_spec == "item" and target_items:
+        # Block the TARGET items whenever the manifest names them, whatever the
+        # deletion_spec. The old condition also required deletion_spec == "item",
+        # so the sensitive scenario (deletion_spec == "item_pairs") fell through
+        # to forget_shard_items: every item appearing in a forget user's session,
+        # which on toys was 229 items of which only 11 were sensitive. That
+        # blocked 218 unrelated items globally while leaving 57 of the 68
+        # sensitive items reachable, so Sensitive@10 never went to zero and the
+        # baseline measured neither "remove the concept" nor "honour the pairs".
+        # forget_shard_items stays as the fallback for manifests with no target
+        # list at all.
+        if target_items:
             forbidden = sorted(int(x) for x in target_items)
         else:
             forbidden = sorted(int(x) for x in forget_shard_items)

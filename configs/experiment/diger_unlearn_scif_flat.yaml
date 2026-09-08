@@ -142,7 +142,38 @@ unlearning:
   # The neighbour set reuses coherence_neighbor_method / neighborhood_count /
   # neighborhood_prefix_length, so the rows that can move are the same items the
   # coherence term is scoring.
+  drift_neighbor_k: 32
+  # --- collateral-drift diagnosis (src/measure_collateral_drift.py) -----------
+  # Read-only. ckpt_path is the PRE-unlearning model; this is the POST one.
+  # How the collateral-drift measurement defines "neighbour".
+  #   prefix    (default) shared code-prefix length. The bucket SIZE depends on
+  #             the codebook, not the experiment: 64 / 70 / 36 items for the
+  #             beauty unpopular / mid / popular targets, so the neighbour bar
+  #             is a different sample size per stratum.
+  #   embedding k nearest items by cosine in the pre-quantization embedding
+  #             space -- exactly k per stratum, and the same space L_n samples
+  #             from (coherence_neighbor_method=embedding).
+  drift_neighbor_mode: prefix
   code_row_scope: all
+  # Orthogonal LEVEL axis of the same row mask: keep only the rows of these
+  # hierarchies. Same syntax as update_positions (null / "all" -> every level;
+  # [0,1] == "c1,c2"; [2,3] == the fine tail). Crosses with code_row_scope into
+  # "which items" x "which levels".
+  #
+  # NOT the same instrument as adaptive_code_lr_scale / update_positions: those
+  # also freeze that level's decoder head decoder_mlp[h] (and, for
+  # update_positions, the backbone), which confounds "this level's identifier
+  # rows are frozen" with "this level's output head is frozen". This key touches
+  # the SID embedding table only, so the backbone and all four heads still move.
+  code_row_levels: null
+  # Pin the ENTIRE semantic-ID embedding table for the update. The backbone and
+  # the decoder heads still move (subject to adaptive_code_lr_scale), so the
+  # identifier space is held fixed while the recommender is edited around it.
+  # Composed with adaptive_code_lr_scale=0.0 this gives: backbone moves, SID
+  # table frozen, decoder_mlp[0],[1] move, decoder_mlp[2],[3] frozen.
+  # Makes code_row_scope inert by construction -- the rows it would select are
+  # frozen anyway.
+  freeze_sid_table: false
   # lambda_r: weight on the RETAIN (repair) term. 1.0 = current behaviour.
   # Exists so the ascent/descent baselines are exact special cases of this
   # objective instead of separate implementations, which removes every

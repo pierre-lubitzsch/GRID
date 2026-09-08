@@ -22,6 +22,7 @@ def neg_train_unlearn(
     retain_batches: Sequence[TigerBatch],
     *,
     steps: int = 200,
+    n_epochs: Optional[int] = None,
     lr: float = 1e-3,
     neg_retain_every: int = 5,
     update_scope: str = "all",
@@ -60,6 +61,11 @@ def neg_train_unlearn(
     model.train()
     forget_losses: List[float] = []
     retain_losses: List[float] = []
+    # Same budget rule as unified.py / tracer.py: n_epochs * min(n_forget,
+    # n_retain), so the step count follows the forget set rather than a fixed
+    # constant. n_epochs wins when both are given.
+    if n_epochs is not None and forget_batches and retain_batches:
+        steps = int(n_epochs) * min(len(forget_batches), len(retain_batches))
     for step in range(int(steps)):
         if neg_retain_every > 0 and step % int(neg_retain_every) == 0 and retain_batches:
             batch = retain_batches[step % len(retain_batches)]

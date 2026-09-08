@@ -424,6 +424,9 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             self,
             ctx["retain_batches"],
             steps=int(cfg.get("finetune_steps", 500)),
+            # Shared budget knob, same one unified and tracer read, so all three
+            # take n_epochs passes over the batches actually present.
+            n_epochs=cfg.get("n_epochs"),
             lr=float(cfg.get("finetune_lr", 1e-3)),
             # Same 'modular stabilizer' scope as unified. With a PKM installed
             # over a checkpoint that was trained WITHOUT it (replace mode), this
@@ -451,6 +454,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             ctx["forget_batches"],
             ctx["retain_batches"],
             steps=int(cfg.get("neg_train_steps", 200)),
+            n_epochs=cfg.get("n_epochs"),
             lr=float(cfg.get("neg_train_lr", 1e-3)),
             neg_retain_every=int(cfg.get("neg_retain_every", 5)),
             update_scope=str(cfg.get("update_scope", "all")),
@@ -605,32 +609,68 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                   item's neighbours, so the repair term still has the
                   parameters it needs to move the neighbourhood back.
 
-        Returns a ``[H*K]`` float mask (1.0 = may update), or None for ``all``.
-        The mask covers ALL levels; composing it with the level restriction is
-        the caller's job, and is what makes "levels 0,1, forget rows only" a
+        ``code_row_levels`` is the orthogonal LEVEL axis of the same mask: it
+        keeps only the rows of the named hierarchies, so the two knobs cross
+        into "which items" x "which levels". It is deliberately NOT the same
+        instrument as ``adaptive_code_lr_scale`` / ``update_positions``: those
+        also stop that level's decoder head ``decoder_mlp[h]`` (and, for
+        ``update_positions``, the whole backbone) from moving, which confounds
+        "the identifier rows for this level are frozen" with "this level's
+        output head is frozen". This one touches the SID embedding table only.
+
+        Returns a ``[H*K]`` float mask (1.0 = may update), or None when neither
+        knob restricts anything (the recorded path). Composing the mask with the
+        LR-scale level restriction is still the caller's job, so
+        ``code_row_scope=forget`` + ``adaptive_code_lr_scale=0.0`` remains a
         single well-defined update.
         """
+        # freeze_sid_table wins over code_row_scope: an all-zero row multiplier
+        # pins every row of the SID embedding table, so the identifier space is
+        # held fixed while the backbone and the level-0/1 decoder heads still
+        # move. Reuses the row machinery rather than dropping the tensor from the
+        # optimizer, because the multiplier is applied to the post-step DELTA --
+        # under Adam a frozen-by-zero-gradient row still drifts via the momentum
+        # buffers, so cancelling the delta is the only way to truly hold it.
+        if bool(cfg.get("freeze_sid_table", False)):
+            n_rows = int(self.item_sid_embedding_table_encoder.weight.shape[0])
+            log.info(
+                "[code-row-scope] freeze_sid_table=true: all %d SID rows pinned "
+                "(code_row_scope=%r is inert while the table is frozen)",
+                n_rows, cfg.get("code_row_scope", "all"),
+            )
+            return torch.zeros(n_rows, dtype=torch.float32)
+
         scope = str(cfg.get("code_row_scope", "all")).strip().lower()
-        if scope in ("all", "", "none"):
-            return None
-        if scope not in ("forget", "forget_neighborhood"):
+        all_scopes = ("all", "", "none")
+        if scope not in all_scopes + ("forget", "forget_neighborhood"):
             raise ValueError(
                 "code_row_scope must be all | forget | forget_neighborhood, got "
                 f"{scope!r}"
             )
+        # Same parser as update_positions, so `[0,1]`, `"c1,c2"` and `"all"` mean
+        # the same thing for both knobs. It returns None for the FULL set as well
+        # as for null, which is what makes "all levels" cost nothing here.
+        levels = _resolve_update_positions(
+            cfg.get("code_row_levels"), int(self.num_hierarchies)
+        )
+        if scope in all_scopes and levels is None:
+            return None  # recorded path: no mask at all
 
         codes = self.codebooks.detach().cpu().to(torch.long)            # [N, H]
         n_items, n_hier = int(codes.shape[0]), int(codes.shape[1])
         K = int(self.num_embeddings_per_hierarchy)
 
-        items: Set[int] = set(int(i) for i in (ctx.get("visible_forget_items") or []))
-        if not items:
-            items = set(int(i) for i in (ctx["meta"].get("target_items") or []))
-        if not items:
-            raise ValueError(
-                f"code_row_scope={scope} but the request names no forget items"
-            )
-        n_forget = len(items)
+        items: Set[int] = set()
+        n_forget = 0
+        if scope not in all_scopes:
+            items = set(int(i) for i in (ctx.get("visible_forget_items") or []))
+            if not items:
+                items = set(int(i) for i in (ctx["meta"].get("target_items") or []))
+            if not items:
+                raise ValueError(
+                    f"code_row_scope={scope} but the request names no forget items"
+                )
+            n_forget = len(items)
 
         n_neighbors = 0
         if scope == "forget_neighborhood":
@@ -674,19 +714,42 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             n_neighbors = len(neigh)
             items |= neigh
 
-        idx = torch.tensor(sorted(items), dtype=torch.long)
-        if int(idx.max()) >= n_items:
-            raise ValueError(
-                f"item id {int(idx.max())} outside the SID tensor ({n_items} items)"
-            )
-        keep = torch.zeros(n_hier * K, dtype=torch.float32)
-        for h in range(n_hier):
-            keep[h * K + codes[idx, h].unique()] = 1.0
+        if scope in all_scopes:
+            keep = torch.ones(n_hier * K, dtype=torch.float32)
+        else:
+            idx = torch.tensor(sorted(items), dtype=torch.long)
+            if int(idx.max()) >= n_items:
+                raise ValueError(
+                    f"item id {int(idx.max())} outside the SID tensor "
+                    f"({n_items} items)"
+                )
+            keep = torch.zeros(n_hier * K, dtype=torch.float32)
+            for h in range(n_hier):
+                keep[h * K + codes[idx, h].unique()] = 1.0
+        n_rows_items = int(keep.sum())
+
+        if levels is not None:
+            lvl = torch.zeros_like(keep)
+            for h in levels:
+                lvl[h * K : (h + 1) * K] = 1.0
+            keep = keep * lvl
+            if float(keep.sum()) == 0.0:
+                # Only reachable if a level selection and an item selection are
+                # disjoint, which cannot happen for RQ codes (every item has a
+                # code at every level) -- but an empty mask would silently mean
+                # "SID table frozen", a different experiment, so refuse it.
+                raise ValueError(
+                    f"code_row_scope={scope} x code_row_levels={levels} selects "
+                    "0 rows; use freeze_sid_table=true if that is what you want"
+                )
+
         log.info(
-            "[code-row-scope] %s: %d forget + %d neighbour item(s) -> %d/%d SID "
-            "rows updatable (%.2f%% of the table)",
-            scope, n_forget, n_neighbors, int(keep.sum()), keep.numel(),
-            100.0 * float(keep.sum()) / keep.numel(),
+            "[code-row-scope] %s x levels=%s: %d forget + %d neighbour item(s) "
+            "-> %d/%d SID rows updatable (%.2f%% of the table; %d before the "
+            "level cut)",
+            scope, "all" if levels is None else levels,
+            n_forget, n_neighbors, int(keep.sum()), keep.numel(),
+            100.0 * float(keep.sum()) / keep.numel(), n_rows_items,
         )
         return keep
 

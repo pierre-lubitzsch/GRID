@@ -21,6 +21,7 @@ def finetune_unlearn(
     retain_batches: Sequence[TigerBatch],
     *,
     steps: int = 500,
+    n_epochs: Optional[int] = None,
     lr: float = 1e-3,
     update_scope: str = "all",
     pkm_update_keys: bool = True,
@@ -63,6 +64,14 @@ def finetune_unlearn(
     opt = build_optimizer(optimizer, params, float(lr), algo="finetune")
     model.train()
     losses: List[float] = []
+    # Budget on the same rule as unified.py and tracer.py: n_epochs full passes
+    # over the batches actually present, so the step count scales with the data
+    # instead of being a fixed constant. A hardcoded steps=500 against unified's
+    # 4 is 125x the optimization, which is what drove this baseline to tau_P
+    # 0.04 on the sensitive scenario: a destroyed model reported as a baseline.
+    # n_epochs wins when both are given.
+    if n_epochs is not None and retain_batches:
+        steps = int(n_epochs) * len(retain_batches)
     if int(steps) > 0 and not retain_batches:
         raise ValueError("retain_batches is empty")
     best = float("inf")

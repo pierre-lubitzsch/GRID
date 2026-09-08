@@ -143,6 +143,32 @@ if [ "${VARIANT}" = "poison" ]; then
     MTOK="${MTOK}x${CLONE_INJECT_COUNT}"
   fi
   RUN_LABEL="${RUN_LABEL}${MTOK}_${PCT_LABEL}_n${N_TARGET_ITEMS}"
+  # Target-stratum token, matching resolve_grid_dataset's dataset naming: EMPTY
+  # for the default 'unpopular' so every recorded run dir keeps its name, and
+  # _tgt<strategy> otherwise.
+  #
+  # WHY THIS IS HERE AND NOT ONLY IN THE SWEEP DRIVERS. The strategy changes the
+  # DATASET (beauty_spam_seed2_pct1_n1 vs beauty_spam_tgtmid_seed2_pct1_n1) but
+  # used to leave the run label identical, so two runs on different attacks were
+  # indistinguishable by label. Measured cost on 2026-09-04: a mid-stratum run
+  # was SKIPPED outright by the duplicate guard because an unpopular run already
+  # held the label, and two poisoned-CF runs on different datasets both landed on
+  # 'letter_beauty_poison_pct1_n1_poisoncf'. Drivers that already pass
+  # RUN_LABEL_SUFFIX=_tgt<s> are left alone so their names do not double-tag.
+  # Poison SEED token, same convention: EMPTY for the default 2 so recorded run
+  # dirs keep their names. Without it every seed of one cell shares a label and
+  # the duplicate guard skips all but the first -- the same failure the missing
+  # stratum token caused on 2026-09-04.
+  _PSEED="${POISON_SEED:-2}"
+  case "${RUN_LABEL_SUFFIX:-}" in
+    *_seed*) ;;
+    *) [ "${_PSEED}" != "2" ] && RUN_LABEL="${RUN_LABEL}_seed${_PSEED}" ;;
+  esac
+  _STRAT="${TARGET_STRATEGY:-unpopular}"
+  case "${RUN_LABEL_SUFFIX:-}" in
+    *_tgt*) ;;                                   # driver already tagged it
+    *) [ "${_STRAT}" != "unpopular" ] && RUN_LABEL="${RUN_LABEL}_tgt${_STRAT}" ;;
+  esac
 fi
 case "$(printf '%s' "${PKM_MODE:-}" | tr '[:upper:]' '[:lower:]')" in
   add|replace) RUN_LABEL="${RUN_LABEL}_pkm$(printf '%s' "${PKM_MODE}" | tr '[:upper:]' '[:lower:]')" ;;
