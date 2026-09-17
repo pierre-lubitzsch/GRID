@@ -89,6 +89,19 @@ unlearning:
   max_norm: null
   update_max_norm: 1.0
   batch_size_per_device: 256
+  # Forget-set coverage. collate_with_sid_causal_duplicate expands each sequence
+  # into all its contiguous prefixes and then draws max_batch_size (512) of them
+  # with torch.randint, WITH REPLACEMENT. Below the cap nothing is lost, which is
+  # 94% of recorded requests; above it rows repeat and part of the expansion is
+  # never seen. forget_full_coverage lifts the cap for the FORGET loader only and
+  # splits the expansion into forget_rows_per_batch chunks instead. The step
+  # budget does not change: unified.py accumulates q_forget = ceil(n_forget /
+  # n_retain) forget mini-batches per optimizer step, so every forget row
+  # contributes exactly once per pass either way.
+  #
+  # Default false so every recorded run keeps the batch it was produced with.
+  forget_full_coverage: false
+  forget_rows_per_batch: 512
   target_params: tiger
   eval_mode: true
   rows_per_shard: 4096
@@ -279,8 +292,13 @@ unlearning:
   drift_neighbor_mode: prefix
   drift_neighbor_k: 32
   drift_unlearned_ckpt: null
-  drift_n_queries: 8          # retain query batches to score over
-  drift_control_items: 600    # sampled non-sharing items, the comparison group
+  drift_n_queries: 8          # query batches to score over
+  # Which queries to score. `retain` = retain TRAINING batches (what every
+  # recorded drift run used). `test` = the held-out test split, i.e. the same
+  # population NDCG@10 and SH@10 are computed on, so drift is measured where the
+  # reported metrics are and is not a claim about training rows.
+  drift_query_split: retain   # retain | test
+  drift_control_items: 600    # sampled items sharing NO code prefix with the target
   drift_item_chunk: 64
   # per-item position profile (src/item_position_profile.py)
   profile_max_items: 2000

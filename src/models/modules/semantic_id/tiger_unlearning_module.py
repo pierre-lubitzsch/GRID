@@ -1772,10 +1772,25 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         )
 
         unlearn_batch_size = unlearning_cfg.get("batch_size_per_device")
+        # forget_full_coverage: see _split_batch_rows. OFF by default, so every
+        # recorded run keeps the capped-and-sampled forget batch it was produced
+        # with. ON, the collate cap is lifted and the expansion is split into
+        # equal row-chunks, so the forget set is seen exactly once per pass and
+        # n_forget_batches finally tracks forget-set size (it is pinned at 1
+        # otherwise, because the cap fires long before 256 sequences do).
+        forget_full_coverage = bool(
+            unlearning_cfg.get("forget_full_coverage", False)
+        )
+        _forget_rows_per_batch = int(
+            unlearning_cfg.get("forget_rows_per_batch", 512)
+        )
         forget_loader = _build_finite_loader(
             base_train_cfg=train_dataloader_config,
             data_folder=forget_dir,
             batch_size_per_device_override=unlearn_batch_size,
+            max_batch_size_override=(
+                10 ** 9 if forget_full_coverage else None
+            ),
         )
         # Where the retain batches come from.
         #   subset (DEFAULT) -> retain_subset_dir, the sampled subset of size
@@ -1818,6 +1833,18 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             batch_size_per_device_override=unlearn_batch_size,
         )
         forget_batches = _drain_loader(forget_loader, device=device)
+        if forget_full_coverage:
+            _n_before = len(forget_batches)
+            _rows = sum(tiger_batch_size(b) for b in forget_batches)
+            forget_batches = [
+                c for b in forget_batches
+                for c in _split_batch_rows(b, _forget_rows_per_batch)
+            ]
+            log.info(
+                "[forget_full_coverage] %d rows, no subsampling: %d loader "
+                "batch(es) -> %d batches of <=%d rows",
+                _rows, _n_before, len(forget_batches), _forget_rows_per_batch,
+            )
         retain_batches = _drain_loader(retain_loader, device=device)
         if not forget_batches:
             raise RuntimeError(f"No forget batches from {forget_dir}")
@@ -2014,6 +2041,7 @@ def _build_finite_loader(
     base_train_cfg: "SequenceDataloaderConfig",
     data_folder: str,
     batch_size_per_device_override: Optional[int] = None,
+    max_batch_size_override: Optional[int] = None,
 ) -> DataLoader:
     cfg = deepcopy(base_train_cfg)
     cfg.data_folder = data_folder
@@ -2045,14 +2073,22 @@ def _build_finite_loader(
     dataset.set_list_of_files(list_of_files=file_map.get(0, []))
     dataset.set_distributed_params(total_workers=1, global_worker_id=0)
 
-    collate_fn_partial = partial(
-        cfg.collate_fn,
+    _collate_kw = dict(
         labels=cfg.labels,
         sequence_length=cfg.sequence_length,
         masking_token=cfg.masking_token,
         padding_token=cfg.padding_token,
         oov_token=cfg.get("oov_token", None) if hasattr(cfg, "get") else None,
     )
+    # collate_with_sid_causal_duplicate expands each sequence into ALL its
+    # contiguous prefixes and then draws max_batch_size of them with
+    # torch.randint -- WITH REPLACEMENT. Under the cap nothing is lost; over it,
+    # rows repeat and part of the expansion is never seen. For the forget set
+    # that is silent data loss, so the caller can lift the cap here and split
+    # the result into full-coverage batches instead.
+    if max_batch_size_override is not None:
+        _collate_kw["max_batch_size"] = int(max_batch_size_override)
+    collate_fn_partial = partial(cfg.collate_fn, **_collate_kw)
 
     return DataLoader(
         dataset=dataset,
@@ -2066,6 +2102,67 @@ def _build_finite_loader(
         collate_fn=collate_fn_partial,
         timeout=0,
     )
+
+
+def _split_batch_rows(batch: Any, max_rows: int) -> List[Any]:
+    """Split one TigerBatch into row-chunks of at most ``max_rows``.
+
+    Every tensor in a TigerBatch is row-major on dim 0 (one row per augmented
+    sequence), so a chunk is a plain slice of each field. Used with the collate
+    cap lifted, so the forget set is covered exactly once across the chunks
+    instead of being sampled with replacement down to one capped batch.
+    """
+    import dataclasses
+
+    model_input, label_data = batch
+    n = tiger_batch_size(batch)
+    if n <= max_rows:
+        return [batch]
+
+    # A TigerBatch stores three kinds of field, and only the first two scale
+    # with rows:
+    #   leading dim == n        row-major (mask, transformed_sequences, user ids)
+    #   leading dim == n * k    FLATTENED per-row groups. `labels` is like this:
+    #                           n rows x H hierarchies stored flat, recovered by
+    #                           `labels.reshape(bsz, -1)` in
+    #                           _build_coherence_neighbors. Slicing it as [a:b]
+    #                           left 16726 rows of labels against 512 of mask and
+    #                           raised "shape '[512, -1]' is invalid for input of
+    #                           size 66904".
+    #   anything else           per-hierarchy or scalar; slicing it truncated the
+    #                           hierarchy axis and raised IndexError in model_step.
+    # So slice proportionally when the leading dim is a multiple of n, and pass
+    # everything else through untouched.
+    def _slice(v, a, b):
+        if isinstance(v, torch.Tensor):
+            if v.dim() >= 1 and v.shape[0] % n == 0 and v.shape[0] >= n:
+                k = v.shape[0] // n
+                return v[a * k:b * k]
+            return v
+        if isinstance(v, dict):
+            return {key: _slice(x, a, b) for key, x in v.items()}
+        if isinstance(v, list):
+            if len(v) % n == 0 and len(v) >= n:
+                k = len(v) // n
+                return v[a * k:b * k]
+            return v
+        return v
+
+    out: List[Any] = []
+    for a in range(0, n, max_rows):
+        b = min(a + max_rows, n)
+        mi = dataclasses.replace(
+            model_input,
+            **{f.name: _slice(getattr(model_input, f.name), a, b)
+               for f in dataclasses.fields(model_input)},
+        )
+        ld = dataclasses.replace(
+            label_data,
+            **{f.name: _slice(getattr(label_data, f.name), a, b)
+               for f in dataclasses.fields(label_data)},
+        )
+        out.append((mi, ld))
+    return out
 
 
 def _drain_loader(loader: DataLoader, device: torch.device) -> List[Any]:
