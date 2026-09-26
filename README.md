@@ -1,6 +1,6 @@
 # Neighborhood-Aware Unlearning for Generative Recommendation
 
-This repository contains the code for Neighborhood-Aware Unlearning (NAU), a method for removing training interactions from generative recommenders that predict items through semantic IDs (SIDs). It builds on [GRID](https://github.com/snap-research/GRID) (Generative Recommendation with Semantic IDs, Apache 2.0, see `LICENSE` and `notices.txt`). We keep GRID's data format, semantic-ID pipeline, and TIGER implementation, and add:
+This repository contains the code for Neighborhood-Aware Unlearning (NAU), a method for removing training interactions from generative recommenders that predict items through semantic IDs (SIDs). It builds on [GRID](https://github.com/snap-research/GRID) (Generative Recommendation with Semantic IDs). We keep GRID's data format, semantic-ID pipeline, and TIGER implementation, and add:
 
 - two deletion scenarios:
   - **spam removal:** a bandwagon attack injects fake users that promote a target item;
@@ -265,3 +265,7 @@ This code builds on GRID:
 [4] Geng, Shijie, et al. "Recommendation as language processing (RLP): A unified pretrain, personalized prompt & predict paradigm (P5)." Proceedings of the 16th ACM Conference on Recommender Systems. 2022.
 
 [5] Wang, Wenjie, et al. "Learnable item tokenization for generative recommendation." Proceedings of the 33rd ACM International Conference on Information and Knowledge Management. 2024.
+
+## License
+
+This code is derived from GRID and is distributed under GRID's license (`LICENSE`): non-commercial research use only. Third-party attribution notices are in `notices.txt`.
