@@ -1,12 +1,10 @@
 """Unlearning algorithms for TIGER.
 
-This sub-package ports algorithms from
-https://github.com/deem-data/erase-bench (RecBole-flavoured) onto GRID's
-TIGER pipeline (Hydra + Lightning + TFRecord dataloaders).
+This sub-package ports algorithms from the RecBole-based ERASE benchmark onto
+GRID's TIGER pipeline (Hydra + Lightning + TFRecord dataloaders).
 
-The first algorithm is SCIF (Second-order Conjugate Influence Function); the
-module is structured so additional ports (Kookmin / Fanchuan / GIF / CEU /
-IDEA / SEIF) can be dropped in alongside as siblings.
+Each algorithm (SCIF, Kookmin, Fanchuan, SEIF, fine-tune, negative training,
+unified) lives in its own sibling module.
 """
 
 from src.components.unlearning.scif import scif_unlearn  # noqa: F401

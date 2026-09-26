@@ -1,24 +1,16 @@
-"""SCIF (Single-shot Conjugate Influence Function) unlearning, ported from
-``def scif`` in
-https://github.com/deem-data/erase-bench/blob/main/recbole/trainer/trainer.py
-and adapted to TIGER's ``(SequentialModelInputData, SequentialModuleLabelData)``
-batches and ``model.model_step(...)`` loss.
+"""SCIF (Single-shot Conjugate Influence Function) unlearning, ported from the
+ERASE benchmark and adapted to TIGER batches and ``model.model_step(...)``.
 
-High-level recipe (matches ERASE, restated):
+Update rule::
 
     retain_count := retain_samples_used_for_update * |D_f|
-    neg_grads  := -1/retain_count * Σ_{b in D_f}      ∂L_b / ∂θ
-    pos_grads  := +1/retain_count * Σ_{b in D_retain} ∂L_b / ∂θ
+    neg_grads  := -1/retain_count * sum_{b in D_f}      dL_b / dtheta
+    pos_grads  := +1/retain_count * sum_{b in D_retain} dL_b / dtheta
     grads      := neg_grads + pos_grads
-    x          := (H + λI)^{-1} grads        # CG, HVP from retain batches
-    θ          := θ - (1 / |D_retain_full|) * x
+    x          := (H + lambda I)^{-1} grads   # CG, HVP from retain batches
+    theta      := theta - (1 / |D_retain_full|) * x
 
-In the spam scenario every forget user's data is to be deleted (no
-"clean-forget" subset), so the optional ``clean_forget`` path is empty by
-default, matching the plan.
-
-The function intentionally does **not** know about Lightning, dataloaders,
-or checkpointing -- those are handled by ``TigerUnlearningModule``.
+Lightning, dataloaders and checkpointing are handled by ``TigerUnlearningModule``.
 """
 
 from __future__ import annotations
@@ -43,8 +35,6 @@ from src.components.unlearning.target_params import (
 
 
 # A TIGER batch is `(SequentialModelInputData, SequentialModuleLabelData)`.
-# We use a loose `Any` alias here to mirror `hvp.py` and avoid pulling in the
-# heavy `src.data.loading.components.interfaces` module at import time.
 TigerBatch = Any  # noqa: N816
 
 
@@ -58,9 +48,8 @@ def _materialize_batches(
 ) -> List["TigerBatch"]:
     """Pull batches out of a (possibly streaming) dataloader onto ``device``.
 
-    We need this because SCIF iterates the same retain batches twice -- once
-    for the gradient pass and again (cycled) inside CG. ``max_rows`` caps the
-    total number of *post-collate* rows we will materialise.
+    SCIF iterates the retain batches twice (gradient pass and CG).
+    ``max_rows`` caps the total number of post-collate rows.
     """
     out: List[TigerBatch] = []
     rows = 0
@@ -118,51 +107,42 @@ def scif_unlearn(
         helper :func:`_materialize_batches` (or the unlearning Lightning
         module) to populate these from existing GRID dataloaders.
     forget_size
-        ``|D_f|`` -- number of forget users/rows *before* collate augmentation.
-        Used only to compute ``retain_count``; both forget and retain gradient
-        passes divide by ``retain_count`` (ERASE parity). ERASE's
-        ``len(forget_data.dataset)`` is the equivalent.
+        ``|D_f|``, number of forget rows before collate augmentation. Used
+        only to compute ``retain_count``, which scales both gradient passes.
     retain_size
-        ``|D_retain_full|`` -- denominator in the final ``tau = 1/retain_size``
-        update step. Set to the row count of the full training retain corpus
-        (not the neighborhood subset used for gradients/HVP).
+        ``|D_retain_full|``, denominator in ``tau = 1/retain_size``. Row count
+        of the full retain corpus, not the subset used for gradients and HVP.
     retain_samples_used_for_update
-        Multiplier on ``forget_size`` for the retain gradient pass. ERASE
-        defaults to 16. Set to ``None`` to use the default.
+        Multiplier on ``forget_size`` for the retain gradient pass
+        (``None`` means 16).
     cg_max_iter, cg_tol, cg_damping
         Conjugate-Gradient knobs (see :func:`cg_inv_hvp`).
     target_params_policy
         ``"all"`` / ``"sid_embeddings"`` / ``"encoder_only"``. See
         :func:`select_target_params`. Ignored when ``params`` is given.
     params
-        Optional precomputed list of parameters to update (e.g. the
-        position-restricted set from
-        :func:`select_code_position_params`). When ``None`` (default), the set
-        is resolved from ``target_params_policy``.
+        Optional precomputed list of parameters to update. When ``None``, the
+        set is resolved from ``target_params_policy``.
     grad_masks
-        Optional ``id(param) -> float mask`` map. For each listed param the
-        per-element update ``-tau * x`` is multiplied by the mask before norm
-        clipping and application, so only the unmasked slots actually move
-        (used for the position-wise / adaptive-code interventions). Params
-        absent from the map are updated in full.
+        Optional ``id(param) -> float mask`` map. The update ``-tau * x`` of
+        each listed param is multiplied by its mask before norm clipping.
+        Params absent from the map are updated in full.
     cg_solution_max_norm
         If set, the CG solution ``x`` is joint L2-clipped before scaling by
-        ``tau`` (rarely needed; prefer ``update_max_norm``).
+        ``tau``.
     update_max_norm
         Joint L2 cap on the actual parameter update ``-tau * x``. ``None``
         disables clipping. Default ``1.0``.
     eval_mode
-        If True (default), ``model.eval()`` is invoked before any forward
-        pass. ERASE itself uses ``train()``; we deviate because TIGER applies
-        dropout heavily and we want a deterministic Hessian for CG.
+        If True (default), run in ``model.eval()`` so dropout is disabled and
+        the Hessian used by CG is deterministic.
     device
         Defaults to ``next(model.parameters()).device``.
 
     Returns
     -------
     info : dict
-        Diagnostic info: shapes, CG residuals, whether NaN guards triggered,
-        actual ``tau`` used.
+        Diagnostics: sizes, CG residuals, NaN-guard counts and ``tau``.
     """
     if forget_size <= 0:
         raise ValueError(f"forget_size must be > 0, got {forget_size}")
@@ -267,9 +247,7 @@ def scif_unlearn(
                 du = (-tau) * xi
                 mask = grad_masks.get(id(p))
                 if mask is not None:
-                    # Restrict the update to the unmasked slots (e.g. the
-                    # selected RQ-code positions' embedding rows). Done before
-                    # norm clipping so the clip reflects only what actually moves.
+                    # Mask before clipping so the norm covers only moved slots.
                     du = du * mask.to(device=du.device, dtype=du.dtype)
                     n_param_masked += 1
                 update_before.append(du)

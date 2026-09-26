@@ -174,8 +174,7 @@ class BaseJobLauncher:
         self.process = None
 
     def setup_metadata_dir(self):
-        """We look for the path first on the callback, then on the paths folder. If none is available,
-        we create a temporary directory."""
+        """Use the callback's metadata_dir, then paths.metadata_dir, else a temporary directory."""
         if (
             self.cfg.get("callbacks")
             and self.cfg.callbacks.get("restart_job", None)

@@ -8,16 +8,8 @@ ckpt_path: ???
 seed: 42
 
 
-# RQ-VAE inference. Mirrors rkmeans_inference_flat.yaml but swaps the quantizer
-# for the autoencoder + VectorQuantization stack used by rqvae_train_flat.yaml,
-# so a checkpoint trained with QUANTIZER=rqvae can be loaded to assign codes.
-# The rkmeans path is untouched.
-#
-# NOTE the codebooks live in the ENCODER LATENT space (model.encoder.output_dim,
-# 64) rather than the raw embedding space -- unlike RQ-KMeans, whose centroids
-# are in the 2048-d input space. Anything that recomputes residuals from raw
-# embeddings (e.g. TRACER's tracer_tokenizer.compute_residuals) must run the
-# encoder first for RQ-VAE checkpoints.
+# RQ-VAE inference: loads a checkpoint trained with rqvae_train_flat.yaml to assign codes.
+# Codebooks live in the encoder latent space (model.encoder.output_dim), not the input space.
 model:
   _target_: src.modules.clustering.residual_quantization.ResidualQuantization
   track_residuals: true

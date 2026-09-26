@@ -6,11 +6,9 @@ import os
 
 
 def guard_fresh_unlearn_output_dir(output_dir: str) -> None:
-    """Refuse to run if ``output_dir`` already holds a completed unlearning artefact.
+    """Refuse to run if ``output_dir`` already holds a completed unlearning artifact.
 
-    Intended as a second line of defence when two jobs race for the same
-    ``hydra.run.dir``. SLURM wrappers should allocate a unique directory with
-    :func:`scripts.unlearn_run_dir.unlearn_allocate_output_dir` before launch.
+    Use a fresh run directory for every unlearning run.
     """
     if not output_dir:
         return
@@ -21,9 +19,8 @@ def guard_fresh_unlearn_output_dir(output_dir: str) -> None:
     existing = [p for p in markers if os.path.exists(p)]
     if existing:
         raise FileExistsError(
-            f"Unlearning output dir {output_dir!r} already contains artefacts "
-            f"from a prior run ({existing[0]!r}). Pick a fresh hydra.run.dir "
-            f"(each sbatch job should get a unique path via the SLURM wrapper)."
+            f"Unlearning output dir {output_dir!r} already contains artifacts "
+            f"from a prior run ({existing[0]!r}). Pick a fresh hydra.run.dir."
         )
 
 

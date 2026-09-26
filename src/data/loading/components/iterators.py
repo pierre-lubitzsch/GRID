@@ -141,14 +141,9 @@ class TFRecordIterator(RawDataIterator):
     def _row_shuffle_seed(self):
         """Deterministic per-worker seed for the tf.data row shuffle.
 
-        tf.data.Dataset.shuffle without a seed draws a fresh nondeterministic
-        seed EVERY RUN — outside the control of lightning's seed_everything —
-        so two identical runs see different record orders and training is not
-        reproducible even with DETERMINISTIC=1 (found 2026-07-14 by the resume
-        smoke test: identical resumed runs diverged). torch.initial_seed() in a
-        dataloader worker is base_seed-derived and per-worker distinct (set by
-        pl_worker_init_function), so it is the right deterministic source.
-        Falls back to None (old nondeterministic behaviour) if torch is absent.
+        An unseeded tf.data shuffle is not controlled by seed_everything, so the
+        seed is derived from torch.initial_seed(), which is distinct per
+        dataloader worker. Returns None if torch is unavailable.
         """
         try:
             import torch
@@ -241,8 +236,7 @@ class TFRecordIterator(RawDataIterator):
         return example
 
     def shuffle(self, seed=42) -> RawDataIterator:
-        # TODO(lneves): Unify the shuffle method for all iterators
-        # Currently this one shuffles only files, parquet shuffles rows.
+        # This iterator shuffles only files; the parquet iterator shuffles rows.
         random.seed(seed)
         random.shuffle(self.list_of_file_paths)  # type: ignore
         return self

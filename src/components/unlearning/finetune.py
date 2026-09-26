@@ -33,25 +33,16 @@ def finetune_unlearn(
 ) -> Dict[str, Any]:
     """Fine-tune ``model`` on retain batches for ``steps`` optimizer steps.
 
-    ``update_scope='pkm_only'`` restricts the update to the Product-Key Memory,
-    freezing the backbone. Combined with a PKM installed over an already-trained
-    checkpoint this is the "ablate-then-repair" setup: installing PKM in
-    ``replace`` mode DISCARDS the trained FFN weights for the targeted layers
-    (they become unexpected_keys under the strict=False load), and this
-    fine-tune then rebuilds that capacity from retain data only.
+    ``update_scope='pkm_only'`` restricts the update to the Product-Key Memory
+    and freezes the backbone. ``steps=0`` performs no update, which measures the
+    effect of installing PKM alone.
 
-    ``steps=0`` performs NO update — use it to measure the pure ablation (how
-    much the knowledge destruction alone moves the metrics).
+    ``patience>0`` enables early stopping on the retain loss: training stops
+    after ``patience`` consecutive steps without improving the best loss by more
+    than ``min_delta``.
 
-    ``patience>0`` enables early stopping on the RETAIN loss: training halts once
-    ``patience`` consecutive steps pass without improving the best loss by more
-    than ``min_delta``. NOTE this watches the training objective, not SH/UR — the
-    eval metrics are only computed after the run, so a plateau in retain loss is
-    a proxy for "the rebuild has converged", not for "removal has converged".
-
-    ``optimizer='sgd'`` follows Sparse Memory Finetuning, whose argument is that
-    Adam's moment estimates get diluted on sparsely-selected memory slots that
-    receive zero gradient on most steps.
+    ``optimizer='sgd'`` follows Sparse Memory Finetuning, where Adam's moment
+    estimates are diluted on memory slots that rarely receive gradient.
     """
     device = device or next(model.parameters()).device
     params, _ = resolve_scope_params(
@@ -64,12 +55,7 @@ def finetune_unlearn(
     opt = build_optimizer(optimizer, params, float(lr), algo="finetune")
     model.train()
     losses: List[float] = []
-    # Budget on the same rule as unified.py and tracer.py: n_epochs full passes
-    # over the batches actually present, so the step count scales with the data
-    # instead of being a fixed constant. A hardcoded steps=500 against unified's
-    # 4 is 125x the optimization, which is what drove this baseline to tau_P
-    # 0.04 on the sensitive scenario: a destroyed model reported as a baseline.
-    # n_epochs wins when both are given.
+    # n_epochs full passes over the retain batches; overrides steps when given.
     if n_epochs is not None and retain_batches:
         steps = int(n_epochs) * len(retain_batches)
     if int(steps) > 0 and not retain_batches:
@@ -96,7 +82,7 @@ def finetune_unlearn(
                 if since_best >= int(patience):
                     stopped_at = step + 1
                     log.info(
-                        "[finetune] EARLY STOP at step=%d/%d "
+                        "[finetune] early stop at step=%d/%d "
                         "(no retain-loss improvement > %.2g for %d steps; best=%.4f)",
                         stopped_at, int(steps), float(min_delta), int(patience), best,
                     )

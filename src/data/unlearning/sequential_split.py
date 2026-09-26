@@ -3,20 +3,14 @@
 The single-shot pipeline uses ``training_forget/`` and ``training_retain/``
 directories produced by :mod:`src.data.unlearning.split_forget_retain`.
 
-For the sequential driver we:
+For the sequential driver, this module:
 
-1. Pre-scan both directories once and build user_id -> raw TFRecord bytes
-   maps. The forget pool is small (e.g. spam users); the retain pool is
-   typically tens of thousands of rows -> tens of MB compressed, fine to
-   keep in RAM.
-2. For each unlearning request ``k``, materialise a small per-request
+1. Scans both directories once and builds in-memory user_id -> raw TFRecord
+   bytes maps.
+2. For each unlearning request ``k``, writes a per-request
    ``training_forget/`` (B users) and ``training_retain/`` (current retain
-   pool minus the request's user_ids) under a per-request directory the
-   existing :class:`TigerUnlearningModule` can consume verbatim.
-
-We deliberately keep this module dependency-light (TensorFlow is the only
-heavy import) so the sequential driver can pre-build per-request shards on
-the CPU side before SCIF starts on GPU.
+   pool minus the request's user_ids) that :class:`TigerUnlearningModule`
+   can consume directly.
 """
 
 from __future__ import annotations
@@ -107,9 +101,7 @@ class UserIdIndex:
 def index_tfrecord_dir_by_user_id(directory: str) -> UserIdIndex:
     """Walk every shard under ``directory`` once and build a uid -> bytes map.
 
-    Rows missing a ``user_id`` are counted but skipped (caller decides what
-    to do; for the sequential driver they're never selectable as forget
-    targets and they would not survive a uid-based retain filter).
+    Rows missing a ``user_id`` are counted but skipped.
     """
     if not os.path.isdir(directory):
         raise FileNotFoundError(f"Expected TFRecord directory at {directory}")
@@ -232,7 +224,7 @@ def _write_uid_bytes(
 
 
 # ---------------------------------------------------------------------------
-# Public entry point: materialise one request's forget + retain dirs
+# Public entry point: materialize one request's forget + retain dirs
 # ---------------------------------------------------------------------------
 
 
@@ -248,10 +240,8 @@ def materialize_request_dirs(
 ) -> Dict[str, object]:
     """Write per-request ``training_forget/`` and ``training_retain/`` dirs.
 
-    Side effects on the in-memory indices: nothing here. Mutating the retain
-    index (``retain_{k+1} = retain_k \\ forget_k``) is the driver's job, done
-    *after* this call so the request's own retain shards still exist in case
-    the user wants to inspect them.
+    The in-memory indices are not modified; the driver updates the retain index
+    (``retain_{k+1} = retain_k \\ forget_k``) after this call.
     """
     if os.path.exists(request_dir):
         raise FileExistsError(
@@ -393,8 +383,7 @@ def order_forget_uids(
                 # Keep only uids that actually exist in the index, preserving order.
                 index_uids = set(forget_index.bytes_by_uid)
                 ordered = [u for u in manifest_uids if u in index_uids]
-                # Append any uid in the index but not in the manifest, sorted, so we
-                # never silently drop forget rows.
+                # Append uids missing from the manifest, sorted, so no forget rows are dropped.
                 trailing = sorted(index_uids - set(ordered))
                 if trailing:
                     log.warning(

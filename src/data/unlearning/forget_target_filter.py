@@ -11,7 +11,7 @@ Two modes are supported:
     For each spam session ``[i_1,...,i_n]`` and each position ``j`` where
     ``i_j ∈ I_f``, emit one TFRecord entry with
     ``sequence_data = [i_1,...,i_j]``.  The training collate will turn this
-    into the (full-prefix → target) training pair ``([i_1,...,i_{j-1}], i_j)``.
+    into the (full-prefix, target) training pair ``([i_1,...,i_{j-1}], i_j)``.
     Deduplicates across all source dirs so no exact sequence is written twice.
 
     With ``--unlearn_whole_items`` (``extra_source_dirs=[retain_dir]``) the
@@ -125,7 +125,7 @@ def materialize_item_pairs_forget_dir(
     overwrite: bool = True,
     include_context_rows: bool = False,
 ) -> Dict[str, object]:
-    """Write forget shards with one entry per (full_prefix → target_item) pair.
+    """Write forget shards with one entry per (full_prefix, target_item) pair.
 
     For each session ``[i_1,...,i_n]`` from ``forget_dir`` (and optionally
     ``extra_source_dirs``) and each position ``j ≥ 1`` where ``i_j ∈
@@ -133,8 +133,7 @@ def materialize_item_pairs_forget_dir(
     ``sequence_data = [i_1,...,i_j]``.  The standard training collate
     (``collate_with_sid_causal_duplicate``) will expand this into training
     pairs ending at ``i_j``, including the full-prefix pair
-    ``([i_1,...,i_{j-1}], i_j)`` that has the strongest influence on the
-    target-item prediction.
+    ``([i_1,...,i_{j-1}], i_j)``.
 
     Each pair entry gets a unique synthetic ``user_id`` (0-based counter) so
     that ``index_tfrecord_dir_by_user_id`` stores all of them without
@@ -142,8 +141,7 @@ def materialize_item_pairs_forget_dir(
     should be set to ``sorted`` or ``shuffled`` (not ``manifest``) since
     synthetic IDs do not appear in the spam manifest.
 
-    Deduplicates by exact sequence across all source dirs so no
-    ``[i_1,...,i_j]`` tuple is written more than once.
+    Deduplicates by exact sequence across all source dirs.
 
     Parameters
     ----------
@@ -156,9 +154,12 @@ def materialize_item_pairs_forget_dir(
     extra_source_dirs:
         Additional source directories to scan, e.g. ``training_retain`` when
         ``unlearn_whole_items=True``.  Pairs from these dirs are included in
-        the same dedup set so no sequence is emitted twice.
+        the same dedup set.
     rows_per_shard, overwrite:
         Passed to ``_ShardWriter``.
+    include_context_rows:
+        Also emit later prefixes in which a target item appears in the input
+        history rather than as the label.
     """
     if not target_items:
         raise ValueError("target_items must be non-empty for item_pairs mode.")
@@ -199,18 +200,9 @@ def materialize_item_pairs_forget_dir(
         rows_in += 1
         seq = tf.sparse.to_dense(example[SEQUENCE_FIELD]).numpy().tolist()
 
-        # Positions to emit a prefix for. By default only positions where the
-        # target item is the LABEL, i.e. seq[:j+1] supervises seq[j] in I_f.
-        #
-        # include_context_rows additionally emits every LATER prefix
-        # seq[:k+1] for k > j, i.e. the rows where the sensitive item sits in
-        # the model's INPUT history rather than in the target. Those rows are
-        # genuinely part of a sensitive-item deletion request: the model still
-        # conditions on the user's alcohol purchase when predicting their next
-        # item, so leaving them in means the interaction was not unlearned.
-        # Target-position-only is the right default for SPAM (the attack works
-        # through the target), which is why this is opt-in: every recorded spam
-        # result keeps its exact forget set.
+        # By default, emit prefixes whose label is a target item. With
+        # include_context_rows, also emit every later prefix, where the target
+        # item appears in the input history.
         cut_points = set()
         for j, item in enumerate(seq):
             if int(item) not in target_items:
@@ -218,10 +210,7 @@ def materialize_item_pairs_forget_dir(
             if j >= 1:
                 cut_points.add(j)
             if include_context_rows:
-                # every LATER prefix: k > j, so seq[k] is the label and the
-                # sensitive item at j sits in the history. Must start at j+1,
-                # not max(j,1)+1 -- the latter drops k=1 when the sensitive
-                # item is FIRST in the session (j=0), losing the row [i_0, i_1].
+                # Start at j + 1 so a target item at j = 0 still yields [i_0, i_1].
                 cut_points.update(range(j + 1, len(seq)))
 
         for j in sorted(cut_points):

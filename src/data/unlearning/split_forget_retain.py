@@ -14,10 +14,9 @@ ${paths.data_dir}/training_forget`` (or ``training_retain``).
 Usage
 -----
 ``python -m src.data.unlearning.split_forget_retain \\
-    --data_dir src/data/amazon_data/beauty_spam_seed42_pct1_n10 \\
-    --forget_manifest src/data/amazon_data/beauty_spam_seed42_pct1_n10/forget_manifest.json``
+    --data_dir <data_dir> --forget_manifest <data_dir>/forget_manifest.json``
 
-After running you will get::
+Outputs::
 
     <data_dir>/training_forget/data_*.tfrecord.gz
     <data_dir>/training_retain/data_*.tfrecord.gz
@@ -143,7 +142,7 @@ def _split_segregated_shards(
     out_retain_dir: str,
     spam_shard_prefix: str = "data_spam_",
 ) -> Tuple[List[str], List[str]]:
-    """Copy shards by filename — no TFRecord parse (bandwagon layout).
+    """Copy shards by filename without parsing TFRecords (bandwagon layout).
 
     Clean rows live in ``partition_*.tfrecord.gz``; spam rows in
     ``data_spam_*.tfrecord.gz`` only.
@@ -378,7 +377,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--deletion_spec",
         default=None,
         choices=sorted({"session", "item"}),
-        help="Deletion specification recorded in forget_retain_split.json.",
+        help="Deletion specification written to forget_retain_split.json.",
     )
     return p
 

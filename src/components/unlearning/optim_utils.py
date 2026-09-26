@@ -1,13 +1,7 @@
-"""One optimizer factory for every unlearning algorithm.
+"""Shared optimizer factory for the first-order unlearning algorithms.
 
-Before this, the optimizer was selectable for `unified`, `finetune` and `tracer`
-but hardcoded to Adam inside `seif`, `kookmin`, `fanchuan` and `neg_train`, so an
-"optimizer" axis in an experiment grid silently did nothing for half the
-algorithms. This centralises the choice so `adam | adamw | sgd` means the same
-thing everywhere, and so an unknown name fails loudly instead of being ignored.
-
-`scif` deliberately has no entry: it is a Newton/conjugate-gradient step, not a
-first-order loop, so there is no optimizer to choose.
+Supports ``adam``, ``adamw`` and ``sgd``; unknown names raise. ``scif`` does not
+use it because it takes a conjugate-gradient step instead of an optimizer loop.
 """
 
 from __future__ import annotations
@@ -16,9 +10,7 @@ from typing import Any, Dict, Iterable, List, Union
 
 import torch
 
-# SGD gets momentum by default because the algorithms that used to hardcode Adam
-# were tuned with an adaptive method; plain SGD without momentum is a much weaker
-# drop-in replacement and would make the axis look worse than it is.
+# Default SGD momentum, since plain SGD is a weak substitute for Adam.
 SGD_DEFAULT_MOMENTUM = 0.9
 
 _OPTIMIZERS = {
@@ -43,11 +35,9 @@ def build_optimizer(
     momentum: float = SGD_DEFAULT_MOMENTUM,
     algo: str = "",
 ) -> torch.optim.Optimizer:
-    """Build ``name`` over ``params`` (a param iterable OR param groups).
+    """Build optimizer ``name`` over ``params`` (parameters or param groups).
 
-    Only kwargs the chosen optimizer actually accepts are passed: handing
-    ``momentum`` to Adam raises, and handing ``betas`` to SGD raises, so the
-    caller should not have to branch.
+    Only kwargs accepted by the chosen optimizer are passed.
     """
     key = str(name).strip().lower()
     if key not in _OPTIMIZERS:

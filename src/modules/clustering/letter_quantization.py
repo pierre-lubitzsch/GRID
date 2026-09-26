@@ -1,45 +1,16 @@
-"""LETTER's learnable tokenizer, as a drop-in for GRID's RQ-VAE.
+"""LETTER tokenizer (arXiv:2405.07314) as a drop-in for GRID's RQ-VAE.
 
-LETTER (arXiv:2405.07314, "Learnable Item Tokenization for Generative
-Recommendation") is an RQ-VAE with two extra regularisers and one extra
-assignment rule:
-
-1. **Semantic regularisation** -- the plain RQ-VAE reconstruction + commitment
-   terms. Unchanged from :class:`ResidualQuantization`; that is the whole point
-   of subclassing rather than porting the authors' file.
-2. **Collaborative regularisation** (``alpha``) -- an InfoNCE term pulling each
-   item's quantised latent towards that item's vector in a sequential CF model
-   (the paper uses a 32-d SASRec; here, whatever
-   ``scripts/train_cf_embeddings.py`` produced). This is the term that makes
-   LETTER's identifiers behaviour-aware rather than purely content-derived.
-3. **Diversity regularisation** (``beta``) -- a per-level contrastive term over
-   the codebook that counteracts code-assignment bias, plus optional Sinkhorn
-   balancing on the final level (see
-   :class:`~src.components.quantization_strategies.SinkhornQuantization`).
-
-HOW IT PLUGS INTO GRID
-----------------------
-The extra terms are folded into the value :meth:`model_step` already returns as
-``quantization_loss``, so the inherited ``training_step`` -- including the manual
-``training_loop_function`` used for codebook initialisation -- is untouched. With
-``quantization_loss_weight = 1.0`` the total is exactly LETTER's
+LETTER extends the RQ-VAE (reconstruction and commitment losses) with a
+collaborative InfoNCE term (``alpha``) that aligns each item's quantized latent
+with its CF embedding (from ``scripts/train_cf_embeddings.py``), a per-level
+diversity term (``beta``) over the codebook, and optional Sinkhorn balancing on
+the final level. The extra terms are folded into ``quantization_loss`` during
+fitting only, so the total loss is
 
     L = L_recon + L_quant + beta * L_diversity + alpha * L_CF
 
-Validation, test and predict paths are untouched: the extra terms are added only
-while fitting. In particular ID ASSIGNMENT is the inherited deterministic
-``argmin``, matching LETTER's own ``use_sk=False`` at tokenization time.
-
-ID LAYOUT
----------
-This module trains ``num_hierarchies`` real codebooks; GRID's inference pipeline
-then appends a dedup digit, exactly as for RQ-VAE / RQ-KMeans. So a LETTER
-tensor has the same ``(L, N)`` shape and the same "last position is the dedup
-digit" convention as every other GRID identifier space, and every prefix-based
-diagnostic (code sharing, neighbourhood sampling, TRACER, the position analysis)
-applies unchanged. LETTER's own release instead trains 4 semantic levels and
-breaks collisions by resampling; that variant is NOT what this file implements,
-because it would silently change what a depth-3 prefix means everywhere.
+ID assignment uses the inherited deterministic ``argmin``. As with RQ-VAE, the
+inference pipeline appends a dedup digit as the last ID position.
 """
 
 from __future__ import annotations
@@ -70,23 +41,15 @@ def balanced_kmeans(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Size-constrained k-means: every cluster gets at most ``ceil(n / k)`` points.
 
-    LETTER calls ``k_means_constrained.KMeansConstrained`` here. That package is
-    not installed in this environment (and pulls in ortools), so the constraint
-    is solved directly instead: with a per-cluster capacity of ``cap``, replicate
-    each cluster ``cap`` times and run a rectangular linear-sum assignment. That
-    is the exact optimum of the balanced assignment step, not an approximation of
-    it, and it is cheap at the size that matters here (256 codes, 10 clusters).
-
-    Why the size constraint is load-bearing: the diversity loss samples a
-    positive from the assigned code's cluster, so a singleton cluster has no
-    positive to offer. Capacity ``ceil(n/k)`` forces every cluster to at least
-    ``n - (k-1) * cap`` members (22 for the default 256/10).
+    The balanced assignment step is solved exactly by replicating each cluster
+    ``cap`` times and running a rectangular linear-sum assignment. Balancing
+    ensures every cluster has members to sample diversity positives from.
 
     Args:
         points: ``[n, d]`` points to cluster (the codebook).
         n_clusters: number of clusters.
         n_iters: Lloyd iterations.
-        seed: seeds the initial centre choice.
+        seed: seeds the initial center choice.
 
     Returns:
         ``(centers [k, d], labels [n])``, both on ``points``' device.
@@ -138,11 +101,9 @@ class LetterVectorQuantization(VectorQuantization):
     """A codebook level plus LETTER's diversity loss.
 
     The diversity loss is a cross-entropy over the codebook in which the
-    "positive" is a DIFFERENT code drawn from the same balanced-k-means cluster
-    as the code the item was actually assigned, and the item's own code is masked
-    out. Pushing an assigned code towards its cluster-mates makes nearby codes
-    interchangeable, which is what stops the assignment piling onto a few
-    dominant codes.
+    "positive" is a different code drawn from the same balanced k-means cluster
+    as the assigned code, and the item's own code is masked out. This spreads
+    assignments over more codes.
 
     The cluster labels are recomputed from the live codebook by
     :meth:`refresh_code_clusters`; the parent
@@ -165,11 +126,9 @@ class LetterVectorQuantization(VectorQuantization):
         self.diversity_temperature = float(diversity_temperature)
         self.diversity_kmeans_iters = int(diversity_kmeans_iters)
         self.diversity_seed = int(diversity_seed)
-        # [n_clusters, n_positives]: for code k, the OTHER codes in its cluster.
-        # A buffer so it follows .to(device), but NOT persistent: its width is
-        # the largest cluster size and therefore varies between refreshes, so
-        # checkpointing it would make resume fail on a shape mismatch. It is
-        # rebuilt from the live codebook on the first fitting step instead.
+        # [n_clusters, n_positives]: for code k, the other codes in its cluster.
+        # Non-persistent because its width varies between refreshes; it is
+        # rebuilt from the codebook on the first fitting step.
         self.register_buffer(
             "code_cluster_positives",
             torch.zeros(self.n_clusters, 1, dtype=torch.long),
@@ -206,9 +165,7 @@ class LetterVectorQuantization(VectorQuantization):
             members = members_by_cluster[int(labels[code])]
             others = members[members != code]
             if others.numel() == 0:
-                # Degenerate singleton cluster: fall back to the whole codebook
-                # minus self, so the loss stays defined instead of hanging (the
-                # reference implementation loops forever here).
+                # Singleton cluster: fall back to the whole codebook minus self.
                 others = torch.cat(
                     [
                         torch.arange(code, device=labels.device),
@@ -245,9 +202,7 @@ class LetterVectorQuantization(VectorQuantization):
         )
         targets = table[ids, column]                                # [B]
         similarity = quantized @ codebook.t()                       # [B, K]
-        # Mask the item's own code, exactly as the reference does: without this
-        # the argmin-assigned code trivially wins and the term has no gradient
-        # towards its cluster-mates.
+        # Mask the item's own code so the assigned code cannot trivially win.
         similarity = similarity.scatter(
             1, ids.unsqueeze(-1), torch.finfo(similarity.dtype).min
         )
@@ -285,23 +240,13 @@ class LetterResidualQuantization(ResidualQuantization):
             semantic-ID tensor). Produced by
             ``scripts/train_cf_embeddings.py``. Required whenever
             ``cf_loss_weight > 0``.
-        cf_loss_weight: LETTER's ``alpha``. 0 disables the term, which reduces
-            the tokenizer to "RQ-VAE + diversity" -- useful as an ablation, not
-            as LETTER.
+        cf_loss_weight: LETTER's ``alpha``. 0 disables the term.
         cf_projection: if the latent dim and ``d_cf`` differ, align them with a
-            learned bias-free linear map. The paper has no such map (its latent
-            and its SASRec are both 32-d); prefer matching the dims by training
-            the CF model at the latent width, and treat this as the escape hatch.
-        diversity_refresh_every_n_steps: how often to recluster the codebooks for
-            the diversity term. The reference reclusters once per epoch, but
-            GRID's item loader is unbounded and its "epochs" are a few steps
-            long, so this is expressed in steps.
-        sinkhorn_epsilon: entropic regularisation for balanced code assignment.
-            LETTER applies it to the FINAL level only (``sk_epsilons =
-            [0, 0, 0, 0.003]``), which is what ``sinkhorn_layers="last"``
-            reproduces for any number of levels. Levels are configured from ONE
-            deep-copied prototype, so per-level epsilons have to be set here
-            rather than in the config.
+            learned bias-free linear map.
+        diversity_refresh_every_n_steps: how often (in steps) to recluster the
+            codebooks for the diversity term.
+        sinkhorn_epsilon: entropic regularization for balanced code assignment,
+            applied to the levels selected by ``sinkhorn_layers``.
         sinkhorn_layers: ``"last"`` (default), ``"all"``, ``"none"``, or an
             explicit list of level indices.
     """
@@ -329,10 +274,8 @@ class LetterResidualQuantization(ResidualQuantization):
 
         if self.cf_loss_weight > 0 and cf_embeddings is None:
             raise ValueError(
-                "cf_loss_weight > 0 but no cf_embeddings were given. LETTER's "
-                "collaborative alignment has nothing to align to; run "
-                "scripts/train_cf_embeddings.py first, or set cf_loss_weight=0 "
-                "to train the ablation explicitly."
+                "cf_loss_weight > 0 but no cf_embeddings were given; run "
+                "scripts/train_cf_embeddings.py first, or set cf_loss_weight=0."
             )
 
         if cf_embeddings is None:
@@ -345,10 +288,9 @@ class LetterResidualQuantization(ResidualQuantization):
             if not cf_projection:
                 raise ValueError(
                     f"cf_embeddings are {matrix.size(-1)}-d but the tokenizer's "
-                    f"latent is {latent_dim}-d. LETTER's alignment term is a dot "
-                    f"product between the two, so they must match. Retrain the CF "
+                    f"latent is {latent_dim}-d; they must match. Retrain the CF "
                     f"model with --dim {latent_dim}, or set cf_projection=true to "
-                    f"learn a map (a deviation from the paper)."
+                    f"learn a map."
                 )
             self.cf_projection = nn.Linear(latent_dim, matrix.size(-1), bias=False)
         # Not a Parameter: the CF model is frozen, it is an input to this one.
@@ -391,8 +333,8 @@ class LetterResidualQuantization(ResidualQuantization):
                     raise TypeError(
                         f"sinkhorn_epsilon={epsilon} selects level {idx}, but its "
                         f"quantization_strategy is {type(strategy).__name__}, which "
-                        f"has no epsilon. Use SinkhornQuantization for the levels "
-                        f"balanced assignment is meant to act on."
+                        f"has no epsilon. Use SinkhornQuantization for the "
+                        f"balanced levels."
                     )
                 continue
             strategy.epsilon = value
@@ -411,10 +353,8 @@ class LetterResidualQuantization(ResidualQuantization):
     def _as_cf_matrix(value: Any) -> torch.Tensor:
         """Accept a bare ``[N, d]`` tensor or a dict with an ``item_ids`` key.
 
-        The dict form is reordered by ``item_ids``. Row ``i`` is only item ``i``
-        when the ids happen to be ``arange``; a differently ordered artefact
-        would otherwise pair every item's identifier with another item's
-        behaviour, with no error anywhere.
+        The dict form is reordered by ``item_ids`` so that row ``i`` is item
+        ``i``.
         """
         if isinstance(value, dict):
             keys = [k for k in ("embeddings", "cf_embeddings", "weight") if k in value]
@@ -445,11 +385,9 @@ class LetterResidualQuantization(ResidualQuantization):
     def cf_loss(
         self, quantized: torch.Tensor, item_ids: torch.Tensor
     ) -> torch.Tensor:
-        """InfoNCE between quantised latents and CF vectors, in-batch negatives.
+        """InfoNCE between quantized latents and CF vectors, in-batch negatives.
 
-        Identical in form to the reference ``RQVAE.CF_loss``: the similarity
-        matrix is ``x_q @ cf^T`` and the label of row ``i`` is ``i``, so the item
-        must score its OWN behaviour above every other item's in the batch.
+        The similarity matrix is ``x_q @ cf^T`` and the label of row ``i`` is ``i``.
         """
         cf = self.cf_embeddings
         if cf is None or self.cf_loss_weight <= 0:
@@ -492,10 +430,7 @@ class LetterResidualQuantization(ResidualQuantization):
         for layer in self.quantization_layer_list:
             if not isinstance(layer, LetterVectorQuantization):
                 continue
-            # A level that has just finished initialising has no cluster table
-            # yet. Waiting for the next scheduled refresh would leave the
-            # diversity term silently at zero for up to `every` steps -- which
-            # is most of a short run.
+            # Also refresh a level that was just initialized and has no table.
             if due or (layer.is_initialized and not layer._clusters_ready):
                 layer.refresh_code_clusters()
 
@@ -506,13 +441,7 @@ class LetterResidualQuantization(ResidualQuantization):
     def forward(
         self, embeddings: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """As the parent, but keeps the summed quantised latent for the CF term.
-
-        ``quantized_embeddings`` is the straight-through sum over levels, i.e.
-        exactly the ``dense_out`` the reference implementation feeds to its CF
-        loss. Recomputing it instead would run the residual chain twice and
-        re-draw the Sinkhorn assignment.
-        """
+        """As the parent, but caches the summed quantized latent for the CF term."""
         cluster_ids, all_residuals, quantized, quantization_loss = super().forward(
             embeddings
         )
@@ -525,10 +454,8 @@ class LetterResidualQuantization(ResidualQuantization):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """As the parent, but folds LETTER's extra terms into ``quantization_loss``.
 
-        Folding rather than returning a fifth value keeps the inherited
-        ``training_step`` -- and with it the manual ``training_loop_function``
-        that drives codebook initialisation -- working unmodified. With
-        ``quantization_loss_weight = 1.0`` the total loss is exactly LETTER's.
+        This keeps the inherited ``training_step`` and codebook initialization
+        unchanged.
         """
         (
             cluster_ids,

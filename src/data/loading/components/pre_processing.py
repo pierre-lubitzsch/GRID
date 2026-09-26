@@ -21,15 +21,8 @@ def convert_bytes_to_string(
     **kwargs,
 ) -> Dict[str, np.ndarray]:
     # For each feature to apply, cast its np.ndarray of bytes to string.
-    #
-    # Decode UTF-8 explicitly rather than `.astype(str)`: numpy's bytes->str cast
-    # assumes ASCII and raises UnicodeDecodeError on the first non-ASCII byte.
-    # The Amazon P5 item text happens to be ASCII, but Amazon-Reviews-2023 titles
-    # are not (em dashes, accents, trademark signs), which killed the grocery
-    # embedding job with "'ascii' codec can't decode byte 0xe2".
-    # UTF-8 is a strict superset of ASCII, so every existing dataset decodes
-    # byte-identically; `errors="replace"` keeps one malformed title from
-    # aborting a multi-hour job.
+    # Decode as UTF-8 (numpy's bytes->str cast assumes ASCII); malformed bytes
+    # are replaced.
     for k in batch_or_row:
         if is_feature_in_features_to_apply(features_to_apply, k):
             arr = batch_or_row[k]
@@ -37,10 +30,8 @@ def convert_bytes_to_string(
             if kind == "S":
                 arr = np.char.decode(arr, "utf-8", "replace")
             elif kind == "O":
-                # TFRecord parsing hands back an OBJECT array of python `bytes`,
-                # not a fixed-width "S" array, so this is the branch that actually
-                # runs -- and `.astype(str)` on bytes objects yields "b'...'" or
-                # raises UnicodeDecodeError on non-ASCII. Decode element-wise.
+                # TFRecord parsing returns an object array of `bytes`; decode
+                # element-wise.
                 arr = np.array(
                     [
                         x.decode("utf-8", "replace") if isinstance(x, (bytes, bytearray))
@@ -77,7 +68,7 @@ def filter_features_to_consider(
     if len(dataset_config.features_to_consider):
         # Given a batch or row, filter the features to consider.
         return {k: v for k, v in batch_or_row.items() if k in features_to_consider}
-    # if not specified, we consider all features
+    # if not specified, consider all features
     return batch_or_row
 
 
@@ -129,7 +120,6 @@ def convert_fields_to_tensors(
 
 def filter_sequence_length_row(row: Dict[str, torch.Tensor], dataset_config: BaseDatasetConfig, features_to_apply: Optional[List[str]] = [], **kwargs) -> Dict[str, np.ndarray]:  # type: ignore
     # Only works for a row right now. This filters out rows that have fields with sequence length smaller than the min threshold.
-    # TODO(lneves): Make this work for a batch as well without creating batches of different sizes.
     for _, tensor in row.items():
         if len(tensor) < dataset_config.min_sequence_length:
             return None
@@ -282,7 +272,7 @@ def preprocess_categorical_feature_to_idx(
                 value, 0
             )  # Default to 0 (e.g., '<OOV>') if not found
 
-    # Determine if we are handling a single row or a batch of rows
+    # Determine whether this is a single row or a batch of rows
     is_batch = isinstance(batch_or_row, list)
     # Apply the mapping to the appropriate features
     if is_batch:
@@ -310,15 +300,10 @@ def map_sparse_id_to_embedding(
     # Map sparse id to pre-computed embedding
 
     embedding_map = dataset_config.embedding_map.get(sparse_id_field, None)
-    # embedding_map is either an N×d tensor (legacy format) or a dict with
-    # "embeddings" (N×d) and "item_ids" (N,) keys (indexed format from
-    # generate_embeddings.sh when item IDs are non-sequential, e.g. rsc15).
-    # In both cases item IDs in the TFRecords must already be sequential
-    # (0..N-1) after convert_rsc15_inter.py remapping.
+    # embedding_map is either an N×d tensor or a dict with "embeddings" (N×d)
+    # and "item_ids" (N,) keys. Item IDs in the TFRecords must be 0..N-1.
     if embedding_map is None:
         raise ValueError("Embedding map not found")
-    # Support both plain N×d tensor (legacy) and {"embeddings": N×d, "item_ids": N}
-    # dict/OmegaConf-DictConfig (generate_embeddings.sh indexed format).
     # OmegaConf DictConfig is not a dict subclass, so check for Tensor explicitly.
     if isinstance(embedding_map, torch.Tensor):
         emb_tensor: torch.Tensor = embedding_map

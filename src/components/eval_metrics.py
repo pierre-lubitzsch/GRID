@@ -143,13 +143,12 @@ class Recall(CustomRetrievalMetric):
 #
 # These measure how often the spam-boosted target items I_t leak into the top-k
 # recommendations, restricted to evaluation examples whose ground-truth label is
-# NOT itself a target (y not in I_t). With one eval example per user (leave-one-
-# out, |D_u| = 1) these accumulators match the definitions exactly:
+# not itself a target (y not in I_t). With one eval example per user
+# (leave-one-out):
 #   SH@k  = (# non-target examples with a target in top-k) / (# non-target examples)
 #   ASI@k = (sum over non-target examples of |top-k ∩ I_t| / min(|I_t|, k)) / |U|
-# where |U| is the total number of users/examples (so target-labelled examples
-# contribute 0 to the numerator but still count in ASI's denominator, matching
-# the max{1, ...} convention).
+# where |U| is the total number of users/examples (target-labeled examples
+# contribute 0 to the numerator but count in ASI's denominator).
 
 
 class CustomSpamMetric(CustomMeanReductionMetric):
@@ -172,14 +171,8 @@ class CustomSpamMetric(CustomMeanReductionMetric):
         super().__init__(**kwargs)
         self.top_k = top_k
         self.num_targets = max(1, int(num_targets))
-        # User scope. A sensitive deletion is a request by SPECIFIC users, so a
-        # single population-wide number cannot express whether the request was
-        # honoured: with 14 requesting users out of 22,363, at most 0.06% of a
-        # global SH@k drop can come from them, so a 39% drop is ~96% removal for
-        # users who never asked. Scoping the same metric to the two populations
-        # separates deletion efficacy from collateral over-removal:
-        #   "forget" -> should fall to ~0 (the request was honoured)
-        #   "retain" -> should stay at base (everyone else still wants the item)
+        # User scope: "all", "forget" (requesting users only) or "retain"
+        # (all other users). Separates deletion efficacy from collateral removal.
         if user_scope not in ("all", "forget", "retain"):
             raise ValueError(
                 f"user_scope must be one of all/forget/retain, got {user_scope!r}"
@@ -243,8 +236,7 @@ class SpamHitRate(CustomSpamMetric):
         is_spam_label: torch.Tensor,
         keep: torch.Tensor,
     ) -> None:
-        # `keep` restricts BOTH numerator and denominator, so a scoped metric is
-        # the same ratio measured on a subpopulation, not a diluted global one.
+        # `keep` restricts both numerator and denominator.
         nonspam = (~is_spam_label) & keep
         hits = spam_in_topk.any(dim=1) & nonspam
         self.metric_values += hits.sum().item()
@@ -255,8 +247,8 @@ class AvgSpamItems(CustomSpamMetric):
     """ASI@k: mean over users of |top-k ∩ I_t| / min(|I_t|, k) on non-target examples.
 
     Numerator sums ``|top-k ∩ I_t| / min(|I_t|, k)`` over non-target examples;
-    denominator is the total example count |U| (target-labelled examples add 0 to
-    the numerator but are counted here, per the max{1, ...} convention).
+    denominator is the total example count |U| (target-labeled examples add 0 to
+    the numerator but are counted here).
     """
 
     def _accumulate(
@@ -268,9 +260,9 @@ class AvgSpamItems(CustomSpamMetric):
         nonspam = (~is_spam_label) & keep
         cap = max(1, min(self.num_targets, self.top_k))
         per_example = spam_in_topk.sum(dim=1).float() / cap
-        per_example = per_example * nonspam.float()  # zero out target-labelled
+        per_example = per_example * nonspam.float()  # zero out target-labeled
         self.metric_values += per_example.sum().item()
-        # denom: |U| within scope (target-labelled examples still counted)
+        # denom: |U| within scope (target-labeled examples still counted)
         self.total_values += int(keep.sum().item())
 
 
@@ -285,11 +277,9 @@ class TargetProbMass(CustomSpamMetric):
     (the beam's product-of-per-hierarchy-softmax score in
     ``tiger_generation_model.generate``), so no exponentiation is needed.
 
-    Unlike SH@k / ASI@k this is NOT top-k truncated and NOT restricted to
-    non-target-labelled examples — it is the remaining probability the model
-    would generate for the spam IDs over the whole query set. ``top_k`` is
-    accepted for the shared registration machinery but ignored, so TPM@5 and
-    TPM@10 are identical (read either).
+    Unlike SH@k / ASI@k this is not top-k truncated and not restricted to
+    non-target-labeled examples. ``top_k`` is accepted for interface
+    compatibility but ignored, so TPM@k is the same for every k.
     """
 
     def update(
@@ -300,7 +290,7 @@ class TargetProbMass(CustomSpamMetric):
         user_ids: Optional[torch.Tensor] = None,
     ) -> None:
         # preds: (B, C) linear marginal prob of each generated candidate.
-        # is_spam_cand: (B, C) bool — candidate's full SID matches a target item.
+        # is_spam_cand: (B, C) bool, candidate's full SID matches a target item.
         # is_spam_label is unused (TPM is over all queries q ∈ Q in scope).
         keep = self._scope_mask(user_ids, preds.size(0), preds.device)
         mass = (preds * is_spam_cand.to(preds.dtype)).sum(dim=1)  # (B,)
@@ -366,7 +356,7 @@ class RetrievalEvaluator(Evaluator):
                 num_of_candidates=num_of_candidates,
                 num_negatives=self.num_negatives,
             )
-            # we +1 here because we need to include the positive sample
+            # +1 to include the positive sample
             num_of_candidates = self.num_negatives + 1
             pos_embeddings = key_embeddings[labels]
             key_embeddings = key_embeddings[inbatch_negatives]
@@ -418,11 +408,7 @@ class RetrievalEvaluator(Evaluator):
         # num_of_candidates: number of total vocabs
         # num_negatives: number of negative samples
 
-        # we do randint to accelerate the negative sampling
-        # this could have collision with positive pairs but the chance is very low
-
-        # TODO (Clark): in the future we might need to have non-collision negative sampling
-        # when K in top-k is very small (e.g., hits@1) and num_negatives is very large
+        # randint is used for speed; collisions with positives are possible but rare
         negative_candidates = torch.randint(
             self.placeholder_token_buffer,
             num_of_candidates,
@@ -457,14 +443,11 @@ class SIDRetrievalEvaluator(Evaluator):
 
         # Optional spam-exposure metrics (SH@k, ASI@k). They require the spam
         # target set I_t as semantic IDs, loaded from the poison forget_manifest
-        # and the semantic-ID tensor. If either is missing they are skipped, so
-        # clean/unpoisoned runs without a manifest simply don't emit them.
+        # and the semantic-ID tensor. If either is missing they are skipped.
         self.spam_target_sids: Optional[torch.Tensor] = None
         self.num_spam_targets: int = 0
-        # Users who actually requested the deletion. Present for a sensitive
-        # manifest; absent (or empty) for a spam one, where the "forget users"
-        # are injected fakes that carry no eval examples and the global number is
-        # already the right question.
+        # Users who requested the deletion (sensitive manifests only; empty for
+        # spam manifests).
         self.forget_user_ids: List[int] = self._load_forget_user_ids(
             forget_manifest_path
         )
@@ -481,9 +464,8 @@ class SIDRetrievalEvaluator(Evaluator):
                             sync_on_compute=False,
                             compute_with_cache=False,
                         )
-                        # Scoped twins. Registered only when the manifest names
-                        # the requesting users, so spam runs are byte-identical
-                        # to before and no existing table changes.
+                        # Scoped variants, registered only when the manifest
+                        # names the requesting users.
                         if self.forget_user_ids:
                             for scope, suffix in (("forget", "F"), ("retain", "R")):
                                 self.metrics[f"{metric_name}{suffix}@{top_k}"] = (
@@ -514,9 +496,8 @@ class SIDRetrievalEvaluator(Evaluator):
     def _load_forget_user_ids(forget_manifest_path: Optional[str]) -> List[int]:
         """User ids named by the manifest as having requested the deletion.
 
-        Returns [] when the manifest is missing or records no users, which
-        disables the scoped metrics rather than failing: a spam manifest has no
-        real requesting users, so only the global number is meaningful there.
+        Returns [] when the manifest is missing or is not a sensitive-deletion
+        manifest, which disables the scoped metrics.
         """
         if not forget_manifest_path or not os.path.isfile(forget_manifest_path):
             return []
@@ -544,7 +525,7 @@ class SIDRetrievalEvaluator(Evaluator):
 
         ``forget_manifest_path`` provides ``target_items`` (I_t); the semantic-ID
         tensor (``[num_hierarchies, num_items]``, raw per-hierarchy codes) maps
-        each target item to its code tuple — the same space as ``generated_ids``.
+        each target item to its code tuple (the same space as ``generated_ids``).
         """
         if not forget_manifest_path or not os.path.isfile(forget_manifest_path):
             return None, 0
@@ -579,13 +560,13 @@ class SIDRetrievalEvaluator(Evaluator):
         preds = marginal_probs.reshape(-1)
 
         # check if the generated IDs contain the labels
-        # if so, we get the coordinates of the matched IDs
+        # if so, get the coordinates of the matched IDs
         matched_id_coord = torch.all((generated_ids == labels), dim=2).nonzero()
 
-        # we initialize the ground truth as all false
+        # initialize the ground truth as all false
         target = torch.zeros(batch_size, num_candidates).bool()
 
-        # we set the matched IDs to true if they are in the generated IDs
+        # set the matched IDs to true if they are in the generated IDs
         target[matched_id_coord[:, 0], matched_id_coord[:, 1]] = True
         target = target.reshape(-1)
         expanded_indexes = (
@@ -605,7 +586,7 @@ class SIDRetrievalEvaluator(Evaluator):
             )
 
         # Spam-exposure metrics: detect target items among the generated
-        # candidates and among the labels (to exclude target-labelled examples).
+        # candidates and among the labels (to exclude target-labeled examples).
         if self.spam_target_sids is not None:
             st = self.spam_target_sids.to(generated_ids.device)  # (T, H)
             # candidate is a target iff its full code tuple matches any target sid

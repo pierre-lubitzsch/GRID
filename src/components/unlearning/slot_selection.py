@@ -1,40 +1,27 @@
 """Top-t Product-Key-Memory slot selection for sparse-memory unlearning.
 
-Adapts Sparse Memory Finetuning (Lin et al., 2025) to unlearning: instead of
-updating the whole memory, score every value slot, keep the best ``t``, and mask
-the gradient of all the others so only those rows move.
+Adapts Sparse Memory Finetuning (Lin et al., 2025) to unlearning: every value
+slot is scored, the best ``t`` are kept, and the gradients of all other slots are
+masked so only the selected rows are updated.
 
-Three scoring families, all computed from the SAME forget/retain passes:
+Scoring criteria, computed from the same forget and retain passes:
 
 ``af``
-    Raw access frequency on the forget set -- the access-count baseline (SMF's
-    TF term). Cheap: no backward pass needed.
+    Access frequency on the forget set (no backward pass needed).
 ``af_ihf``
-    ``AF(s) * log((T_r + 1) / (HF(s) + 1))``. The recommender-side analogue of
-    TF-IDF, with the retain split as the "history": a slot scores highly when the
-    forget data reads it often and the retain data rarely does. Retain is the
-    right history (it is definitionally what must be preserved) and the counts
-    are additive, so they can be cached and updated incrementally.
+    ``AF(s) * log((T_r + 1) / (HF(s) + 1))``, a TF-IDF analogue with the retain
+    split as history: a slot scores highly when forget data reads it often and
+    retain data rarely does.
 ``grad``
-    Per-slot gradient criteria on ``values.weight``:
+    Per-slot magnitude criterion ``||g_f|| - lambda * ||g_r||`` on
+    ``values.weight``.
+``grad_combined``
+    ``gf_hat - lambda * gr_hat - mu * dot_hat`` with ``dot_i = <g_f,i, g_r,i>``,
+    the first-order change in retain loss from editing slot ``i``. The objective
+    is separable over slots, so exact top-t is a plain ``topk``.
 
-    * magnitude-only ``||g_f|| - lambda * ||g_r||``
-    * combined ``gf_hat - lambda * gr_hat - mu * dot_hat`` where
-      ``dot_i = <g_f,i , g_r,i>``
-
-    The dot term is the one that matters: the unlearning update moves along
-    ``+g_f``, so the first-order change in the RETAIN loss from editing slot
-    ``i`` is ``<g_f,i , g_r,i>`` -- not ``||g_r,i||``. It is signed, so a
-    negative value means editing for forgetting also *improves* retain, which a
-    norm-only score cannot express. Restricted to the selected coordinates the
-    objective is additively separable over slots, so exact top-t is plain
-    ``topk`` -- no greedy approximation is needed.
-
-NOTE (see WORKFLOW.md section H): on a memory that has COLLAPSED to a handful of
-slots, ``af`` and ``af_ihf`` are degenerate -- forget and retain read the same
-slots, so IHF is constant and ``af_ihf == af``. The gradient criteria can still
-discriminate, because magnitudes differ on shared slots. Selection is only a
-real experiment once slot utilisation is healthy.
+On a memory whose accesses concentrate on a few slots, ``af`` and ``af_ihf`` are
+degenerate; the gradient criteria can still discriminate.
 """
 
 from __future__ import annotations
@@ -165,20 +152,15 @@ def select_top_t_slots(
                     - float(mu) * _maxnorm(d)
                 )
 
-        # ELIGIBILITY MASK. A slot the forget data never touches has zero forget
-        # gradient, so editing it cannot possibly help — yet it can still WIN the
-        # selection: on a collapsed memory 'grad' with lambda=1 scores live slots
-        # NEGATIVE (when ||g_r|| > ||g_f||) while dead slots score exactly 0, so
-        # topk returns dead slots and the "selection" is a silent no-op.
-        # Observed on E23D01/D1/D2 (jobs 10303835/48/49): top-25 under lam=1.0
-        # had mean_gf_selected == mean_gr_selected == 0.
+        # Exclude slots the forget data never reaches; otherwise untouched slots
+        # (score 0) can outrank live slots with negative scores.
         eligible = a > 0
         if need_grad:
             eligible = eligible | (gf[name].norm(dim=1) > 0)
         n_eligible = int(eligible.sum().item())
         if n_eligible == 0:
             raise ValueError(
-                f"{name}: no slot has any forget access or forget gradient — "
+                f"{name}: no slot has any forget access or forget gradient; "
                 "the forget batches never reach this memory."
             )
         score = torch.where(
@@ -188,8 +170,8 @@ def select_top_t_slots(
         k = max(1, min(int(top_t), n_slots))
         if k > n_eligible:
             log.warning(
-                "[slot-select] %s: top_t=%d exceeds %d eligible slots — "
-                "selecting all eligible ones instead of padding with dead slots",
+                "[slot-select] %s: top_t=%d exceeds %d eligible slots; "
+                "selecting all eligible slots",
                 name, k, n_eligible,
             )
             k = n_eligible
@@ -198,9 +180,7 @@ def select_top_t_slots(
         mask[idx] = 1.0
         masks[name] = mask
 
-        # Slots that are LIVE at all (read by either split). On a collapsed
-        # memory this is tiny, and selecting t > live is a no-op dressed up as
-        # a selection — surface it rather than let it pass silently.
+        # Slots read by either split; warn if the selection covers all of them.
         live = int(((a > 0) | (h > 0)).sum().item())
         info["per_memory"][name] = {
             "n_slots": n_slots,
@@ -212,8 +192,8 @@ def select_top_t_slots(
         }
         if k >= live:
             log.warning(
-                "[slot-select] %s: top_t=%d >= live slots=%d — the selection is "
-                "not restricting anything (memory collapse? see WORKFLOW (H))",
+                "[slot-select] %s: top_t=%d >= live slots=%d; the selection "
+                "does not restrict the update",
                 name, k, live,
             )
 

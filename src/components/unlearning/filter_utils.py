@@ -20,16 +20,8 @@ def build_filter_mask(
     """Build a serialisable decode mask specification."""
     mode = str(filter_mode).strip().lower()
     if mode == "global":
-        # Block the TARGET items whenever the manifest names them, whatever the
-        # deletion_spec. The old condition also required deletion_spec == "item",
-        # so the sensitive scenario (deletion_spec == "item_pairs") fell through
-        # to forget_shard_items: every item appearing in a forget user's session,
-        # which on toys was 229 items of which only 11 were sensitive. That
-        # blocked 218 unrelated items globally while leaving 57 of the 68
-        # sensitive items reachable, so Sensitive@10 never went to zero and the
-        # baseline measured neither "remove the concept" nor "honour the pairs".
-        # forget_shard_items stays as the fallback for manifests with no target
-        # list at all.
+        # Block the target items when the manifest lists them; otherwise fall
+        # back to every item in the forget shard.
         if target_items:
             forbidden = sorted(int(x) for x in target_items)
         else:
@@ -41,24 +33,8 @@ def build_filter_mask(
             "user_forget_items": None,
         }
     if mode == "user_dependent":
-        # Each AFFECTED user gets the whole forbidden set, not just the items
-        # that user happened to interact with. The scenario this mode exists for
-        # is "remove this category, for the people who asked": scoping the block
-        # to a user's own interactions leaves the rest of the category
-        # recommendable to exactly those people. Measured on beauty hair-loss,
-        # the category holds 106 items while `scan_user_forget_items` returned 3
-        # to 11 per user, so 95-103 sensitive items stayed reachable and SHF@10
-        # sat at 0.18 instead of ~0 in 45 of 45 beauty and sports runs.
-        #
-        # NOT a union with the user's own items. `scan_user_forget_items` returns
-        # every item in the forget SEQUENCE, most of which is unrelated -- on toys
-        # 229 items of which 11 were sensitive. Unioning would re-introduce the
-        # over-blocking the `global` branch above was fixed to avoid, and would
-        # charge this baseline collateral it does not owe.
-        #
-        # The per-user keys still matter: retain users are absent from the map and
-        # so keep the category, which is the whole point of the mode and the axis
-        # on which it beats `global` (which suppresses the category for everyone).
+        # Each affected user gets the full forbidden set (not only their own
+        # interactions); users absent from the map keep all items.
         forbidden_user = sorted(int(x) for x in (target_items or forget_shard_items))
         serial_user: Dict[str, List[int]] = {}
         if user_forget_items:
@@ -107,10 +83,8 @@ def user_forbidden_sids_from_codebook(
 ) -> Dict[int, Set[Tuple[int, ...]]]:
     """``user_id -> forbidden SID tuples``, for ``filter_mode='user_dependent'``.
 
-    Mirrors :func:`forbidden_sids_from_codebook` but keeps the per-user
-    partition, which is what makes the user-dependent mode different from the
-    global one at decode time. Keys are coerced to ``int`` because a mask that
-    has been through JSON has string keys.
+    Like :func:`forbidden_sids_from_codebook` but keeps the per-user partition.
+    Keys are coerced to ``int`` since JSON-loaded masks have string keys.
     """
     if not user_forget_items:
         return {}
@@ -134,12 +108,9 @@ def merge_filter_masks(
 ) -> Optional[Dict[str, Any]]:
     """Union of a sequence of masks, for the sequential (per-request) driver.
 
-    Request ``k`` only sees its own users, but the model that is finally
-    evaluated has been asked to delete everything up to and including the last
-    request, so the mask the post-unlearn eval applies must be the union. Global
-    masks union their item lists; user-dependent masks union per user. Mixing
-    modes is refused rather than silently resolved: the two make different
-    claims about what the deployed system does.
+    The final model must honor all requests, so the evaluated mask is the union.
+    Global masks union their item lists; user-dependent masks union per user.
+    Masks with differing modes or deletion specs are rejected.
     """
     masks = [m for m in masks if m]
     if not masks:

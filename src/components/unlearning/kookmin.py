@@ -1,28 +1,18 @@
-"""Kookmin unlearning, ported from ``def kookmin`` in
-https://github.com/deem-data/erase-bench/blob/main/recbole/trainer/trainer.py
+"""Kookmin unlearning, ported from the RecBole trainer of the ERASE benchmark
 and adapted to TIGER's ``(SequentialModelInputData, SequentialModuleLabelData)``
 batches and ``model.model_step(...)`` loss.
 
-Recipe (matches ERASE, restated):
+Recipe:
 
-    1. ``grads_forget`` := Σ_{b in D_f}      ∂L_b/∂θ   (averaged by ``neg_grad_sample_size``)
-    2. ``grads_retain`` := Σ_{b in D_retain} ∂L_b/∂θ   (averaged by ``neg_grad_sample_size``,
-       capped at ~``neg_grad_sample_size`` rows like the reference's ``k_more`` slice)
-    3. ``signed_grads`` := grads_retain - grads_forget
-    4. For *each* parameter tensor, reinitialise the ``init_rate`` fraction of
-       entries with the smallest ``|signed_grad|`` (per-layer threshold, as in
-       the original Kookmin paper). These are the slots the retain data cares
-       about least and the forget data cares about most.
-    5. Reset optimiser state for the touched tensors (we use a *fresh* Adam, so
-       its state starts at zero — equivalent to the reference's
-       ``_reset_adam_state``).
-    6. Retain-repair round: fine-tune on the retain corpus, scaling the
-       gradient of reinitialised slots by ``scale_for_reinit_params`` so the
-       freshly-randomised weights relearn faster than the rest of the network.
-
-The spam scenario deletes every forget user's data (no "clean-forget" subset),
-so the optional clean-forget gradient path is empty by default, matching
-``scif.py`` and the rest of the GRID baselines.
+    1. ``grads_forget``: sum of forget-batch gradients, divided by ``neg_grad_sample_size``.
+    2. ``grads_retain``: same over retain batches, capped at about
+       ``neg_grad_sample_size`` rows (the reference's ``k_more`` slice).
+    3. ``signed_grads = grads_retain - grads_forget``.
+    4. For each parameter tensor, reinitialize the ``init_rate`` fraction of
+       entries with the smallest ``|signed_grad|`` (per-layer threshold).
+    5. Use a fresh optimizer, equivalent to the reference's ``_reset_adam_state``.
+    6. Fine-tune on the retain data, scaling the gradient of reinitialized
+       entries by ``scale_for_reinit_params``.
 """
 
 from __future__ import annotations
@@ -59,9 +49,8 @@ def _accumulate_grad(
 ) -> List[torch.Tensor]:
     """Sum per-batch gradients (each divided by ``average_scale``).
 
-    When ``max_rows`` is set we stop once that many post-collate rows have been
-    consumed, mirroring the reference's ``interaction[:k_more]`` truncation of
-    the retain stream to ``neg_grad_retain_sample_size`` rows.
+    When ``max_rows`` is set, stop once that many rows have been consumed
+    (the reference's ``interaction[:k_more]`` truncation).
     """
     acc = [torch.zeros_like(p) for p in params]
     rows = 0
@@ -91,7 +80,7 @@ def kookmin_unlearn(
     optimizer: str = "adam",
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
-    """Run Kookmin gradient-guided reinitialisation + retain repair in-place.
+    """Run Kookmin gradient-guided reinitialization and retain repair in place.
 
     Parameters
     ----------
@@ -100,19 +89,19 @@ def kookmin_unlearn(
     forget_batches, retain_batches
         Pre-collected TIGER batches already on ``device``.
     init_rate
-        Per-layer fraction of weights to reinitialise (ERASE ``kookmin_init_rate``).
+        Per-layer fraction of weights to reinitialize (ERASE ``kookmin_init_rate``).
     neg_grad_sample_size
-        Normaliser for the gradient passes and row cap on the retain gradient
+        Normalizer for the gradient passes and row cap on the retain gradient
         pass (ERASE ``neg_grad_retain_sample_size``).
     retain_epochs
         Number of passes over ``retain_batches`` in the repair round.
     retain_lr
-        Learning rate for the repair Adam optimiser.
+        Learning rate for the repair optimizer.
     scale_for_reinit_params
-        Gradient multiplier applied to reinitialised slots during repair
+        Gradient multiplier applied to reinitialized entries during repair
         (ERASE ``scale_for_reinit_params``, default 10).
     target_params_policy
-        Which parameters to consider — see :func:`select_target_params`.
+        Which parameters to consider; see :func:`select_target_params`.
     """
     if not forget_batches:
         raise ValueError("kookmin_unlearn: no forget batches were provided")
@@ -154,7 +143,7 @@ def kookmin_unlearn(
     # --- 3. signed gradients -------------------------------------------------
     signed_grads = [gr - gf for gr, gf in zip(grads_retain, grads_forget)]
 
-    # --- 4. per-layer reinitialisation of low-|signed_grad| slots ------------
+    # --- 4. per-layer reinitialization of low-|signed_grad| entries ----------
     reinit_masks: List[Optional[torch.Tensor]] = [None] * len(params)
     total_params_reset = 0
     with torch.no_grad():
@@ -192,8 +181,7 @@ def kookmin_unlearn(
     )
 
     # --- 5/6. retain-repair round with scaled grads on reinit slots ----------
-    # A fresh optimiser starts with zero state, equivalent to ERASE's
-    # `_reset_adam_state` on the reinitialised tensors.
+    # A fresh optimizer starts with zero state (ERASE's `_reset_adam_state`).
     opt = build_optimizer(optimizer, params, float(retain_lr), algo="kookmin")
     repair_losses: List[float] = []
     for epoch in range(int(retain_epochs)):

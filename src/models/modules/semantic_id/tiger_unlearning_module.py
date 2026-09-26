@@ -76,12 +76,9 @@ _PKM_SCOPE_ALGOS = frozenset(
 
 
 def _resolve_optimizer(cfg, algo: str, default: str = "adam") -> str:
-    """Optimizer name for `algo`, honouring a global fallback.
+    """Optimizer name for `algo`, honoring a global fallback.
 
-    Precedence: unlearning.<algo>_optimizer  >  unlearning.optimizer  > default.
-    The per-algorithm keys predate the global one and are kept so recorded
-    commands keep their meaning; the global key is what makes "optimizer" a real
-    experiment axis instead of something only three algorithms respect.
+    Precedence: unlearning.<algo>_optimizer > unlearning.optimizer > default.
     """
     specific = cfg.get(f"{algo}_optimizer")
     if specific:
@@ -114,9 +111,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         forget_manifest_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         algorithm = str(unlearning_cfg.get("algorithm", "scif")).strip().lower()
-        # update_scope=pkm_only is only honoured by the algorithms wired for it.
-        # Fail LOUDLY rather than silently performing a full-model update that
-        # would be recorded as a memory-only result.
+        # Restricted update scopes are only supported by some algorithms.
         _scope = str(unlearning_cfg.get("update_scope", "all") or "all").strip().lower()
         if _scope not in ("all", "pkm_only", "ffn_only"):
             raise ValueError(
@@ -127,16 +122,16 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             raise ValueError(
                 f"unlearning.update_scope={_scope!r} is not supported for "
                 f"algorithm={algorithm!r}. Supported: {sorted(_PKM_SCOPE_ALGOS)}. "
-                + ("'scif' cannot work on PKM at all: its HVP needs a second "
-                   "derivative and PKM's EmbeddingBag has none. "
+                + ("'scif' needs a second derivative, which PKM's "
+                   "EmbeddingBag does not provide. "
                    if algorithm == "scif" else "")
                 + ("'filter' performs no weight update (it masks forbidden SIDs "
-                   "at decode time), so a parameter scope is meaningless. "
+                   "at decode time). "
                    if algorithm == "filter" else "")
             )
         if algorithm == "retrain":
             raise ValueError(
-                "algorithm='retrain' is an external baseline; use run_tiger_train.sh "
+                "algorithm='retrain' is an external baseline; use scripts/pipeline/train_rec.sh "
                 "on cleaned/retain data."
             )
         if algorithm == "scif":
@@ -271,8 +266,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             cg_solution_max_norm = unlearning_cfg.get("max_norm")
         update_max_norm = unlearning_cfg.get("update_max_norm", 1.0)
 
-        # Position-wise intervention: optionally confine the update to selected
-        # RQ-code positions' parameters (decoder heads + SID embedding rows).
+        # Optionally confine the update to selected RQ-code positions.
         positions = _resolve_update_positions(
             unlearning_cfg.get("update_positions"),
             int(num_hierarchies or self.num_hierarchies),
@@ -424,14 +418,9 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             self,
             ctx["retain_batches"],
             steps=int(cfg.get("finetune_steps", 500)),
-            # Shared budget knob, same one unified and tracer read, so all three
-            # take n_epochs passes over the batches actually present.
+            # Shared pass-count knob (also read by unified and tracer).
             n_epochs=cfg.get("n_epochs"),
             lr=float(cfg.get("finetune_lr", 1e-3)),
-            # Same 'modular stabilizer' scope as unified. With a PKM installed
-            # over a checkpoint that was trained WITHOUT it (replace mode), this
-            # is the ablate-then-repair setup; finetune_steps=0 measures the
-            # pure ablation with no repair at all.
             update_scope=str(cfg.get("update_scope", "all")),
             pkm_update_keys=bool(cfg.get("pkm_update_keys", True)),
             pkm_update_query=bool(cfg.get("pkm_update_query", True)),
@@ -475,8 +464,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         local_repair = cfg.get("local_repair") or {}
         n_epochs_cfg = cfg.get("n_epochs")
 
-        # Coherence loss L_n (TRACER Eq. 9): precompute, per forget batch, the
-        # prefix-neighbour semantic ids of each sample's target item.
+        # Coherence loss L_n: precompute, per forget batch, the neighbor
+        # semantic ids of each sample's target item.
         lambda_neighborhood = float(cfg.get("lambda_n", 0.0))
         coherence_neighbors = None
         if lambda_neighborhood != 0.0:
@@ -489,16 +478,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                     cfg.get("neighborhood_prefix_length", 2)
                 ),
                 exclude_items=ctx["visible_forget_items"],
-                # 'target_only' (default) restricts L_n to forget rows whose
-                # label IS a deletion target. 'all' reproduces the pre-2026-08-05
-                # behaviour, where >=92% of the term boosted neighbours of
-                # popular filler items instead (see _build_coherence_neighbors).
+                # 'target_only' restricts L_n to rows labeled with a deletion target.
                 coherence_rows=str(cfg.get("coherence_rows", "target_only")),
                 target_items=set(ctx["meta"].get("target_items") or []),
-                # 'embedding' defines P(i_T) as a fixed-size top-k in the
-                # pre-quantization space: never empty, independent of codebook
-                # width, and the ground truth that a prefix bucket only
-                # approximates (0.24-0.68 overlap, sid_fidelity.json).
+                # 'embedding' uses a fixed-size top-k in the pre-quantization space.
                 neighbor_method=str(
                     cfg.get("coherence_neighbor_method", "prefix")
                 ),
@@ -518,24 +501,18 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 int(n_epochs_cfg) if n_epochs_cfg is not None else None
             ),
             lr=float(cfg.get("unified_lr", 1e-4)),
-            # lambda_r weights the retain term. 1.0 = current behaviour.
-            # 0.0 turns repair off, which with lambda_f > 0 is pure gradient
-            # ascent -- so the ascent/descent baselines are special cases of
-            # this objective, not separate implementations.
+            # lambda_r weights the retain term; 0.0 with lambda_f > 0 is pure
+            # gradient ascent.
             lambda_retain=float(cfg.get("lambda_r", 1.0)),
             lambda_forget=float(cfg.get("lambda_f", 1.0)),
             lambda_sep=float(cfg.get("lambda_s", 0.1)),
             lambda_neighborhood=lambda_neighborhood,
             coherence_neighbors=coherence_neighbors,
-            # 'mass' (logsumexp over the neighbourhood) is the bounded, feasible
-            # form; 'nll' is the original per-neighbour TRACER Eq. 9 whose optimum
-            # needs every neighbour at probability 1 (see compute_coherence_loss).
+            # 'nll': per-neighbor NLL; 'mass': bounded logsumexp over the neighborhood.
             coherence_loss_type=str(cfg.get("coherence_loss_type", "nll")),
             coherence_mass_cap=float(cfg.get("coherence_mass_cap", 0.999)),
             forget_loss_level=str(cfg.get("forget_loss_level", "token")),
-            # None (the default) keeps the uniform w = 1 behaviour.
-            # position_weights is the paper's w: one vector over SID levels,
-            # applied to the item-level loss in BOTH the retain and forget terms.
+            # Per-SID-level weights for the retain and forget terms (None = uniform).
             position_weights=cfg.get("position_weights"),
             forget_position_weights=cfg.get("forget_position_weights"),
             sep_temperature=float(cfg.get("sep_temperature", 0.07)),
@@ -544,11 +521,9 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             neighbor_item_ids=ctx["neighborhood_centers"],
             sep_negative_item_ids=ctx["sep_negative_items"],
             sep_negatives_mode=str(cfg.get("sep_negatives", "forget_target_only")),
-            # history (default, back-compatible but tautological: r_u IS the mean
-            # of the history items) | label (the true next item; a real positive).
+            # 'history' (history items) or 'label' (the true next item).
             sep_positives=str(cfg.get("sep_positives", "history")),
-            # cosine (default) = pooled-encoder similarity; generative = the
-            # model's own sequence log-prob, i.e. on the generation path.
+            # 'cosine': pooled-encoder similarity; 'generative': sequence log-prob.
             sep_loss_type=str(cfg.get("sep_loss_type", "cosine")),
             sep_gen_temperature=float(cfg.get("sep_gen_temperature", 1.0)),
             local_repair_cfg=local_repair,
@@ -556,9 +531,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             stable_codes=int(cfg.get("stable_codes", 2)),
             adaptive_update_backbone=bool(cfg.get("adaptive_update_backbone", False)),
             adaptive_adapter=bool(cfg.get("adaptive_adapter", False)),
-            # Position-wise intervention (same unlearning.update_positions knob
-            # as SCIF): confine the unified update to an arbitrary subset of RQ
-            # code positions, e.g. [0] = only c1 moves. Overrides adaptive_codes.
+            # Confine the update to a subset of RQ code positions (overrides
+            # adaptive_codes).
             update_positions=_resolve_update_positions(
                 cfg.get("update_positions"),
                 num_hierarchies=int(self.num_hierarchies),
@@ -566,10 +540,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             update_positions_backbone=bool(
                 cfg.get("update_positions_backbone", False)
             ),
-            # "Modular stabilizer" scope: update_scope='pkm_only' keeps ONLY the
-            # Product-Key Memory in the optimizer (backbone/SID/heads frozen), so
-            # forgetting must be expressible as a sparse-memory edit. Requires a
-            # PKM-bearing model (pass model.pkm_layers / model.pkm_mode).
+            # 'pkm_only' optimizes only the Product-Key Memory (requires a PKM model).
             update_scope=str(cfg.get("update_scope", "all")),
             pkm_update_keys=bool(cfg.get("pkm_update_keys", True)),
             pkm_update_query=bool(cfg.get("pkm_update_query", True)),
@@ -580,11 +551,9 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             slot_mu=float(cfg.get("slot_mu", 5.0)),
             slot_dot_abs=bool(cfg.get("slot_dot_abs", False)),
             optimizer=_resolve_optimizer(cfg, "unified"),
-            # 1.0 = one lr for every parameter, the value every recorded run
-            # used. Lower it (0.1 / 0.01) to slow the identifier space down.
+            # LR multiplier for the SID code parameters (1.0 = uniform lr).
             code_lr_scale=float(cfg.get("code_lr_scale", 1.0)),
-            # Extra multiplier on the ADAPTIVE tail [stable_codes, H) only, on
-            # top of code_lr_scale. 1.0 = one code group (previous behaviour).
+            # Extra multiplier on levels [stable_codes, H), on top of code_lr_scale.
             adaptive_code_lr_scale=float(cfg.get("adaptive_code_lr_scale", 1.0)),
             stable_code_lr_scale=float(cfg.get("stable_code_lr_scale", 1.0)),
             device=device,
@@ -598,44 +567,24 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
     def _resolve_code_row_keep(
         self, ctx: Dict[str, Any], cfg: Any, **kwargs: Any
     ) -> Optional[torch.Tensor]:
-        """Row mask over the SID embedding table: which CODE ROWS may update.
+        """Row mask over the SID embedding table selecting which code rows may update.
 
-        ``update_positions`` / ``adaptive_code_lr_scale`` choose which *levels*
-        move; every one of the K rows in a chosen level moves with them. That is
-        a blunt instrument for a deletion: a level-0 code is shared by ~47 items
-        at width 256, so updating the whole block edits the identifier space for
-        thousands of items that were never part of the request.
+        ``code_row_scope``:
 
-        This narrows the block to the rows the request actually touches:
+        ``all``                  every row (subject to ``code_row_levels``)
+        ``forget``               rows ``h*K + code_h(i)`` for i in the forget set
+        ``forget_neighborhood``  the above plus the rows of each forget item's
+                                 neighbors
 
-        ``all``   every row in the selected levels (previous behaviour)
-        ``forget``            rows ``h*K + code_h(i)`` for i in the forget set
-        ``forget_neighborhood``  the above, plus the same rows for each forget
-                  item's neighbours, so the repair term still has the
-                  parameters it needs to move the neighbourhood back.
+        ``code_row_levels`` further keeps only the rows of the named hierarchies.
+        Unlike ``update_positions``, this affects only the SID embedding table,
+        not the decoder heads or backbone.
 
-        ``code_row_levels`` is the orthogonal LEVEL axis of the same mask: it
-        keeps only the rows of the named hierarchies, so the two knobs cross
-        into "which items" x "which levels". It is deliberately NOT the same
-        instrument as ``adaptive_code_lr_scale`` / ``update_positions``: those
-        also stop that level's decoder head ``decoder_mlp[h]`` (and, for
-        ``update_positions``, the whole backbone) from moving, which confounds
-        "the identifier rows for this level are frozen" with "this level's
-        output head is frozen". This one touches the SID embedding table only.
-
-        Returns a ``[H*K]`` float mask (1.0 = may update), or None when neither
-        knob restricts anything (the recorded path). Composing the mask with the
-        LR-scale level restriction is still the caller's job, so
-        ``code_row_scope=forget`` + ``adaptive_code_lr_scale=0.0`` remains a
-        single well-defined update.
+        Returns a ``[H*K]`` float mask (1.0 = may update), or None when nothing
+        is restricted.
         """
-        # freeze_sid_table wins over code_row_scope: an all-zero row multiplier
-        # pins every row of the SID embedding table, so the identifier space is
-        # held fixed while the backbone and the level-0/1 decoder heads still
-        # move. Reuses the row machinery rather than dropping the tensor from the
-        # optimizer, because the multiplier is applied to the post-step DELTA --
-        # under Adam a frozen-by-zero-gradient row still drifts via the momentum
-        # buffers, so cancelling the delta is the only way to truly hold it.
+        # freeze_sid_table pins every SID row. The mask is applied to the
+        # post-step delta, so rows stay fixed even under Adam momentum.
         if bool(cfg.get("freeze_sid_table", False)):
             n_rows = int(self.item_sid_embedding_table_encoder.weight.shape[0])
             log.info(
@@ -652,14 +601,12 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 "code_row_scope must be all | forget | forget_neighborhood, got "
                 f"{scope!r}"
             )
-        # Same parser as update_positions, so `[0,1]`, `"c1,c2"` and `"all"` mean
-        # the same thing for both knobs. It returns None for the FULL set as well
-        # as for null, which is what makes "all levels" cost nothing here.
+        # Same parser as update_positions; None means all levels.
         levels = _resolve_update_positions(
             cfg.get("code_row_levels"), int(self.num_hierarchies)
         )
         if scope in all_scopes and levels is None:
-            return None  # recorded path: no mask at all
+            return None  # no restriction
 
         codes = self.codebooks.detach().cpu().to(torch.long)            # [N, H]
         n_items, n_hier = int(codes.shape[0]), int(codes.shape[1])
@@ -739,17 +686,14 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 lvl[h * K : (h + 1) * K] = 1.0
             keep = keep * lvl
             if float(keep.sum()) == 0.0:
-                # Only reachable if a level selection and an item selection are
-                # disjoint, which cannot happen for RQ codes (every item has a
-                # code at every level) -- but an empty mask would silently mean
-                # "SID table frozen", a different experiment, so refuse it.
+                # An empty mask would freeze the whole table; refuse it.
                 raise ValueError(
                     f"code_row_scope={scope} x code_row_levels={levels} selects "
                     "0 rows; use freeze_sid_table=true if that is what you want"
                 )
 
         log.info(
-            "[code-row-scope] %s x levels=%s: %d forget + %d neighbour item(s) "
+            "[code-row-scope] %s x levels=%s: %d forget + %d neighbor item(s) "
             "-> %d/%d SID rows updatable (%.2f%% of the table; %d before the "
             "level cut)",
             scope, "all" if levels is None else levels,
@@ -759,17 +703,13 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         return keep
 
     def _run_tracer(self, **kwargs: Any) -> Dict[str, Any]:
-        """TRACER (arXiv:2606.07688) -- token reassignment, as a baseline.
+        """TRACER token-reassignment baseline.
 
-        Needs the codebook the semantic ids were built from
-        (``unlearning.tracer_codebook_ckpt``, alias ``tracer_rqkmeans_ckpt``) plus
-        the pre-quantization item embeddings (``unlearning.embedding_path``).
-        Either quantizer works: ``load_rq_quantizer`` detects rkmeans vs rqvae
-        from the checkpoint and returns the matching residual recipe (rqvae
-        matches in its 64-d encoder latent, rkmeans in the raw embedding space).
-        ``phi=0`` is asserted to reproduce the stored codes before anything is
-        trained, because a codebook that does not match the SID tensor would
-        silently reassign items before unlearning even starts.
+        Requires the codebook the semantic IDs were built from
+        (``unlearning.tracer_codebook_ckpt``, alias ``tracer_rqkmeans_ckpt``)
+        and the pre-quantization item embeddings (``unlearning.embedding_path``).
+        RQ-KMeans and RQ-VAE checkpoints are both supported. Before training, it
+        is asserted that ``phi=0`` reproduces the stored codes.
         """
         import torch as _torch
 
@@ -786,17 +726,12 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         cfg = kwargs["unlearning_cfg"]
         t0 = time.time()
 
-        # tracer_rqkmeans_ckpt is the historical name, kept as an alias so the
-        # recorded rkmeans runs reproduce; tracer_codebook_ckpt is the current
-        # one, because the checkpoint may equally be an RQ-VAE codebook.
+        # tracer_rqkmeans_ckpt is an alias of tracer_codebook_ckpt.
         ckpt = cfg.get("tracer_codebook_ckpt") or cfg.get("tracer_rqkmeans_ckpt")
         if not ckpt:
             raise ValueError(
                 "algorithm=tracer requires unlearning.tracer_codebook_ckpt (the "
-                "RQ-KMeans or RQ-VAE checkpoint holding the codeword centroids). "
-                "The original width-256/L4 beauty RQ-KMeans codebook no longer "
-                "exists, so use an identifier space whose checkpoint survives: "
-                "any <ds>_rqvae space, or w16 / w8l6 / L8."
+                "RQ-KMeans or RQ-VAE checkpoint holding the codeword centroids)."
             )
         emb_path = cfg.get("embedding_path")
         if not emb_path:
@@ -806,7 +741,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         n_levels = int(cfg.get("tracer_levels") or (num_hierarchies - 1))
         front = load_rq_quantizer(str(ckpt), n_levels=n_levels)
         centroids = _torch.stack([c for c in front.centroids])         # [L, K, D]
-        # The residual recipe travels with the checkpoint, never with the caller.
+        # The residual recipe is taken from the checkpoint.
         res_kwargs = dict(
             project=front.project,
             normalize_inputs=front.normalize_inputs,
@@ -816,11 +751,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         codes = self.codebooks.t().to(_torch.long).cpu()               # [H, N]
         n_items = int(codes.shape[1])
 
-        # load_dense_embeddings returns a DenseEmbeddings whose rows are indexed by
-        # RAW item id (rsc15's reach into the hundreds of millions), while `codes`
-        # is indexed by dense id 0..N-1. Align explicitly rather than assuming the
-        # two coincide -- they happen to for Amazon, but silently mismatched rows
-        # would make every distance in Eq. 6 refer to the wrong item.
+        # Embedding rows are keyed by raw item id while `codes` uses dense ids
+        # 0..N-1, so align them explicitly.
         z_obj = load_dense_embeddings(str(emb_path))
         if hasattr(z_obj, "tensor"):
             id_to_idx = z_obj.item_id_to_idx
@@ -843,20 +775,13 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 f"{n_items} items"
             )
 
-        # Correctness anchor: refuses unless phi=0 reproduces the stored codes.
-        # Default is exact (1.0). It is a config knob because a single item
-        # differing by a quantisation tie-break is not the failure this guards
-        # against -- a silently reassigned catalog shows up as a large fraction,
-        # not as 1 item in 12k -- and blocking a whole track on that is worse
-        # than accepting a bounded, stated mismatch.
+        # Require phi=0 to reproduce the stored codes (tolerance is the minimum
+        # fraction of matching items).
         assert_reproduces_sids(
             z, [centroids[i] for i in range(n_levels)], codes,
             tol=float(cfg.get("tracer_sid_tolerance", 1.0)), **res_kwargs
         )
 
-        # Target items live under ctx["meta"], not ctx itself -- reading the
-        # wrong key made this look like "no targets" and tripped the
-        # coherence_rows=target_only guard on a dataset that has them.
         target_items = sorted(int(i) for i in (ctx["meta"].get("target_items") or []))
         if not target_items:
             target_items = sorted(int(i) for i in (ctx.get("visible_forget_items") or []))
@@ -873,38 +798,26 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         )
         residuals = _torch.stack([r[concept] for r in res_levels], dim=1)  # [M, L, D]
 
-        # L_Coh's P(i_T) -- BUILT HERE, BY TRACER, ON PURPOSE.
-        #
-        # The paper's P(i_T) is the K nearest items to the CONCEPT item i_T in
-        # the frozen embedding space. That is computed directly below from `z`
-        # (the same dense embeddings the RQ-KMeans quantizer was fitted on, in
-        # dense-item-id row order), with the concept set excluded from its own
-        # neighbourhood.
-        #
-        # It deliberately does NOT call self._build_coherence_neighbors and does
-        # not read any coherence_* / neighborhood_* config key: our prefix and
-        # L_n neighbourhood construction is a contribution of ours, so routing a
-        # baseline through it would stop it being a baseline. The only knob is
-        # unlearning.tracer_neighborhood_count (the paper's K ~ 5).
+        # TRACER's neighborhood P(i_T): the K nearest items to each concept item
+        # by cosine similarity in the embedding space, excluding the concept set.
+        # Built independently of _build_coherence_neighbors.
         k_coh = int(cfg.get("tracer_neighborhood_count", 5))
         neighbor_items_log: Optional[List[List[int]]] = None
         zc = _torch.nn.functional.normalize(z[concept].double(), dim=-1)   # [M, D]
         za = _torch.nn.functional.normalize(z.double(), dim=-1)            # [N, D]
         sim = zc @ za.t()                                                  # [M, N]
-        sim[:, concept] = float("-inf")   # never a neighbour of itself/the concept
+        sim[:, concept] = float("-inf")   # exclude the concept set
         k_eff = int(min(k_coh, max(0, sim.shape[1] - int(concept.numel()))))
         if k_eff <= 0:
             concept_neighbor_sids = None
         else:
             nbr_items = sim.topk(k_eff, dim=-1).indices                    # [M, k]
-            # codes is [H, N]; transpose to [N, H] and gather the neighbours'
-            # full semantic ids (including the trailing dedup digit).
+            # Gather the neighbors' full semantic ids (including the dedup digit).
             concept_neighbor_sids = codes.t()[nbr_items].contiguous()      # [M, k, H]
             neighbor_items_log = nbr_items.tolist()
             log.info(
                 "[tracer] P(i_T): cosine top-%d over %s for %d concept item(s), "
-                "concept set excluded (built inside the TRACER path, not via "
-                "_build_coherence_neighbors). First concept item %d -> %s",
+                "concept set excluded. First concept item %d -> %s",
                 k_eff,
                 emb_path,
                 int(concept.numel()),
@@ -939,7 +852,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         info["wall_seconds"] = time.time() - t0
         info["tracer_codebook_ckpt"] = str(ckpt)
         info["tracer_quantizer"] = front.quantizer
-        # Audit trail for P(i_T): the exact neighbour item ids TRACER used.
+        # Neighbor item ids used for P(i_T).
         info["tracer_coherence_neighbor_items"] = neighbor_items_log
         info["tracer_coherence_metric"] = "cosine_topk_on_concept_items"
         info.update(ctx["meta"])
@@ -962,37 +875,21 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         latent_path: Optional[str] = None,
         union_size: str = "full",
     ) -> List[Optional[Any]]:
-        """Per-forget-batch neighbour semantic ids for the coherence loss.
+        """Per-forget-batch neighbor semantic ids for the coherence loss.
 
-        For every eligible forget sample ``(H_f, i_T)`` we resolve the label item
+        For each eligible forget sample ``(H_f, i_T)``, resolve the label item
         ``i_T`` from its label semantic id, then look up the
         ``neighborhood_count`` closest catalog items by shared SID prefix (length
         ``>= neighborhood_prefix_length``), excluding forget items. Returns a
         list aligned to ``forget_batches``; each element is
         ``(neighbor_sids[B, C, H], neighbor_mask[B, C])`` or ``None`` when a
-        batch has no eligible neighbours anywhere.
+        batch has no eligible neighbors anywhere.
 
-        ``coherence_rows`` decides which forget rows are eligible:
-
-        ``target_only`` (default)
-            Only rows whose label item is in ``target_items`` (the deletion
-            targets, i.e. the spam items). This is the documented TRACER
-            semantics — ``P(i_T)`` is the neighbourhood *of the removed item*.
-
-        ``all``
-            Every forget row, keyed on whatever its label happens to be. This
-            was the behaviour up to 2026-08-05 and is kept only to reproduce the
-            432-run λ_n grid and its 3-seed replication. It is **not** the
-            intended objective: TIGER's collate expands each session into all
-            contiguous sub-sequences and supervises the last item of each, so in
-            a bandwagon session the label is a popular *filler* item on all but
-            one row. Measured on beauty bandwagon pct1/n1 (226 spam users, one
-            target click each, 4110 forget rows over 10 chunks): only 226 rows
-            (8.3% of the 2739 rows that had a neighbour) could possibly be the
-            target, so >=91.7% of the λ_n gradient budget was spent boosting the
-            prefix-neighbours of popular filler items from spam contexts —
-            which is why λ_n never helped and hurt the `mid` stratum most (that
-            target has zero prefix-2 neighbours, so its share was exactly 0%).
+        ``coherence_rows`` selects the eligible forget rows: ``target_only``
+        (default) keeps only rows whose label item is in ``target_items``;
+        ``all`` keeps every forget row. Since the collate expands each session
+        into all prefixes, most rows under ``all`` are labeled with non-target
+        items.
         """
         rows_mode = str(coherence_rows).lower()
         if rows_mode not in ("target_only", "all"):
@@ -1011,14 +908,13 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         if needs_embedding and not embedding_path:
             raise ValueError(
                 f"coherence_neighbor_method={nbr_method!r} requires "
-                "unlearning.embedding_path (pre-quantization item embeddings, "
-                "e.g. embeddings/beauty_merged_predictions_tensor_latest.pt)."
+                "unlearning.embedding_path (pre-quantization item embeddings)."
             )
         if needs_latent and not latent_path:
             raise ValueError(
                 f"coherence_neighbor_method={nbr_method!r} requires "
                 "unlearning.coherence_latent_path (the [N, d_z] refined-latent "
-                "tensor from scripts/train_latent_refiner.py)."
+                "precomputed latent tensor)."
             )
         union_mode = str(union_size).lower()
         if union_mode not in ("full", "matched"):
@@ -1035,7 +931,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         if not semantic_id_path:
             raise ValueError(
                 "lambda_n > 0 (coherence loss) requires semantic_id_path "
-                "(merged_predictions_tensor.pt) to define SID neighbours."
+                "(merged_predictions_tensor.pt) to define SID neighbors."
             )
         codebook = load_codebook(semantic_id_path, num_hierarchies=num_hierarchies)
         num_items, H = int(codebook.shape[0]), int(codebook.shape[1])
@@ -1049,17 +945,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         sorted_sids = codebook.numpy()[sorted_ids]
         exclude = {int(x) for x in (exclude_items or set())}
 
-        # Embedding mode: the neighbourhood is a fixed-size top-k in the
-        # pre-quantization space, so every target gets exactly `count` neighbours
-        # regardless of codebook width. Loaded once; the k-NN itself is cached
-        # per item below (with coherence_rows='target_only' and n_target=1 that
-        # is a single query for the whole run).
-        # Per-source top-k budget. For the union arm `full` gives each source its
-        # own `count` (the literal N_emb ∪ N_z of the plan, so up to 2*count
-        # neighbours), while `matched` splits one `count` budget between them so
-        # the union is compared against the single-source arms at EQUAL
-        # neighbourhood size -- otherwise a union win could just be "more
-        # neighbours" rather than "better neighbours".
+        # Per-source top-k budget. For the union, 'full' gives each source
+        # `count` neighbors; 'matched' splits one `count` budget between them.
         if nbr_method == "embedding+latent":
             if union_mode == "full":
                 k_emb = k_lat = count
@@ -1069,20 +956,13 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         else:
             k_emb = count if nbr_method == "embedding" else 0
             k_lat = count if nbr_method == "latent" else 0
-        # Rows to allocate per forget sample: the union arm can return more than
-        # `count`, every other arm is capped at it.
+        # Neighbor slots allocated per forget sample.
         count_alloc = (k_emb + k_lat) if nbr_method == "embedding+latent" else count
 
         embeddings = None
         if needs_embedding:
             embeddings = load_dense_embeddings(embedding_path)
-            # We index the embedding matrix BY ROW, because the codebook is
-            # indexed 0..N-1 by row and raw item IDs are not valid codebook
-            # indices for datasets with non-sequential IDs (rsc15's reach ~1e9).
-            # That is only sound if row i means the same item in both, which
-            # holds when the SID tensor came from RQ-KMeans over these very
-            # embeddings, in order. Assert the shapes agree rather than silently
-            # mismatching items.
+            # Embeddings are indexed by row and must be row-aligned with the codebook.
             if len(embeddings) != num_items:
                 raise ValueError(
                     f"embedding_path has {len(embeddings)} items but the "
@@ -1092,7 +972,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                     f"pre-quantization tensor the SID codebook was built from."
                 )
             log.info(
-                "[unified] coherence L_n neighbours: embedding top-k "
+                "[unified] coherence L_n neighbors: embedding top-k "
                 "(metric=%s, k=%d) from %s [%d items, dim %d]",
                 embedding_metric,
                 k_emb,
@@ -1101,10 +981,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 int(embeddings.shape[1]),
             )
 
-        # Refined latent space z (scripts/train_latent_refiner.py). Loaded with
-        # the SAME loader as the dense embeddings because it has the same
-        # contract -- a [N, d] tensor whose row i is item i -- so the k-NN below
-        # is literally the same helper, just on a different geometry.
+        # Refined latent space z: an [N, d] tensor whose row i is item i.
         latents = None
         if needs_latent:
             latents = load_dense_embeddings(latent_path)
@@ -1112,12 +989,12 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 raise ValueError(
                     f"coherence_latent_path has {len(latents)} items but the "
                     f"codebook has {num_items}: the refined latent tensor is "
-                    f"indexed BY ROW and must be row-aligned with the codebook. "
+                    f"indexed by row and must be row-aligned with the codebook. "
                     f"Check that {latent_path!r} was produced by "
                     "scripts/train_latent_refiner.py against this SID tensor."
                 )
             log.info(
-                "[unified] coherence L_n neighbours: latent top-k "
+                "[unified] coherence L_n neighbors: latent top-k "
                 "(metric=cosine, k=%d) from %s [%d items, dim %d]",
                 k_lat,
                 latent_path,
@@ -1125,13 +1002,12 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 int(latents.shape[1]),
             )
 
-        # item id -> neighbour SID rows [k, H] (cached; forget targets repeat).
+        # item id -> neighbor SID rows [k, H] (cached; forget targets repeat).
         neighbor_cache: Dict[int, List[List[int]]] = {}
 
         def _neighbor_rows(item_id: int) -> List[List[int]]:
             if item_id not in neighbor_cache:
-                # by_row throughout: item_id and the returned neighbours are
-                # codebook row indices, directly usable as codebook[n] below.
+                # item_id and the returned neighbors are codebook row indices.
                 nbr_ids: List[int] = []
                 if k_emb > 0:
                     nbr_ids.extend(
@@ -1145,8 +1021,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                         )
                     )
                 if k_lat > 0:
-                    # Cosine on z, matching how N_z is defined in the plan:
-                    # TopK_{i != t} cos(z_t, z_i) over non-forget items.
+                    # Cosine top-k on z over non-forget items.
                     nbr_ids.extend(
                         topk_embedding_neighbors(
                             item_id,
@@ -1169,8 +1044,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                             exclude_ids=exclude,
                         )
                     )
-                # Set union, order-preserving: an item that both sources rank
-                # must be teacher-forced ONCE, or L_n would double-weight it.
+                # Order-preserving dedup so no neighbor is counted twice.
                 seen: Set[int] = set()
                 deduped = []
                 for n in nbr_ids:
@@ -1202,8 +1076,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 if item_id is None:
                     n_targets_missing += 1
                     continue
-                # Skip rows whose label is not a deletion target: their
-                # neighbourhood is irrelevant to the removal (see docstring).
+                # Skip rows whose label is not a deletion target.
                 if rows_mode == "target_only" and item_id not in eligible:
                     continue
                 n_eligible += 1
@@ -1222,7 +1095,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
 
         log.info(
             "[unified] coherence L_n: method=%s rows=%s, %d/%d forget rows "
-            "eligible, %d of those have >=1 neighbour (count=%d, "
+            "eligible, %d of those have >=1 neighbor (count=%d, "
             "min_prefix_length=%s, %d labels not found in codebook)",
             nbr_method,
             rows_mode,
@@ -1234,8 +1107,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             n_targets_missing,
         )
         log.info(
-            "[unified] coherence L_n neighbourhood size: k_emb=%d k_lat=%d "
-            "alloc=%d union_size=%s, realised mean %.2f neighbours per scored "
+            "[unified] coherence L_n neighborhood size: k_emb=%d k_lat=%d "
+            "alloc=%d union_size=%s, realized mean %.2f neighbors per scored "
             "row (%d total over %d rows with >=1)",
             k_emb,
             k_lat,
@@ -1248,22 +1121,17 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         if n_with_neighbors == 0:
             if nbr_method == "prefix":
                 log.warning(
-                    "[unified] coherence L_n is identically ZERO: no eligible "
-                    "forget row has a catalog neighbour sharing a prefix of "
-                    "length >=%d. lambda_n cannot have any effect. Lower "
-                    "unlearning.neighborhood_prefix_length, switch to "
-                    "coherence_neighbor_method=embedding (fixed-size top-k, "
-                    "never empty), or use a narrower codebook (at beauty width "
-                    "256 the mean prefix-2 neighbourhood is ~3 items and ~31%% "
-                    "of items have none).",
+                    "[unified] coherence L_n is zero: no eligible forget row "
+                    "has a catalog neighbor sharing a prefix of length >=%d, so "
+                    "lambda_n has no effect. Lower "
+                    "unlearning.neighborhood_prefix_length or use "
+                    "coherence_neighbor_method=embedding.",
                     int(neighborhood_prefix_length),
                 )
             else:
                 log.warning(
-                    "[unified] coherence L_n is identically ZERO despite "
-                    "fixed-size top-k neighbours (method=%s) — no eligible "
-                    "forget row was found at all (check "
-                    "coherence_rows/target_items).",
+                    "[unified] coherence L_n is zero (method=%s): no eligible "
+                    "forget row was found (check coherence_rows/target_items).",
                     nbr_method,
                 )
         return out
@@ -1326,8 +1194,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         cfg = kwargs["unlearning_cfg"]
         t0 = time.time()
         keywords = cfg.get("seif_noise_param_keywords")
-        # `unlearning.n_epochs`, when set, is the shared "number of passes" knob
-        # and overrides the per-algorithm `seif_repair_epochs` default.
+        # unlearning.n_epochs, when set, overrides seif_repair_epochs.
         n_epochs_cfg = cfg.get("n_epochs")
         repair_epochs = (
             int(n_epochs_cfg)
@@ -1408,7 +1275,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         else:
             log.warning(
                 "[filter] semantic_id_path is unset, so no decode mask was "
-                "installed: this run measures the UNFILTERED model."
+                "installed; the model is unfiltered."
             )
         mask_path = os.path.join(output_dir or ".", "filter_mask.json")
         save_filter_mask(mask, mask_path)
@@ -1417,10 +1284,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             "deletion_spec": deletion_spec,
             "filter_mode": filter_mode,
             "filter_mask_path": os.path.abspath(mask_path),
-            # The mask is module state, not checkpoint state, so a downstream
-            # process must reinstall it (see decode_filter_mask in
-            # scripts/eval_ckpt_on_test). Carried in the info dict so the
-            # sequential driver can persist the union at the run root.
+            # The mask is module state, not checkpoint state, so downstream
+            # evaluation must reinstall it from this entry.
             "filter_mask": mask,
             "decode_filter_installed": installed,
             "n_forbidden_items": len(mask["forbidden_item_ids"]),
@@ -1437,19 +1302,14 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
     ) -> Dict[str, Any]:
         """Per-slot access statistics for every PKM, forget vs retain (read-only).
 
-        Answers the question that gates top-t memory-slot selection: do forget
-        and retain interactions route to DISJOINT memory slots? If they overlap
-        almost completely, no selection criterion can separate them.
+        Measures whether forget and retain interactions route to disjoint
+        memory slots, and computes per-slot selection scores:
 
-        Produces two candidate selection scores per slot:
+        * ``AF``: access frequency on the forget set.
+        * ``AF-IHF``: ``AF(s) * log((T_r + 1) / (HF(s) + 1))``, where ``HF`` is
+          the retain access count and ``T_r`` the total retain reads.
 
-        * ``AF``      -- raw access frequency on the forget set. The
-          access-count baseline (what Sparse Memory Finetuning's TF term does).
-        * ``AF-IHF``  -- access frequency x inverse history frequency,
-          ``AF(s) * log((T_r + 1) / (HF(s) + 1))``, where ``HF`` is the retain
-          access count and ``T_r`` the total retain reads. This is the
-          recommender-side analogue of TF-IDF: a slot scores highly when the
-          forget data hits it often AND the retain ("history") data rarely does.
+        Gradient-based scores are reported as well.
 
         Nothing is updated; the model is only run forward.
         """
@@ -1493,13 +1353,9 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         af_all = _sweep(ctx["forget_batches"])
         hf_all = _sweep(ctx["retain_batches"])
 
-        # ---- per-slot GRADIENT signal -------------------------------------
-        # Access counts cannot separate forget from retain when both read the
-        # same slots. Gradient MAGNITUDE on those slots still can, so this is
-        # strictly more informative than AF-IHF on a collapsed memory.
+        # ---- per-slot gradient signal -------------------------------------
         # Accumulates the gradient of the summed loss w.r.t. values.weight
-        # (shape (size, v_dim)), then takes the per-slot row norm — i.e. the
-        # gradient of the objective, not a sum of per-batch norms.
+        # (size, v_dim); per-slot row norms are taken afterwards.
         def _grad_sweep(batches: List[Any]) -> Dict[str, torch.Tensor]:
             acc: Dict[str, torch.Tensor] = {
                 n: torch.zeros_like(m.values.weight) for n, m in mems
@@ -1546,23 +1402,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             denom = (gf.norm(dim=1) * gr.norm(dim=1)).clamp_min(1e-12)
             cos_fr = ((gf * gr).sum(dim=1) / denom).double()
             # ---- selection scores -------------------------------------
-            # Magnitude-only criterion (g_f - lambda*g_r) compares NORMS and so
-            # is blind to DIRECTION: it cannot tell a slot whose forget-ascent
-            # direction also happens to help retain from one that wrecks it.
-            #
-            # The unlearning update moves along +g_f (ascend the forget loss),
-            # so the first-order change in the RETAIN loss from editing slot i is
-            # <g_f,i , g_r,i>. That inner product — not ||g_r,i|| — is the actual
-            # collateral-damage term, and it is signed: negative means editing
-            # for forgetting also IMPROVES retain.
-            #
-            # Combined score (all three terms max-normalised so lambda/mu are
-            # scale-free and comparable across memories):
-            #     s_i = gf_i - lambda * gr_i - mu * dot_i
-            # 'dotabs' variant penalises |dot| instead (pure orthogonality: we
-            # only care that the gradients are UNRELATED, either sign).
-            # Both are additively separable over slots, so exact top-t is just
-            # topk — no greedy approximation needed.
+            # The first-order change in retain loss from editing slot i along
+            # +g_f is <g_f,i, g_r,i> (signed). Combined score, with each term
+            # max-normalized:  s_i = gf_i - lambda * gr_i - mu * dot_i.
+            # The 'dotabs' variant penalizes |dot| instead.
             def _nrm(v: torch.Tensor) -> torch.Tensor:
                 m = v.abs().max()
                 return v / m if float(m) > 0 else v
@@ -1589,12 +1432,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                     "retain_grad_norm_total": float(gr_n.sum().item()),
                     "slots_with_forget_grad": int((gf_n > 0).sum().item()),
                     "slots_with_retain_grad": int((gr_n > 0).sum().item()),
-                    # mean cosine over slots that BOTH objectives touch: >0 means
-                    # the forget and retain updates pull the same way (conflict).
+                    # mean cosine over slots touched by both objectives
                     "mean_fr_cosine_on_shared": float(
                         cos_fr[(gf_n > 0) & (gr_n > 0)].mean().item()
                     ) if int(((gf_n > 0) & (gr_n > 0)).sum().item()) else None,
-                    # how far apart are the two objectives' per-slot rankings?
                     "mean_dot_fr": float(dot_fr.mean().item()),
                     "frac_slots_dot_negative": float(
                         (dot_fr < 0).double().mean().item()
@@ -1607,7 +1448,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 "forget_coverage": float(f_touch.sum().item()) / n_slots,
                 "retain_coverage": float(r_touch.sum().item()) / n_slots,
                 "touched_jaccard": (inter / union) if union else 0.0,
-                # the decisive statistic: forget-hit slots the retain set never reads
+                # forget-hit slots the retain set never reads
                 "forget_exclusive_slots": int((f_touch & ~r_touch).sum().item()),
                 "forget_exclusive_frac_of_forget": (
                     float((f_touch & ~r_touch).sum().item())
@@ -1622,12 +1463,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 hf_top = torch.topk(hf, k).indices
                 af_set, ihf_set, hf_set = set(af_top.tolist()), set(ihf_top.tolist()), set(hf_top.tolist())
                 entry["top_t"][str(t)] = {
-                    # how different is AF-IHF from the plain access-count baseline?
                     "af_vs_afihf_overlap": len(af_set & ihf_set) / max(1, k),
-                    # how much do the selected slots collide with retain's own top-t?
                     "af_top_in_retain_top": len(af_set & hf_set) / max(1, k),
                     "afihf_top_in_retain_top": len(ihf_set & hf_set) / max(1, k),
-                    # fraction of selected slots the retain set NEVER touches
+                    # fraction of selected slots the retain set never touches
                     "af_top_retain_unused": float(
                         (hf[af_top] == 0).sum().item()
                     ) / max(1, k),
@@ -1641,11 +1480,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                     g_top = torch.topk(sc, k).indices
                     g_set = set(g_top.tolist())
                     entry["top_t"][str(t)][f"grad_{sname}"] = {
-                        # the collateral-damage term on the SELECTED slots:
-                        # negative is good (forgetting also helps retain)
+                        # mean forget/retain gradient dot product on selected slots
                         "mean_dot_selected": float(dot_fr[g_top].mean().item()),
-                        # does the gradient criterion pick different slots than
-                        # the access-count criteria?
                         "overlap_with_af": len(g_set & af_set) / max(1, k),
                         "overlap_with_afihf": len(g_set & ihf_set) / max(1, k),
                         "retain_unused": float(
@@ -1713,7 +1549,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             extra_dirs: Optional[List[str]] = [retain_dir] if unlearn_whole_items else None
             if not _list_shards_safe(item_pairs_dir):
                 log.info(
-                    "[item_pairs] materialising (prefix→target) pairs "
+                    "[item_pairs] materializing (prefix→target) pairs "
                     "from %s (unlearn_whole_items=%s)",
                     forget_dir,
                     unlearn_whole_items,
@@ -1777,12 +1613,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         )
 
         unlearn_batch_size = unlearning_cfg.get("batch_size_per_device")
-        # forget_full_coverage: see _split_batch_rows. OFF by default, so every
-        # recorded run keeps the capped-and-sampled forget batch it was produced
-        # with. ON, the collate cap is lifted and the expansion is split into
-        # equal row-chunks, so the forget set is seen exactly once per pass and
-        # n_forget_batches finally tracks forget-set size (it is pinned at 1
-        # otherwise, because the cap fires long before 256 sequences do).
+        # forget_full_coverage lifts the collate cap and splits the expansion
+        # into row chunks, so every forget row is seen once per pass.
         forget_full_coverage = bool(
             unlearning_cfg.get("forget_full_coverage", False)
         )
@@ -1797,15 +1629,9 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 10 ** 9 if forget_full_coverage else None
             ),
         )
-        # Where the retain batches come from.
-        #   subset (DEFAULT) -> retain_subset_dir, the sampled subset of size
-        #       retain_samples_used_for_update * |D_f|. This is what every
-        #       influence-function / unlearning-scale algorithm expects and is
-        #       what all existing results were produced with.
-        #   full -> the ENTIRE retain split. Needed when the update has to REBUILD
-        #       capacity rather than nudge it (post-hoc PKM repair): fine-tuning
-        #       thousands of steps over a 2-batch subset just memorises it, which
-        #       collapsed utility 0.832 -> 0.360 in jobs 10280081-84.
+        # Retain batch source: 'subset' (default) uses the sampled subset of
+        # size retain_samples_used_for_update * |D_f|; 'full' uses the whole
+        # retain split.
         retain_source = str(
             unlearning_cfg.get("retain_source", "subset") or "subset"
         ).strip().lower()
@@ -1817,19 +1643,17 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         if retain_source == "full":
             algo_name = str(unlearning_cfg.get("algorithm", "scif")).strip().lower()
             log.warning(
-                "[retain_source=full] retain batches come from the FULL retain "
-                "split (%s), NOT the %d-per-|D_f| subset. Intended for capacity "
-                "REBUILD (post-hoc PKM repair).",
+                "[retain_source=full] retain batches come from the full retain "
+                "split (%s), not the %d-per-|D_f| subset.",
                 retain_dir,
                 int(unlearning_cfg.get("retain_samples_used_for_update") or 16),
             )
             if algo_name in ("scif", "seif"):
                 log.warning(
                     "[retain_source=full] algorithm=%s derives its influence "
-                    "scaling from the SAMPLED retain subset "
+                    "scaling from the sampled retain subset "
                     "(retain_count = retain_samples_used_for_update * |D_f|); "
-                    "using the full split changes that estimator's assumptions. "
-                    "Results will NOT be comparable to the recorded %s numbers.",
+                    "using the full split changes that estimator (%s).",
                     algo_name, algo_name,
                 )
         retain_loader = _build_finite_loader(
@@ -1914,12 +1738,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         * ``random_retain`` → random retain-set item ids (ablation): every item
           id in the retain shards minus forget/target items, sampled to
           ``default_count`` (``sep_num_random_negatives`` overrides). The item
-          pool is cached per resolved retain dir so symlinked sequential request
-          dirs scan once.
+          pool is cached per resolved retain dir.
         """
         mode = str(unlearning_cfg.get("sep_negatives", "forget")).strip().lower()
-        # 'forget' (slide default, I_f only); 'neighbors' kept as a legacy alias
-        # for the same forget-only behavior (neighbors are no longer negatives).
+        # 'neighbors' is a legacy alias for 'forget'.
         if mode in ("", "forget", "neighbors"):
             return None
         if mode == "forget_target_only":
@@ -2085,12 +1907,8 @@ def _build_finite_loader(
         padding_token=cfg.padding_token,
         oov_token=cfg.get("oov_token", None) if hasattr(cfg, "get") else None,
     )
-    # collate_with_sid_causal_duplicate expands each sequence into ALL its
-    # contiguous prefixes and then draws max_batch_size of them with
-    # torch.randint -- WITH REPLACEMENT. Under the cap nothing is lost; over it,
-    # rows repeat and part of the expansion is never seen. For the forget set
-    # that is silent data loss, so the caller can lift the cap here and split
-    # the result into full-coverage batches instead.
+    # The collate expands each sequence into all prefixes and samples
+    # max_batch_size of them with replacement; callers may lift the cap.
     if max_batch_size_override is not None:
         _collate_kw["max_batch_size"] = int(max_batch_size_override)
     collate_fn_partial = partial(cfg.collate_fn, **_collate_kw)
@@ -2113,9 +1931,7 @@ def _split_batch_rows(batch: Any, max_rows: int) -> List[Any]:
     """Split one TigerBatch into row-chunks of at most ``max_rows``.
 
     Every tensor in a TigerBatch is row-major on dim 0 (one row per augmented
-    sequence), so a chunk is a plain slice of each field. Used with the collate
-    cap lifted, so the forget set is covered exactly once across the chunks
-    instead of being sampled with replacement down to one capped batch.
+    sequence), so a chunk is a slice of each field.
     """
     import dataclasses
 
@@ -2124,20 +1940,9 @@ def _split_batch_rows(batch: Any, max_rows: int) -> List[Any]:
     if n <= max_rows:
         return [batch]
 
-    # A TigerBatch stores three kinds of field, and only the first two scale
-    # with rows:
-    #   leading dim == n        row-major (mask, transformed_sequences, user ids)
-    #   leading dim == n * k    FLATTENED per-row groups. `labels` is like this:
-    #                           n rows x H hierarchies stored flat, recovered by
-    #                           `labels.reshape(bsz, -1)` in
-    #                           _build_coherence_neighbors. Slicing it as [a:b]
-    #                           left 16726 rows of labels against 512 of mask and
-    #                           raised "shape '[512, -1]' is invalid for input of
-    #                           size 66904".
-    #   anything else           per-hierarchy or scalar; slicing it truncated the
-    #                           hierarchy axis and raised IndexError in model_step.
-    # So slice proportionally when the leading dim is a multiple of n, and pass
-    # everything else through untouched.
+    # Fields with leading dim n are row-major; fields with leading dim n * k
+    # (e.g. flattened labels) are sliced proportionally; everything else is
+    # passed through unchanged.
     def _slice(v, a, b):
         if isinstance(v, torch.Tensor):
             if v.dim() >= 1 and v.shape[0] % n == 0 and v.shape[0] >= n:

@@ -1,6 +1,5 @@
-"""Pick which parameters of a TIGER ``SemanticIDEncoderDecoder`` SCIF should
-update. Mirrors ERASE's ``Trainer.target_params`` fallback logic but spelled
-out for TIGER's actual module names.
+"""Select which parameters of a TIGER ``SemanticIDEncoderDecoder`` an unlearning
+update may modify, including code-position, stable/adaptive and PKM-only scopes.
 """
 
 from __future__ import annotations
@@ -31,17 +30,13 @@ def select_target_params(model: nn.Module, policy: str = "all") -> List[nn.Param
     policy
         One of:
 
-        * ``all`` -- every trainable named parameter (mirrors ERASE's fallback,
-          which is the right default for TIGER since ``num_user_bins=null`` so
-          there is no per-user embedding to single out).
-        * ``sid_embeddings`` -- only the SID embedding table on the encoder side
-          plus the per-hierarchy decoder linear heads. Cheapest HVP, narrowest
-          influence.
-        * ``encoder_only`` -- all parameters of the encoder sub-module.
-        * ``tiger`` -- all trainable parameters of a ``SemanticIDEncoderDecoder``
-          except ``decoder.bos_token`` and ``sep_token`` (structural scaffolding
-          that carries no item/user knowledge). Raises ``TypeError`` for any
-          other model type.
+        * ``all``: every trainable parameter.
+        * ``sid_embeddings``: the encoder SID embedding table plus the
+          per-hierarchy decoder heads.
+        * ``encoder_only``: all parameters of the encoder sub-module.
+        * ``tiger``: all trainable parameters of a ``SemanticIDEncoderDecoder``
+          except ``decoder.bos_token`` and ``sep_token``. Raises ``TypeError``
+          for any other model type.
 
     Returns
     -------
@@ -102,17 +97,12 @@ def select_adaptive_code_params(
 ) -> Tuple[List[nn.Parameter], Dict[int, torch.Tensor]]:
     """Restrict updates to the *adaptive* (fine-grained) tail of the semantic ID.
 
-    The Stable-Adaptive Semantic ID design: an RQ item id
-    ``[c_0, ..., c_{H-1}]`` is split at ``stable_codes`` into a stable (coarse,
-    frozen) segment ``[c_0, ..., c_{stable_codes-1}]`` and an adaptive (fine,
-    trainable) segment ``[c_{stable_codes}, ..., c_{H-1}]``. Unlearning then
-    moves only the adaptive segment, localizing deletions.
+    An RQ item id ``[c_0, ..., c_{H-1}]`` is split at ``stable_codes`` into a
+    frozen stable prefix and a trainable adaptive tail.
 
     Trainable surface returned:
-      * ``item_sid_embedding_table_encoder`` — included as a whole tensor, but
-        with a row mask zeroing the stable hierarchies' rows
-        ``[0, stable_codes * K)`` so only adaptive rows
-        ``[stable_codes * K, H * K)`` receive updates (the table is laid out as
+      * ``item_sid_embedding_table_encoder``, with a row mask so only adaptive
+        rows ``[stable_codes * K, H * K)`` are updated (the table consists of
         ``H`` contiguous ``K``-row hierarchy blocks).
       * Per-hierarchy decoder heads ``decoder.decoder_mlp[stable_codes:]``.
       * The shared transformer backbone (encoder + decoder T5 stack) only when
@@ -211,32 +201,17 @@ def select_code_position_params(
     positions: List[int],
     update_backbone: bool = False,
 ) -> Tuple[List[nn.Parameter], Dict[int, torch.Tensor]]:
-    """Confine updates to an *arbitrary subset* of RQ semantic-ID code positions.
+    """Restrict updates to a subset of RQ semantic-ID code positions.
 
-    Generalizes :func:`select_adaptive_code_params` (which only freezes a
-    contiguous *prefix* of codes) to any subset ``positions ⊆ {0, .., H-1}`` of
-    hierarchy indices. This is the "position-wise intervention" knob for the
-    RQ-ID diagnosis: it lets the SCIF update touch ONLY the parameters that are
-    specific to the selected code positions, so we can test whether any single
-    code level (``c1``, ``c4``, …) or pair (``[c1,c2]``, ``[c3,c4]``) provides a
-    local unlearning interface.
+    Generalizes :func:`select_adaptive_code_params` to any subset
+    ``positions`` of hierarchy indices.
 
     Trainable surface returned for ``positions = S``:
-      * ``item_sid_embedding_table_encoder`` — included as a whole tensor, with a
-        row mask that is 1 only on the hierarchy blocks ``[h*K, (h+1)*K)`` for
-        ``h in S`` (the table is laid out as ``H`` contiguous ``K``-row blocks)
-        and 0 elsewhere, so only those hierarchies' input embeddings move.
-      * Per-hierarchy decoder heads ``decoder.decoder_mlp[h]`` for ``h in S``
-        (the output projection that maps the decoder state to position ``h``'s
-        code logits — TIGER's only genuinely position-specific output weights).
+      * ``item_sid_embedding_table_encoder``, with a row mask that is 1 only on
+        the hierarchy blocks ``[h*K, (h+1)*K)`` for ``h in S``.
+      * Per-hierarchy decoder heads ``decoder.decoder_mlp[h]`` for ``h in S``.
       * The shared transformer backbone (encoder + decoder T5 stack) only when
         ``update_backbone`` is True (no mask).
-
-    Because ``decoder_mlp[h]`` participates only in hierarchy ``h``'s loss term
-    (``model_step`` sums independent per-hierarchy CE heads), restricting the
-    updated parameters to position ``h`` also restricts the *learning signal*
-    that reaches those heads to position ``h`` — the update is local in both the
-    parameter and the gradient sense.
 
     Parameters
     ----------
@@ -249,12 +224,7 @@ def select_code_position_params(
     Returns
     -------
     (params, grad_masks)
-        ``params`` is the non-empty list handed to the optimizer / SCIF.
-        ``grad_masks`` maps ``id(param) -> float mask`` (same shape as the
-        param) for params that need a partial-gradient/-update mask applied;
-        params absent from the dict are updated in full. Mirrors the contract of
-        :func:`select_adaptive_code_params` so the same downstream masking code
-        applies.
+        Same contract as :func:`select_adaptive_code_params`.
     """
     num_hierarchies = getattr(model, "num_hierarchies", None)
     codebook_size = getattr(model, "num_embeddings_per_hierarchy", None)
@@ -335,20 +305,11 @@ def select_code_position_params(
 def select_pkm_params(
     model: nn.Module, *, include_query: bool = True, include_keys: bool = True
 ) -> Tuple[List[nn.Parameter], List[str]]:
-    """Return only the Product-Key-Memory parameters (everything else frozen).
+    """Return only the Product-Key-Memory parameters.
 
-    This is the "modular stabilizer" update scope: the backbone, SID embeddings
-    and decoder heads are left out of the optimizer entirely, so unlearning can
-    only edit what lives in the sparse memory.
-
-    Selection is by MODULE TYPE (``HashingMemory``), not by parameter name — the
-    PKM wrappers sit at different paths depending on whether they replaced the
-    FFN (``T5LayerPKM``) or run beside it (``T5LayerFFWithPKM``), and encoder
-    FFNs are registered under ``model.encoder.*`` rather than ``encoder.*``.
-
-    ``include_keys`` / ``include_query`` allow editing only the value table
-    (``values.weight``, the "what to output" side per Geva et al. 2021) while
-    freezing the routing, which is the more surgical variant.
+    Selection is by module type (``HashingMemory``) because PKM layers sit at
+    different paths depending on the PKM mode. Setting ``include_keys`` and
+    ``include_query`` to False restricts the update to the value table.
 
     Returns ``(params, names)``; ``names`` is for logging what was selected.
     """
@@ -365,9 +326,7 @@ def select_pkm_params(
         for p_name, p in module.named_parameters():
             if not p.requires_grad or id(p) in seen:
                 continue
-            # ``keys`` is the product-key routing table; ``query_proj`` (or
-            # whatever the query net is called) maps the hidden state to a
-            # query. Both are optional so callers can edit values only.
+            # Optionally skip the key table and query network.
             is_keys = "keys" in p_name
             is_query = "query" in p_name
             if is_keys and not include_keys:
@@ -380,10 +339,9 @@ def select_pkm_params(
 
     if not params:
         raise ValueError(
-            "select_pkm_params found no HashingMemory parameters — the "
-            "checkpoint/model was built without PKM layers. Pass "
-            "model.pkm_layers=... (and model.pkm_mode) so the memory exists "
-            "before requesting update_scope='pkm_only'."
+            "select_pkm_params found no HashingMemory parameters; the "
+            "model was built without PKM layers. Set model.pkm_layers (and "
+            "model.pkm_mode) to use update_scope='pkm_only'."
         )
     return params, names
 
@@ -399,13 +357,11 @@ def resolve_scope_params(
 ) -> Tuple[List[nn.Parameter], Optional[List[str]]]:
     """Resolve an algorithm's trainable parameter list for ``update_scope``.
 
-    Shared by every gradient-based unlearning algorithm so ``pkm_only`` means the
-    same thing everywhere.
-
-    * ``all`` (default) -> ``fallback`` unchanged (the algorithm's own choice).
-    * ``pkm_only``      -> only Product-Key-Memory params; with
-      ``include_keys=False, include_query=False`` this narrows further to the
-      VALUE table only (routing frozen), which is the "values_only" variant.
+    * ``all`` (default): ``fallback`` unchanged.
+    * ``pkm_only``: only Product-Key-Memory params (value table only when
+      ``include_keys`` and ``include_query`` are False).
+    * ``ffn_only``: only the FFN sub-layers re-initialized by
+      ``model.reinit_ffn_layers()``.
 
     Returns ``(params, pkm_names)``; ``pkm_names`` is ``None`` for scope ``all``.
     """
@@ -413,9 +369,7 @@ def resolve_scope_params(
     if scope in ("", "all"):
         return fallback, None
     if scope == "ffn_only":
-        # CONTROL for the post-hoc PKM recipe: train only the FFN sub-layers that
-        # model.reinit_ffn_layers() freshly re-initialised, so "reinit + retrain
-        # this layer" is measured with an ordinary FFN instead of a PKM.
+        # Control for PKM: train only the re-initialized FFN sub-layers.
         names = list(getattr(model, "_reinit_ffn_module_names", []) or [])
         if not names:
             raise ValueError(
@@ -429,8 +383,8 @@ def resolve_scope_params(
                 if p.requires_grad and id(p) not in seen:
                     seen.add(id(p)); params.append(p)
         log.info(
-            "[%s] FFN-ONLY update scope: %d tensors (%d params) across %d "
-            "re-initialised FFNs %s; everything else FROZEN [PKM CONTROL]",
+            "[%s] ffn_only update scope: %d tensors (%d params) across %d "
+            "re-initialized FFNs %s; all other parameters frozen",
             algo or "scope", len(params),
             int(sum(p.numel() for p in params)), len(names), names,
         )
@@ -444,8 +398,8 @@ def resolve_scope_params(
         model, include_keys=include_keys, include_query=include_query
     )
     log.info(
-        "[%s] PKM-ONLY update scope: %d tensors (%d params) across %d memories "
-        "(keys=%s query=%s); everything else FROZEN",
+        "[%s] pkm_only update scope: %d tensors (%d params) across %d memories "
+        "(keys=%s query=%s); all other parameters frozen",
         algo or "scope",
         len(params),
         int(sum(p.numel() for p in params)),
@@ -477,23 +431,10 @@ def split_code_params(
 ) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:
     """Split ``params`` into (semantic-ID *code* params, everything else).
 
-    "Code" params are the ones that define what a semantic-ID token MEANS:
-
-      * ``item_sid_embedding_table_encoder`` -- the shared SID embedding table
-        (``H`` contiguous ``K``-row blocks, hierarchy ``h`` in rows
-        ``[h*K, (h+1)*K)``);
-      * ``decoder.decoder_mlp[*]`` -- the per-hierarchy output heads.
-
-    Used to give the code parameters their own, lower learning rate so that
-    unlearning perturbs the identifier space only slightly while the rest of the
-    model absorbs the update. This is the soft counterpart of the
-    stable/adaptive split, which *hard-freezes* the stable codes instead: here
-    every code can still move, just slowly, and the two compose (the adaptive
-    grad mask is applied to ``.grad`` regardless of which group a tensor is in).
-
-    Membership is decided by identity against ``model.named_parameters()``, so a
-    tensor that appears in ``params`` under a restriction policy keeps its
-    classification.
+    Code params are the SID embedding table
+    (``item_sid_embedding_table_encoder``) and the per-hierarchy output heads
+    (``decoder.decoder_mlp``). The split lets code parameters use a separate
+    learning rate.
     """
     wanted = {id(p) for p in params}
     code_ids: set = set()
@@ -521,29 +462,15 @@ def split_adaptive_code_params(
 ) -> Tuple[List[nn.Parameter], Dict[int, torch.Tensor]]:
     """Identify the *adaptive-tail* subset of the semantic-ID code parameters.
 
-    Position-aware refinement of :func:`split_code_params`: instead of treating
-    the identifier space as one block, separate the codes belonging to the
-    adaptive (fine, item-specific) hierarchies ``[stable_codes,
-    num_hierarchies)`` from the stable (coarse, shared) prefix ``[0,
-    stable_codes)``. Used to give the adaptive tail its OWN learning rate, so
-    the coarse codes every neighbor shares and the fine codes that are nearly
-    item-unique can move at different speeds.
+    Separates the codes of hierarchies ``[stable_codes, num_hierarchies)`` so
+    they can use their own learning rate.
 
-    Two return channels, because the two surfaces are shaped differently:
-
-      * ``tensors`` -- whole parameters that belong exclusively to adaptive
-        hierarchies (the per-hierarchy decoder heads
-        ``decoder.decoder_mlp[stable_codes:]``). These can simply go into their
-        own optimizer group.
-      * ``row_masks`` -- ``id(param) -> float mask`` over rows, for parameters
-        whose rows span BOTH segments and which therefore cannot be split
-        across optimizer groups: the shared SID embedding table
-        (``H`` contiguous ``K``-row hierarchy blocks). The mask is 1.0 on the
-        adaptive rows ``[stable_codes * K, H * K)`` and 0.0 on the stable rows.
-        The caller applies the per-row rate by rescaling the *applied update*
-        after ``opt.step()``; scaling ``.grad`` instead would do nothing under
-        Adam, whose per-parameter normalization cancels any constant gradient
-        factor.
+      * ``tensors``: whole parameters belonging only to adaptive hierarchies
+        (``decoder.decoder_mlp[stable_codes:]``).
+      * ``row_masks``: ``id(param) -> float mask`` over rows of the shared SID
+        embedding table, 1.0 on adaptive rows. The caller rescales the applied
+        update after ``opt.step()``, since scaling ``.grad`` has no effect
+        under Adam.
 
     Only parameters present in ``params`` are returned, so a restriction policy
     that already excluded a tensor keeps it excluded.
@@ -602,20 +529,11 @@ def split_stable_code_params(
     *,
     stable_codes: int,
 ) -> Tuple[List[nn.Parameter], Dict[int, torch.Tensor]]:
-    """The *stable-prefix* counterpart of :func:`split_adaptive_code_params`.
+    """Stable-prefix counterpart of :func:`split_adaptive_code_params`.
 
-    Returns the parameters belonging exclusively to the COARSE hierarchies
-    ``[0, stable_codes)`` -- the decoder heads ``decoder.decoder_mlp[:stable_codes]``
-    -- plus a row mask selecting the stable rows ``[0, stable_codes * K)`` of the
-    shared SID embedding table.
-
-    Why this exists: measuring ``adaptive_code_lr_scale`` across 270 runs showed
-    it changes nothing, because the adaptive tail barely moves in the first place
-    (mean |delta| 3.0e-04 on the tail vs 5.9e-04 on the stable rows, and the last
-    hierarchy is only a dedup digit). The coarse codes are the ones ~47 items
-    share on average at width 256, so they are where a code update is genuinely
-    non-local -- and they were never constrained by the adaptive knob. This makes
-    that half addressable.
+    Returns the decoder heads ``decoder.decoder_mlp[:stable_codes]`` plus a row
+    mask selecting the stable rows ``[0, stable_codes * K)`` of the shared SID
+    embedding table.
     """
     num_hierarchies = getattr(model, "num_hierarchies", None)
     codebook_size = getattr(model, "num_embeddings_per_hierarchy", None)

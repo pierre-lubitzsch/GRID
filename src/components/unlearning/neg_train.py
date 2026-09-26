@@ -33,20 +33,10 @@ def neg_train_unlearn(
 ) -> Dict[str, Any]:
     """Gradient ascent on forget batches with optional retain CE every k steps.
 
-    NOTE ``neg_retain_every=1`` is DEGENERATE: ``step % 1 == 0`` always holds, so
-    the retain branch runs every step, the ascent branch never runs, and this
-    reduces to plain fine-tuning on retain. Measured on beauty: SH@10 0.0115 at
-    UR 0.981, matching `finetune` to within noise because it is the same
-    objective by accident.
-
-    This is the ALTERNATING form: one optimizer step per batch, so a retain step
-    can partially undo the preceding ascent step. The SIMULTANEOUS form usually
-    written for this baseline -- ``L_retain - w*CE_forget`` accumulated into one
-    step -- is reached through the unified objective instead, as
-    ``lambda_r=1, lambda_f=w, lambda_s=0, lambda_n=0`` (unified's
-    ``l_forget = -CE``, so a positive ``lambda_f`` IS ascent). Using that path
-    keeps one implementation, so the comparison against unified carries no
-    incidental difference in batching, optimizer or step budget.
+    ``neg_retain_every=1`` runs only retain steps and reduces to fine-tuning.
+    This is the alternating form (one optimizer step per batch); the
+    simultaneous form ``L_retain - w*CE_forget`` is available through the
+    unified objective with ``lambda_r=1, lambda_f=w, lambda_s=0, lambda_n=0``.
     """
     device = device or next(model.parameters()).device
     if not forget_batches:
@@ -61,9 +51,7 @@ def neg_train_unlearn(
     model.train()
     forget_losses: List[float] = []
     retain_losses: List[float] = []
-    # Same budget rule as unified.py / tracer.py: n_epochs * min(n_forget,
-    # n_retain), so the step count follows the forget set rather than a fixed
-    # constant. n_epochs wins when both are given.
+    # Step budget: n_epochs * min(n_forget, n_retain); n_epochs wins over steps.
     if n_epochs is not None and forget_batches and retain_batches:
         steps = int(n_epochs) * min(len(forget_batches), len(retain_batches))
     for step in range(int(steps)):

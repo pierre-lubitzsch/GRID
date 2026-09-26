@@ -1,24 +1,11 @@
 """Position-wise gradient diagnostics for TIGER RQ semantic IDs.
 
-Answers the "Position-wise signal analysis" question from the RQ-ID diagnosis:
-
-  * Where (which RQ code position c1..cH) is the forget / spam signal strongest?
-  * Where do the forget and retain objectives conflict the most?
-
-TIGER's loss is a sum of independent per-hierarchy cross-entropy heads
-(``model.per_hierarchy_losses``), so the gradient of position ``h``'s loss term
-w.r.t. the shared parameters isolates the learning signal that flows through RQ
-code position ``h``. We accumulate those per-position gradients over the forget
-and retain batches and report, per position:
-
-  * ``forget_grad_norm`` / ``retain_grad_norm`` — signal strength.
-  * ``forget_retain_cosine`` — alignment of the two objectives' gradients.
-    Positive cosine means the forget and retain gradients point the same way at
-    this position: the SCIF step (which pushes *against* the forget gradient
-    while preserving retain) then puts those objectives in tension, so a large
-    positive cosine flags higher collateral / conflict risk for that code level.
-
-The diagnostic only reads gradients; it never updates the model.
+TIGER's loss is a sum of per-hierarchy cross-entropy terms
+(``model.per_hierarchy_losses``), so the gradient of each term isolates the
+signal flowing through one code position. For each position this module reports
+the forget and retain gradient norms and their cosine similarity; a large
+positive cosine indicates that forgetting at that position conflicts with
+retention. The model is never updated.
 """
 
 from __future__ import annotations
@@ -122,13 +109,11 @@ def per_position_gradient_report(
                 "forget_grad_norm": f_norm,
                 "retain_grad_norm": r_norm,
                 "forget_retain_cosine": cosine,
-                # >0 => forget & retain gradients aligned => SCIF (which opposes
-                # the forget gradient) puts the objectives in tension here.
+                # Positive values mean forgetting conflicts with retention.
                 "conflict_score": cosine,
             }
         )
 
-    # Convenience rankings for the slide's three goals.
     by_forget = sorted(positions, key=lambda d: d["forget_grad_norm"], reverse=True)
     by_conflict = sorted(positions, key=lambda d: d["conflict_score"], reverse=True)
     report = {

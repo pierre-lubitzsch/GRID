@@ -1,24 +1,10 @@
-"""Unlearning entrypoint for LETTER checkpoints.
+"""Unlearning module for LETTER checkpoints.
 
-``LetterUnlearningModule`` is to :class:`LetterEncoderDecoder` what
-``TigerUnlearningModule`` is to ``SemanticIDEncoderDecoder``: the same model plus
-the unlearning algorithms. All of them (scif, seif, kookmin, fanchuan, unified,
-finetune, neg_train, filter, tracer) apply unchanged, because they operate on
-parameters and batches, not on how the identifiers were produced.
-
-WHAT IS DIFFERENT FROM DIGER, AND WHY THERE IS NO ``finalize_unlearning`` HERE
-------------------------------------------------------------------------------
-DIGER's tokenizer is differentiable and trains jointly with the recommender, so
-an unlearning update can MOVE an item's semantic id; ``DigerUnlearningModule``
-therefore has to re-commit the ids and rewrite the SID tensor afterwards or every
-downstream metric scores stale codes.
-
-LETTER's tokenizer is learnable but not joint: it is trained in its own stage and
-its output -- the ``(L, N)`` semantic-ID tensor -- is FROZEN before the
-recommender ever runs, exactly as for TIGER. So a LETTER unlearning update moves
-theta only, the ids on disk stay correct by construction, and there is nothing to
-re-commit. That is a property worth stating rather than inferring from the
-absence of a method.
+``LetterUnlearningModule`` combines :class:`LetterEncoderDecoder` with the
+unlearning algorithms of ``TigerUnlearningModule``. LETTER's semantic IDs are
+produced by a separately trained tokenizer and frozen before the recommender is
+trained, so unlearning updates only the recommender parameters and no
+re-assignment of IDs is needed.
 """
 
 from __future__ import annotations
@@ -34,12 +20,10 @@ from src.models.modules.semantic_id.tiger_unlearning_module import (
 
 
 class LetterUnlearningModule(LetterEncoderDecoder, TigerUnlearningModule):
-    """LETTER + the unlearning algorithms.
+    """LETTER model with the unlearning algorithms.
 
-    MRO is ``LetterUnlearningModule -> LetterEncoderDecoder ->
-    TigerUnlearningModule -> SemanticIDEncoderDecoder``, so LETTER's tempered
-    loss wins while every unlearning method is inherited. Both parents take
-    ``**kwargs`` and cooperate through ``super().__init__``.
+    The MRO places ``LetterEncoderDecoder`` before ``TigerUnlearningModule``, so
+    LETTER's tempered loss is used while all unlearning methods are inherited.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:

@@ -11,14 +11,8 @@ unlearning:
   request_user_order: manifest
   request_seed: ${seed}
   save_intermediate_checkpoints: false
-  # Keep ONLY the final checkpoint — it is the one `unlearned.ckpt` points at and
-  # the only one the post-unlearn eval and every downstream table read. The old
-  # [0.01, 0.10, 1.0] progression snapshots wrote a second full checkpoint per
-  # run (1.9-3.6 GiB each) that nothing ever consumed, doubling the on-disk cost
-  # of every sweep. Restore them via CKPT_FRACTIONS in
-  # run_tiger_unlearn_sequential.sh if a request-progression analysis needs them.
+  # Fractions of the request stream after which a checkpoint is saved.
   checkpoint_fractions: [1.0]
   # Drop per-request scratch TFRecords after each SCIF step (eval uses ckpts only).
   cleanup_request_dirs: true
-  # Post-unlearn eval is run by run_tiger_unlearn_sequential.sh (not this Python entry).
-  # Defaults: UNLEARN_RUN_POST_EVAL=true, UNLEARN_EVAL_DATA_DIR=src/data/amazon_data/beauty
+  # Post-unlearn evaluation is run by scripts/pipeline/unlearn.sh.

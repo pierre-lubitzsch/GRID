@@ -53,14 +53,8 @@ class BaseBufferedWriter(BasePredictionWriter):
     def setup(self, trainer: Trainer, pl_module: LightningModule, stage: str) -> None:
         self.global_rank = trainer.global_rank if trainer.global_rank else 0
         log.info(f"Rank {self.global_rank} initialized for inference.")
-        # If the module does not have the prediction_key_name or prediction_name attributes,
-        # we don't do anything as it might be using the previous interface.
-        # If the module has the attributes and they are set, we also don't change it as they
-        # might be hardcoded in the module.
-        # We only set the prediction_key_name or prediction_name if they are not set in the module but are
-        # passed in the callback. This allows us to control the prediction_key_name and prediction_name
-        # from the callback config.
-        # TODO (lneves) Deprecate the way folks do and have all inference pipelines to use this.
+        # Set prediction_key_name / prediction_name on the module only if it defines
+        # them, leaves them unset, and the callback provides them.
 
         if (
             hasattr(pl_module, "prediction_key_name")
@@ -123,8 +117,7 @@ class BaseBufferedWriter(BasePredictionWriter):
     ) -> None:
         """
         Called at the end of each prediction batch.
-        We'll accumulate rows in the buffer and only write to BigQuery
-        once we reach the flush_frequency.
+        Rows are buffered and written once flush_frequency is reached.
         """
         self.handle_batch(prediction)
 
@@ -137,8 +130,7 @@ class BaseBufferedWriter(BasePredictionWriter):
     ) -> None:
         """
         Called at the end of a prediction epoch.
-        We'll continue to buffer predictions from all batches in this epoch
-        and flush if the buffer exceeds flush_frequency.
+        Buffers predictions from all batches and flushes the remainder.
         """
         # predictions is typically a list of tensors (one per batch).
         for batch_pred in predictions:
@@ -153,16 +145,11 @@ class BaseBufferedWriter(BasePredictionWriter):
     ) -> None:
         """
         Called at the end of the prediction process.
-        We'll flush any remaining rows in the buffer.
+        Flushes any remaining rows in the buffer.
         """
         self.flush_buffer()
         log.info(f"Rank {self.global_rank} finished writing predictions.")
-        # TODO (clark): technically write_on_epoch_end should handle this correctly
-        # but if we dont't do this as well here, the number of rows in the final BQ table will
-        # always be a multiplier of flush_frequency
-        # and we will lose some rows if the last batch is smaller than flush_frequency
-        # this is an indicator of something not working fully as expected
-        # i'll investigate this issue later
+        # Flushing here as well ensures a final partial buffer is not lost.
 
 class LocalPickleWriter(BaseBufferedWriter):
     """
@@ -231,8 +218,7 @@ class LocalPickleWriter(BaseBufferedWriter):
         super().on_predict_end(trainer, pl_module)
 
         if self.should_merge_files_on_main:
-            # if we use multiple workers, we need to wait for all of them to finish writing
-            # before merging the files
+            # Wait for all workers to finish writing before merging the files.
             if trainer.global_rank is not None and torch.distributed.is_initialized():
                 torch.distributed.barrier()
             if self.global_rank == 0:

@@ -28,9 +28,7 @@ from src.utils.utils import (
     reset_parameters,
 )
 
-# Module-level logger. This file previously had none, so the TRACER helpers'
-# `log.*` calls raised NameError; kept under a TRACER-specific name so it cannot
-# collide with a general-purpose `log` added elsewhere in this module.
+# Logger used by the TRACER helpers.
 _TRACER_LOG = logging.getLogger(__name__)
 
 
@@ -87,9 +85,7 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
         self.top_k_for_generation = top_k_for_generation
         self.forbidden_sids: Optional[Set[Tuple[int, ...]]] = None
         self.filter_mode: str = "global"
-        # user_id -> forbidden SID tuples, used only by filter_mode
-        # "user_dependent". Kept as SIDs (not item ids) because the decode-time
-        # check compares against the beam's emitted codes.
+        # user_id -> forbidden SID tuples, used only by filter_mode "user_dependent".
         self.user_forbidden_sids: Optional[Dict[int, Set[Tuple[int, ...]]]] = None
 
     def _inject_sep_token_between_sids(
@@ -228,8 +224,6 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
         Returns:
             A boolean tensor of shape [batch_size] indicating the validity of each prefix.
         """
-        # TODO (clark): this is a temporary solution, we should use a more efficient way to do this
-        # like pre-sorting the codebook and implementing a tree strcture
 
         current_hierarchy = prefix.shape[1]
         num_prefixes = prefix.shape[0]
@@ -286,10 +280,9 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
             past_key_values: The cache for past key values.
             hierarchy: The current hierarchy level.
             batch_size: The size of the batch.
-            user_id: Per-row user ids of the ORIGINAL batch (shape ``[B]``),
-                needed only by ``filter_mode="user_dependent"``. Beams are laid
-                out ``b * top_k + k`` by the ``repeat_interleave`` in
-                :meth:`generate`, so ``user_id`` is expanded the same way here.
+            user_id: Per-row user ids of the original batch (shape ``[B]``),
+                needed only by ``filter_mode="user_dependent"``. Expanded to the
+                ``b * top_k + k`` beam layout used by :meth:`generate`.
 
         Returns:
             The updated generated IDs and the marginal probabilities.
@@ -325,11 +318,8 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
                 ).reshape(-1, self.num_embeddings_per_hierarchy)
             candidate_logits[~valid_prefix_mask] = float("-inf")
 
-        # Decode-time filter: mask logits completing a forbidden SID at the final
-        # hierarchy. This is the only point at which a full identifier exists, so
-        # the beam has already committed to the first num_hierarchies-1 codes; a
-        # prefix whose every legal continuation is forbidden is left with nothing.
-        # That cascade is a property of the identifier space, not of this code.
+        # Decode-time filter: at the final hierarchy, mask logits that would
+        # complete a forbidden SID.
         if (
             generated_ids is not None
             and hierarchy == self.num_hierarchies - 1
@@ -341,9 +331,8 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
             if str(self.filter_mode) == "user_dependent":
                 if user_id is None:
                     raise ValueError(
-                        "filter_mode='user_dependent' needs user_id in generate(); "
-                        "got None, which would mask nothing and be recorded as a "
-                        "per-user filter."
+                        "filter_mode='user_dependent' requires user_id in generate(), "
+                        "got None."
                     )
                 top_k = max(1, n_beams // max(1, int(user_id.numel())))
                 uids = (
@@ -451,18 +440,12 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
             },
         )
 
-        # user_id, when the data config keeps it, lets the evaluator scope the
-        # spam/sensitive metrics to the users who actually requested a deletion
-        # versus everyone else. Absent -> only the global metric is emitted.
-        # SequentialModelInputData carries it as `user_id_list` (which may be a
-        # list of str, not a tensor); the feature map can also leave it in
-        # transformed_sequences. Check both, and coerce to a long tensor.
+        # Optional user ids let the evaluator scope metrics to users who requested
+        # a deletion. They may come from `user_id_list` (possibly strings) or from
+        # transformed_sequences; coerce to a 1-D long tensor.
         _uid = getattr(model_input, "user_id_list", None)
         if _uid is None:
-            # collate_fn_train (the eval path) never sets user_id_list; it puts
-            # every field through pad_or_trim_sequence, so user_id arrives as
-            # (B, sequence_length) with the real id in column 0 and padding
-            # after it. Take that column rather than the padded row.
+            # Padded (B, sequence_length) tensor; the id is in column 0.
             _uid = model_input.transformed_sequences.get("user_id")
         if _uid is not None and not torch.is_tensor(_uid):
             try:
@@ -477,7 +460,7 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
         self.evaluator(
             marginal_probs=marginal_probs,
             generated_ids=generated_ids,
-            # TODO: (lneves) hardcoded for now, will need to change for multiple features
+            # Assumes a single label feature.
             labels=list(label_data.labels.values())[0].to(marginal_probs.device),
             user_ids=None if _uid is None else _uid.to(marginal_probs.device),
         )
@@ -490,7 +473,6 @@ class SemanticIDGenerativeRecommender(TransformerBaseModule):
         This is needed as the default functions in lightning such as
         on_validation_start on_predict_start cannnot properly set the flags
         for the encoder and decoder.
-        (TODO) clark: in the future we can revisit this and make it more generic
 
         Args:
             is_training (bool): Whether the model is in training mode or not.
@@ -629,22 +611,17 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             ),
         )
 
-        # Replace selected T5 feed-forward sub-layers with Product-Key Memory
-        # layers. Runs before the mlp_layers bloating below so that PKM-selected
-        # layers stay PKM and only the remaining FFNs get bloated.
-        # Optimizer overrides (lr / weight_decay / ...) for the PKM parameters'
-        # own param group; None => PKM params share the single global optimizer
-        # group (default). The optimizer *class* is still the shared one from the
-        # config (override to SGD via optim.optimizer._target_); this only splits
-        # out the PKM params so they can take their own lr/weight_decay etc.
+        # Optional optimizer overrides (lr, weight_decay, ...) for a separate PKM
+        # param group; None keeps PKM params in the global group.
         self._pkm_param_group = dict(pkm_param_group) if pkm_param_group else None
 
+        # Install PKM layers before the mlp_layers expansion so PKM layers stay PKM.
         if pkm_layers is not None:
             self._install_pkm_layers(pkm_layers, dict(pkm_params or {}), pkm_mode)
 
         if mlp_layers is not None:
             # bloating the mlp layers in both encoder and decoder
-            # TODO (clark): this currently only works for T5
+            # Only supported for T5.
             for name, module in self.named_modules():
                 if isinstance(module, transformers.models.t5.modeling_t5.T5LayerFF):
                     parent_module, attr_name = get_parent_module_and_attr(self, name)
@@ -673,16 +650,11 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             else None
         )
 
-        # Input-side item-token aggregation ("Longer IDs" Jul 3, options 1 & 2).
-        # OFF by default (None) -> the encoder keeps one token position per SID
-        # hierarchy plus separator tokens (original behaviour). When enabled, each
-        # history item's num_hierarchies token embeddings are merged into a single
-        # compact encoder input vector, so the encoder sequence is one position
-        # per item -- keeping it short for long RQ IDs (L in {8, 16}). The decoder
-        # still generates the full num_hierarchies-token semantic ID.
-        #   "mean"        -> mean pooling, 1 vector/item (option 1)
-        #   "attentive"   -> ACERec Attentive Token Merger, k latents/item (option 2;
-        #                    intent token off by default, set intent_token:true for parity)
+        # Optional input-side item-token aggregation (off by default). When set,
+        # each history item's num_hierarchies token embeddings are merged into a
+        # compact encoder input; the decoder still generates the full semantic ID.
+        #   "mean"      -> mean pooling, one vector per item
+        #   "attentive" -> attentive token merger, k latents per item
         #   {type: attentive, num_query_tokens: 4, num_heads: 8, dropout: 0.0}
         self.item_token_merger = build_item_token_merger(
             item_token_aggregation,
@@ -691,8 +663,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         )
 
         # separation token for the encoder to differentiate between items.
-        # Not needed (and would be an unused DDP parameter) when the item-token
-        # merger is active, since each item is then a single encoder position.
+        # Unused when the item-token merger is active.
         self.sep_token = (
             torch.nn.Parameter(torch.randn(1, self.embedding_dim), requires_grad=True)
             if should_add_sep_token and self.item_token_merger is None
@@ -702,14 +673,9 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self.prediction_key_name = prediction_key_name
         self.prediction_value_name = prediction_value_name
         self.repair_adapter: Optional[nn.Parameter] = None
-        # Per-item adaptive-position offsets (Stable-Adaptive Semantic IDs,
-        # "option 2"). None unless explicitly enabled. When set, a zero-init,
-        # per-item, per-adaptive-hierarchy offset is added to the item
-        # embeddings at the adaptive positions [stable_codes, num_hierarchies),
-        # giving genuinely item-local degrees of freedom while the shared SID
-        # table stays frozen. Enabled at construction (for eval/load
-        # consistency) via adaptive_item_offset_stable_codes, or lazily during
-        # unlearning via enable_adaptive_item_offset().
+        # Optional per-item offsets added at the adaptive positions
+        # [stable_codes, num_hierarchies). Enabled at construction via
+        # adaptive_item_offset_stable_codes or later via enable_adaptive_item_offset().
         self.adaptive_item_offset: Optional[nn.Parameter] = None
         self._adaptive_stable_codes: Optional[int] = None
         if adaptive_item_offset_stable_codes is not None:
@@ -724,16 +690,9 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
     ) -> None:
         """Install the decode-time mask used by the ``filter`` unlearning baseline.
 
-        NOTE this is NOT checkpoint state: it lives on the module only. A process
-        that loads a checkpoint produced by the filter baseline (which performs no
-        weight update, so the checkpoint is identical to its source) and does not
-        call this method is evaluating the UNFILTERED model. That is exactly how
-        the filter baseline came to be mis-measured; ``scripts/eval_ckpt_on_test``
-        now reinstalls the mask from ``filter_mask.json`` via ``decode_filter_mask``.
-
-        ``filter_mode="user_dependent"`` requires ``user_forbidden_sids``; a
-        per-user mode with no per-user map would silently degrade to the global
-        one, so it is refused.
+        The mask is module state, not checkpoint state, so it must be reinstalled
+        after loading a checkpoint. ``filter_mode="user_dependent"`` requires
+        ``user_forbidden_sids``.
         """
         filter_mode = str(filter_mode).strip().lower()
         if filter_mode not in ("global", "user_dependent"):
@@ -742,8 +701,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             )
         if filter_mode == "user_dependent" and not user_forbidden_sids:
             raise ValueError(
-                "filter_mode='user_dependent' needs user_forbidden_sids; without "
-                "it the filter would mask globally and be recorded as per-user."
+                "filter_mode='user_dependent' requires user_forbidden_sids."
             )
         self.forbidden_sids = forbidden_sids
         self.filter_mode = filter_mode
@@ -751,7 +709,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
 
     def _pkm_parameters(self) -> List[torch.nn.Parameter]:
         """All trainable parameters that live inside installed PKM (HashingMemory)
-        layers — the memory keys/values and the query network."""
+        layers (memory keys/values and the query network)."""
         pkm_params: List[torch.nn.Parameter] = []
         for module in self.modules():
             if isinstance(module, HashingMemory):
@@ -759,19 +717,16 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         return pkm_params
 
     def configure_optimizers(self) -> Dict[str, Any]:
-        """Like the base implementation, but when ``pkm_param_group`` is set AND
-        the model has PKM layers, put the PKM parameters into their own optimizer
-        param group with the given overrides (e.g. ``{lr: 0.01, weight_decay: 0}``)
-        while every other parameter keeps the config defaults. Same optimizer
-        *class* for both groups (override to SGD via ``optim.optimizer._target_``).
-        Falls back to the base single-group behaviour otherwise.
+        """Put PKM parameters in their own param group when ``pkm_param_group``
+        is set and PKM layers exist (e.g. ``{lr: 0.01, weight_decay: 0}``); other
+        parameters keep the config defaults. Otherwise use the base implementation.
         """
         if not self._pkm_param_group:
             return super().configure_optimizers()
 
         pkm_params = self._pkm_parameters()
         if not pkm_params:
-            # pkm_param_group requested but no PKM layers installed — no-op split.
+            # No PKM layers installed: nothing to split.
             return super().configure_optimizers()
 
         pkm_ids = {id(p) for p in pkm_params}
@@ -807,30 +762,16 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self,
         ffn_layers: Union[str, Dict[str, Any]],
     ) -> List[str]:
-        """CONTROL for the post-hoc PKM experiments: re-initialise selected T5
-        feed-forward sub-layers *in place*, keeping them as ordinary FFNs.
+        """Re-initialize selected T5 feed-forward sub-layers in place (as FFNs).
 
-        This is the sanity check for "does PKM actually help?". The post-hoc PKM
-        recipe is: discard a trained FFN, put a fresh high-capacity module there,
-        fine-tune it on retain data. If doing the SAME thing with a freshly
-        initialised **FFN** matches it, then the result is about
-        *reinitialise-and-retrain-this-layer* and the PKM contributes nothing.
+        Control for post-hoc PKM installation. Uses the same selection format as
+        :meth:`_install_pkm_layers`. Must be called after ``load_state_dict``,
+        since the load would otherwise overwrite the fresh weights.
 
-        Uses the same selection format and the same module discovery as
-        :meth:`_install_pkm_layers`, so the two target byte-identical layers.
-
-        MUST be called AFTER ``load_state_dict``: unlike PKM params (which are
-        missing keys and keep their fresh init), FFN weights are present in the
-        checkpoint and would be overwritten by the load.
-
-        Returns the list of re-initialised module names; also stored on
+        Returns the list of re-initialized module names, also stored on
         ``self._reinit_ffn_module_names`` for ``update_scope='ffn_only'``.
         """
-        # Match BOTH FFN types. mlp_layers bloating (in __init__) replaces every
-        # T5LayerFF with a T5MultiLayerFF, and it runs AFTER the PKM install --
-        # so _install_pkm_layers legitimately sees T5LayerFF, but this method
-        # runs post-init (after the ckpt load) when only T5MultiLayerFF remain.
-        # Checking just T5LayerFF here found zero layers.
+        # After __init__, mlp_layers may have replaced T5LayerFF with T5MultiLayerFF.
         _FFN_TYPES = (
             transformers.models.t5.modeling_t5.T5LayerFF,
             T5MultiLayerFF,
@@ -851,7 +792,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         if not enc_ffns and not dec_ffns:
             raise ValueError(
                 "reinit_ffn_layers found no FFN sub-layers of types "
-                f"{[t.__name__ for t in _FFN_TYPES]} — the model layout changed."
+                f"{[t.__name__ for t in _FFN_TYPES]}."
             )
 
         enc_ids, dec_ids = _resolve_pkm_selection(
@@ -882,10 +823,9 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             n_params += sum(p.numel() for p in mod.parameters())
 
         self._reinit_ffn_module_names = list(target_names)
-        # NOTE: this module logs via the root `logging`, not a module-level `log`.
         logging.info(
-            "Re-initialised %d FFN sub-layers (%d tensors, %d params) -> "
-            "encoder blocks %s, decoder blocks %s [PKM CONTROL]",
+            "Re-initialized %d FFN sub-layers (%d tensors, %d params) -> "
+            "encoder blocks %s, decoder blocks %s",
             len(target_names), n_tensors, n_params, enc_ids, dec_ids,
         )
         return list(target_names)
@@ -917,14 +857,9 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             raise ValueError(
                 f"Unknown pkm_mode: {pkm_mode!r} (expected 'replace' or 'add')"
             )
-        # Collect the FFN module names per subtree, keyed by transformer block id.
-        # NOTE: named_modules() yields each module ONCE under its FIRST
-        # registration path. The huggingface encoder is registered as
-        # ``self.model`` by BaseModule before the ``self.encoder`` wrapper, so
-        # encoder FFNs appear as ``model.encoder.block.N...`` — NOT
-        # ``encoder.*``. Classify by substring, checking "decoder" first (the
-        # decoder path ``decoder.decoder.block.N...`` never contains
-        # "encoder"; the encoder path never contains "decoder").
+        # Collect FFN module names per subtree, keyed by block id. Encoder FFNs
+        # appear under ``model.encoder.block.N`` (first registration path), so
+        # classify by substring.
         enc_ffns: Dict[int, str] = {}
         dec_ffns: Dict[int, str] = {}
         for name, module in self.named_modules():
@@ -941,9 +876,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         enc_ids, dec_ids = _resolve_pkm_selection(
             pkm_layers, sorted(enc_ffns), sorted(dec_ffns)
         )
-        # Fail loudly on selections that don't exist — a silent partial install
-        # would mislabel the experiment (an 'all' over a subtree that matched no
-        # FFNs used to no-op silently).
+        # Reject selections that do not exist.
         missing_enc = [i for i in enc_ids if i not in enc_ffns]
         missing_dec = [i for i in dec_ids if i not in dec_ffns]
         if missing_enc or missing_dec:
@@ -975,14 +908,14 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         )
 
     def enable_adaptive_item_offset(self, stable_codes: int) -> None:
-        """Create per-item adaptive-position offsets (Stable-Adaptive IDs option 2).
+        """Create per-item offsets for the adaptive SID positions.
 
-        Adds a zero-initialised, per-item, per-adaptive-hierarchy offset that is
+        Adds a zero-initialized, per-item, per-adaptive-hierarchy offset that is
         injected into the item embeddings at the adaptive positions
         ``[stable_codes, num_hierarchies)``. The shared SID table is untouched,
-        so these offsets are the only item-local degrees of freedom. Idempotent.
+        so these offsets are item-local degrees of freedom. Idempotent.
 
-        Also precomputes a vectorised inverse map (SID code tuple -> item id)
+        Also precomputes a vectorized inverse map (SID code tuple -> item id)
         used to apply the offsets in the forward pass.
         """
         if self.adaptive_item_offset is not None:
@@ -1008,7 +941,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         )
 
         # Inverse map: encode each item's code tuple as a unique integer key and
-        # keep them sorted for vectorised lookup via searchsorted.
+        # keep them sorted for vectorized lookup via searchsorted.
         powers = codebook_size ** torch.arange(num_hierarchies, dtype=torch.long)
         codebooks = self.codebooks.to(torch.long).cpu()  # (num_items, num_hierarchies)
         keys_all = (codebooks * powers).sum(dim=1)  # (num_items,)
@@ -1045,12 +978,11 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             built with the normalize-in / normalize-residual recursion (see
             ``tracer_tokenizer.compute_residuals``). Frozen.
         centroids:  ``[L, K, D_z]`` codewords ``c_k^l``. Frozen.
-        tau: softmax temperature. The paper uses a narrow band (0.003-0.009);
-            smaller tau makes ``phi=0`` a closer match to the hard embedding.
+        tau: softmax temperature; smaller values bring the soft embedding at
+            ``phi=0`` closer to the hard one.
 
-        Note ``phi=0`` reproduces the stored *assignment* exactly (argmax), but
-        the soft embedding is only approximately the hard one -- that gap is the
-        soft tokenizer of Eq. 5 and is controlled by ``tau``, not a bug.
+        With ``phi=0`` the argmax reproduces the stored assignment exactly, while
+        the soft embedding only approximates the hard one.
         """
         if getattr(self, "tracer_phi", None) is not None:
             return
@@ -1075,15 +1007,8 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self.tracer_phi = nn.Parameter(
             torch.zeros(concept_item_ids.numel(), n_levels, K, device=device)
         )
-        # Precompute -||r - c||^2 ONCE, in float64, and cache it. Two reasons:
-        #  * correctness -- the unlearning entrypoints set matmul precision to
-        #    "medium", and cdist is matmul-backed, so recomputing this per step in
-        #    float32 flips the argmin for near-tied codewords (measured: phi=0
-        #    reproduced 98.59% of beauty-w16 codes instead of 100%);
-        #  * speed -- the distances do not depend on phi, so there is nothing to
-        #    recompute anyway.
-        # Kept in float64: [M, L, K] with M = |concept items| is tiny, and the
-        # float32 rounding is exactly what re-introduces the ties.
+        # Precompute -||r - c||^2 once in float64. The distances do not depend on
+        # phi, and lower precision can flip the argmin for near-tied codewords.
         r = residuals.to(device).double()                      # [M, L, D]
         c = centroids.to(device).double()                      # [L, K, D]
         neg_d2 = -torch.stack(
@@ -1096,8 +1021,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self.register_buffer(
             "_tracer_centroids", centroids.to(device).float(), persistent=False
         )
-        # Dense item_id -> phi row map (-1 for items TRACER must not touch), so
-        # the forward pass can look concept membership up without a search.
+        # Dense item_id -> phi row map (-1 for non-concept items).
         num_items = int(self.codebooks.size(0))
         row_of = torch.full((num_items,), -1, dtype=torch.long, device=device)
         row_of[concept_item_ids.to(device).long()] = torch.arange(
@@ -1107,13 +1031,9 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         # The inverse code->item map is shared with the adaptive-offset path.
         if not hasattr(self, "_adaptive_sorted_keys"):
             self._build_code_to_item_index()
-        # Keep `tracer_phi` OUT of the saved state_dict. It is a training-time
-        # latent of the tokenizer, not a model weight: the reassignment it
-        # encodes is committed to the semantic ids, not to theta. Leaving it in
-        # would make the unlearned checkpoint fail every strict load downstream
-        # (post-unlearn eval, inference) with an unexpected-key error.
-        # NB: a state_dict post-hook must mutate in place and return None --
-        # returning the dict raises "state_dict post-hook must return None".
+        # Exclude `tracer_phi` from the state_dict: the reassignment is committed
+        # to the semantic IDs, and keeping it would break strict loading. The
+        # post-hook must mutate in place and return None.
         def _drop_tracer_phi(module, state, prefix, local_metadata):
             state.pop(prefix + "tracer_phi", None)
 
@@ -1127,23 +1047,16 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
     def tracer_assignment_scores(self) -> torch.Tensor:
         """``-||r_i^l - c_k^l||^2 + phi_{i,k}^l`` for every concept item.
 
-        ``[M, L, K]``. Shared by the soft mixture and the hard commit, so both
-        read exactly the same scores.
-
-        The distance term is the cached float64 ``_tracer_neg_d2`` (see
-        ``enable_token_reassignment``); only ``phi`` varies during training, so
-        recomputing ``cdist`` every step would be both wasteful and -- under the
-        entrypoints' "medium" matmul precision -- numerically unstable.
+        ``[M, L, K]``. Shared by the soft mixture and the hard commit. The
+        distance term is the cached float64 ``_tracer_neg_d2``.
         """
         return self._tracer_neg_d2 + self.tracer_phi
 
     def commit_token_reassignment(self) -> torch.Tensor:
-        """Hard ``argmax_k q_phi`` per concept item -- ``[M, L]`` new codes.
+        """Hard ``argmax_k q_phi`` per concept item, as ``[M, L]`` new codes.
 
-        Inference-time assignment. Softmax is monotone, so this is temperature
-        free. Callers must re-derive the trailing dedup digit and rewrite the SID
-        tensor; stale codes silently break SH/ASI/TPM, which map targets through
-        ``semantic_id_path``.
+        Independent of the temperature. Callers must re-derive the trailing
+        dedup digit and rewrite the SID tensor used at evaluation.
         """
         with torch.no_grad():
             return self.tracer_assignment_scores().argmax(dim=-1)
@@ -1155,8 +1068,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
 
         No-op unless reassignment is enabled and ``raw_codes`` is aligned to full
         ``num_hierarchies``-token item blocks (skipped during incremental
-        generation, where item identity is not yet determined) -- the same guard
-        the adaptive-offset path uses.
+        generation, where item identity is not yet determined).
         """
         if getattr(self, "tracer_phi", None) is None:
             return embeds
@@ -1196,11 +1108,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             return embeds
 
         table = self.get_embedding_table(table_name="encoder").weight
-        # The cached distances are float64 (see enable_token_reassignment), so the
-        # softmax comes out float64 too; the embedding table is float32, and
-        # `q @ table` then dies with "expected mat1 and mat2 to have the same
-        # dtype". Cast AFTER the softmax so the exact scores still decide the
-        # weights, and only the mixture is done in the table's precision.
+        # Softmax in float64, then cast to the embedding table's dtype.
         q = torch.softmax(
             self.tracer_assignment_scores() / self._tracer_tau, dim=-1
         ).to(table.dtype)                                          # [M, L, K]
@@ -1211,39 +1119,27 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             dim=1,
         )                                                          # [M, L, D]
 
-        # `batch`/`seq_len`/`n_items` come from raw_codes, but the view is applied
-        # to `embeds`. When the two carry different sequence lengths (the encoder
-        # is handed shifted/decorated ids whose length need not equal input_ids)
-        # the view silently reshapes to the wrong item count and the masked
-        # assignment then fails with a shape mismatch. Check explicitly.
+        # Shapes come from raw_codes; skip if embeds is not aligned with them.
         if embeds.dim() != 3 or embeds.size(0) != batch or embeds.size(1) != seq_len:
             if not getattr(self, "_tracer_align_warned", False):
                 self._tracer_align_warned = True
                 _TRACER_LOG.warning(
                     "[tracer] skipping soft-SID injection: embeds %s is not aligned "
-                    "to raw_codes %s, so item blocks cannot be identified. phi will "
-                    "receive NO gradient through this call site.",
+                    "to raw_codes %s; phi receives no gradient through this call.",
                     tuple(embeds.shape),
                     tuple(raw_codes.shape),
                 )
             return embeds
 
         emb_items = embeds.view(batch, n_items, num_hierarchies, embeds.size(-1)).clone()
-        # Index dims 0/1 with EXPLICIT integer tensors, never with the 2-D bool
-        # mask. `emb_items[sel, :L, :]` looks equivalent but is not: in a mixed
-        # basic/advanced index tuple torch applies the SLICE first, so the mask is
-        # then validated against the sliced shape [b, L, H, d] and raises
-        #   "shape of the mask [b, n_items] ... does not match the shape of the
-        #    indexed tensor [b, L, H, d] at index 1"
-        # whenever n_items != L. That is what made TRACER die at every step; it is
-        # an indexing-semantics bug, NOT the sequence-length misalignment it looks
-        # like (embeds and raw_codes are in fact aligned here).
+        # Use integer indices rather than a boolean mask, which does not combine
+        # correctly with the trailing slice.
         b_idx, i_idx = (rows >= 0).nonzero(as_tuple=True)          # [n_sel] each
         emb_items[b_idx, i_idx, : self._tracer_levels, :] = soft[rows[b_idx, i_idx]]
         return emb_items.view(batch, seq_len, embeds.size(-1))
 
     def _build_code_to_item_index(self) -> None:
-        """Build the vectorised SID-tuple -> item-id map used by the injectors."""
+        """Build the vectorized SID-tuple -> item-id map used by the injectors."""
         num_hierarchies = int(self.num_hierarchies)
         codebook_size = int(self.num_embeddings_per_hierarchy)
         device = self.item_sid_embedding_table_encoder.weight.device
@@ -1347,8 +1243,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         Like :meth:`_sequence_log_prob` but (a) the target semantic-id codes are
         supplied explicitly (any item, not just the batch label) and (b) the
         result is kept per-sample (shape ``[B]``) rather than averaged. Used by
-        the coherence loss to score arbitrary neighbour items against a given
-        history.
+        the coherence loss to score neighbor items against a given history.
 
         ``future_ids`` are raw per-hierarchy codes of shape ``[B, num_hierarchies]``.
         """
@@ -1379,46 +1274,28 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         loss_type: str = "nll",
         mass_cap: float = 0.999,
     ) -> torch.Tensor:
-        """Coherence loss ``L_n``, prefix-neighbour variant. Two forms.
+        """Coherence loss ``L_n`` over prefix neighbors of the forget target.
 
-        ``loss_type="nll"`` — TRACER Eq. 9 as originally ported:
+        ``loss_type="nll"``: per-neighbor negative log-likelihood,
 
-            L_n = -1/K Σ_{(H_f, i_T) ∈ batch} Σ_{i_p ∈ P(i_T)}
-                        Σ_ℓ log p_θ(s^p_ℓ | 𝒯(H_f), s^p_{<ℓ})
+            L_n = -1/K sum_{(H_f, i_T) in batch} sum_{i_p in P(i_T)}
+                        sum_l log p(s^p_l | T(H_f), s^p_{<l})
 
-        ``loss_type="mass"`` — neighbourhood probability mass (the Step-4
-        "probability mass control" form):
+        ``loss_type="mass"``: negative log of the neighborhood probability mass,
 
-            L_n = -1/B Σ_{(H_f, i_T) ∈ batch}
-                        log Σ_{i_p ∈ P(i_T)} p_θ(s^p | 𝒯(H_f))
+            L_n = -1/B sum_{(H_f, i_T) in batch}
+                        log sum_{i_p in P(i_T)} p(s^p | T(H_f))
 
-        ``loss_type="suppress"`` — the sign-flipped counterpart of ``mass``, for
-        the *sensitive-item* scenario rather than spam repair:
+        ``loss_type="suppress"``: drains the neighborhood instead (for sensitive
+        items), bounded by ``-log(1 - mass_cap)``; use with ``lambda_n > 0``,
 
-            L_n = -1/B Σ_{(H_f, i_T) ∈ batch}
-                        log(1 - Σ_{i_p ∈ P(i_T)} p_θ(s^p | 𝒯(H_f)))
+            L_n = -1/B sum_{(H_f, i_T) in batch}
+                        log(1 - sum_{i_p in P(i_T)} p(s^p | T(H_f)))
 
-        Here the neighbourhood must be **drained**, not repaired: near-duplicates
-        of a banned item must not be promoted into the hole it leaves. Bounded
-        below by 0 (no neighbourhood mass) and rising to ``-log(1 - mass_cap)``
-        as the neighbourhood takes all the mass. Use it with ``lambda_n > 0``;
-        expressing it as a *negative* ``lambda_n`` on ``nll``/``mass`` instead
-        gives an objective unbounded below, which diverges.
-
-        Both condition on the *forget history* ``H_f`` and score (teacher-forced)
-        the semantic-id codes of the neighbours ``i_p`` of the forget target
-        ``i_T``, so that suppressed probability mass flows to coherent nearby
-        items instead of degenerating.
-
-        Prefer ``mass``. The ``nll`` form sums a separate ``-log p`` per
-        neighbour, so its optimum requires all ``C`` neighbours to *each* have
-        probability 1 — infeasible for ``C > 1``. Its gradient therefore never
-        vanishes and a large ``lambda_n`` acts as constant distortion pressure on
-        the whole next-token distribution (measured: ``lambda_n=10`` costs ~2
-        NDCG@10 points across every stratum). The ``mass`` form aggregates the
-        neighbours with ``logsumexp`` first, so it is a proper log-probability
-        bounded below by 0, is satisfiable (the neighbourhood collectively
-        holding all the mass), and its gradient vanishes at the optimum.
+        All forms condition on the forget history ``H_f`` and teacher-force the
+        semantic IDs of the neighbors ``i_p`` of the forget target ``i_T``. The
+        ``mass`` form is satisfiable and its gradient vanishes at the optimum,
+        whereas the ``nll`` optimum is infeasible for more than one neighbor.
 
         Parameters
         ----------
@@ -1427,14 +1304,14 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             (the history ``H_f``) is used here.
         neighbor_sids:
             ``[B, C, num_hierarchies]`` raw per-hierarchy codes of each sample's
-            neighbours (``C = neighborhood_count``). Padding slots may hold any
+            neighbors (``C = neighborhood_count``). Padding slots may hold any
             in-range code; they are excluded via ``neighbor_mask``.
         neighbor_mask:
-            ``[B, C]`` (0/1) marking valid neighbour slots. Samples/slots without
-            an eligible neighbour are masked out and contribute to neither the
-            numerator nor the normaliser.
+            ``[B, C]`` (0/1) marking valid neighbor slots. Samples/slots without
+            an eligible neighbor are masked out and contribute to neither the
+            numerator nor the normalizer.
 
-        Returns the scalar ``L_n``; ``0`` when no valid neighbour exists.
+        Returns the scalar ``L_n``; ``0`` when no valid neighbor exists.
         """
         loss_type = str(loss_type).lower()
         if loss_type not in ("nll", "mass", "suppress"):
@@ -1470,44 +1347,22 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             )
 
         if loss_type == "nll":
-            # -1/K with K = number of valid (sample, neighbour) terms.
+            # -1/K with K = number of valid (sample, neighbor) terms.
             finite = torch.where(
                 neighbor_mask > 0, log_probs, torch.zeros_like(log_probs)
             )
             return -finite.sum() / n_valid.clamp(min=1.0)
 
-        # mass / suppress: logsumexp over each sample's valid neighbours, averaged
-        # over the samples that have at least one. A row with no valid slot is all
-        # -inf; excluding it here is what keeps the term finite.
+        # mass / suppress: logsumexp over each sample's valid neighbors, averaged
+        # over samples with at least one valid neighbor.
         row_has_neighbor = neighbor_mask.sum(dim=1) > 0
         row_mass_logp = torch.logsumexp(log_probs, dim=1)
         n_rows = row_has_neighbor.sum().to(row_mass_logp.dtype)
 
         if loss_type == "suppress":
-            # L_n = -log(1 - sum_j p_j), the sign-flipped counterpart of `mass`.
-            #   -> 0     as the neighbourhood mass -> 0   (nothing to suppress)
-            #   -> +inf  as it -> 1                       (all mass on neighbours)
-            # Minimising it (with lambda_n > 0) DRAINS the neighbourhood, which is
-            # what sensitive/harmful item deletion needs: near-duplicates of a
-            # banned item must not be promoted into the hole it leaves. Contrast
-            # `mass`, which deliberately pushes mass onto neighbours -- correct for
-            # spam repair, catastrophic here.
-            #
-            # Do NOT express this as a negative lambda_n: negating `nll`/`mass`
-            # gives an objective unbounded below, so the run diverges silently.
-            #
-            # Numerics. The bound is applied by SHRINKING the mass, not by
-            # clamping it:
-            #     L = -log(1 - (1-eps)*exp(m)),   eps = 1 - mass_cap
-            # Clamping m at log(mass_cap) would also bound the loss, but `clamp`
-            # has zero gradient in the saturated region -- i.e. it would kill the
-            # signal exactly when the neighbourhood holds ALL the mass, which is
-            # the case suppression exists for. Shrinking keeps dL/dm > 0
-            # everywhere while still bounding the loss at -log(eps) and the
-            # gradient at ~(1-eps)/eps.
-            # log1p rather than log(1 - x): at x ~ 1e-7 the naive form loses all
-            # precision. The clamp at 0 only absorbs float error (mass <= 1
-            # holds mathematically); it never binds in the working range.
+            # L_n = -log(1 - (1 - eps) * exp(m)) with eps = 1 - mass_cap. Scaling
+            # the mass (instead of clamping) bounds the loss while keeping a
+            # nonzero gradient when the neighborhood holds all the mass.
             eps = 1.0 - float(mass_cap)
             m = row_mass_logp.clamp(max=0.0)
             per_row = -torch.log1p(-(1.0 - eps) * torch.exp(m))
@@ -1529,13 +1384,9 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         """Symmetric-KL loss pushing the model's next-token distribution toward
         uniform on the given (forget) batch.
 
-        TIGER adaptation of ERASE's
-        ``Trainer.unlearn_iterative_uniform_distribution``: where the reference
-        drives the *item* softmax toward uniform via
-        ``KLDiv(log p_model, uniform)``, TIGER is a token-generative model, so
-        we drive each hierarchy's next-token softmax (over the codebook
-        vocabulary of size ``num_embeddings_per_hierarchy``) toward uniform and
-        average across hierarchies. This is the Fanchuan stage-1 objective.
+        Each hierarchy's next-token softmax over the codebook vocabulary is
+        pushed toward uniform and the KL terms are averaged across hierarchies.
+        Used as the Fanchuan stage-1 objective.
         """
         fut_ids = None
         for label in label_data.labels:
@@ -1557,7 +1408,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             probs = torch.nn.functional.softmax(logits, dim=-1)
             uniform = torch.ones_like(probs) / probs.size(-1)
             # KLDivLoss expects log-probabilities as the first argument and
-            # plain probabilities as the target (ERASE ``kl_loss_sym``).
+            # plain probabilities as the target.
             loss = loss + kl(torch.log(probs + 1e-20), uniform)
         return loss / self.num_hierarchies
 
@@ -1594,18 +1445,14 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         return emb.mean(dim=1)
 
     def _item_encoder_representation(self, item_sid_rows: torch.Tensor) -> torch.Tensor:
-        """Pooled encoder output for each item, in the SAME representation space
-        as :meth:`_pooled_user_representation` (``r_u``).
+        """Pooled encoder output for each item, in the same space as
+        :meth:`_pooled_user_representation` (``r_u``).
 
         Each item's semantic-id row is encoded as a length-1 history (no user
-        token), and the encoder output is masked-mean-pooled — exactly the
-        pooling used for ``r_u`` — so item and user representations are
-        comparable for the ``L_sep`` contrastive similarity.
+        token) and mean-pooled, so it is comparable to ``r_u`` in ``L_sep``.
         """
         device = next(self.parameters()).device
-        # SID rows must be integer indices (labels may arrive as float), and the
-        # attention mask must be integer too: encoder_forward_pass multiplies the
-        # SID indices by the mask, so a float mask would corrupt the dtype.
+        # SID rows and the attention mask must be integer tensors.
         item_sid_rows = item_sid_rows.to(device).long()
         if item_sid_rows.dim() == 1:
             item_sid_rows = item_sid_rows.unsqueeze(0)
@@ -1632,8 +1479,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                            + sum_f exp(log p(s_i_f | h_u)/T) ) ]
 
         Positive = the batch label; negatives = ``neg_ids`` scored against the
-        SAME retain histories. See :meth:`compute_sep_loss` for why the negative
-        set must stay small. Costs ``1 + len(neg_ids)`` teacher-forced passes.
+        same retain histories. Costs ``1 + len(neg_ids)`` teacher-forced passes.
         """
         model_input, label_data = retain_batch
         device = next(self.parameters()).device
@@ -1678,80 +1524,48 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         loss_type: str = "cosine",
         gen_temperature: float = 1.0,
     ) -> torch.Tensor:
-        """Separation loss ``L_sep'`` (per-user, all-positives form).
+        """Separation loss ``L_sep'`` (per-user InfoNCE against the forget items).
 
-        ``loss_type`` selects the SCORING FUNCTION inside the same InfoNCE shape:
+        ``loss_type`` selects the score inside the InfoNCE:
 
-        ``cosine`` (default, back-compatible)
+        ``cosine`` (default)
             score = ``sim(r_u, z_i)``, cosine between pooled-encoder vectors.
-            Acts on a representation geometry the decoder never reads, so the
-            model can satisfy it by rearranging embeddings WITHOUT changing what
-            it generates. Measured: a 10,000x sweep of lambda_s moves SH@10 by
-            <1% at the operating point.
 
         ``generative``
-            score = ``log p_theta(s_i | h_u)``, the model's own sequence
-            log-probability (sum of per-hierarchy log-probs). At
-            ``gen_temperature=1`` the objective reads literally as
+            score = ``log p(s_i | h_u)``, the model's sequence log-probability.
+            At ``gen_temperature=1`` the loss is
 
                 -log [ p(s_i+ | h_u) / ( p(s_i+ | h_u) + sum_f p(s_i_f | h_u) ) ]
 
-            i.e. "the true next item must outrank the spam items in the model's
-            own generation distribution" -- exactly what SH@k measures. Acts on
-            the next-token distribution, the same place ``L_forget`` acts, and is
-            complementary to it: ``L_forget`` suppresses the target on FORGET
-            histories, this enforces the ranking on RETAIN histories.
+            The positive is always the label and ``positives`` is ignored. The
+            negative set should stay small: with many negatives the loss
+            approaches the retain cross-entropy, and each negative costs one
+            teacher-forced pass.
 
-            The positive is ALWAYS the label (the next item actually consumed);
-            ``positives`` is ignored, since a generative score for an item
-            already inside ``h_u`` is not what generation predicts.
+        ``temperature`` applies to cosine logits and ``gen_temperature`` to
+        log-probability logits.
 
-            Keep the negative set SMALL (``sep_negatives=forget_target_only``).
-            Expanding it toward the full catalog makes the denominator approach
-            the model's own normaliser, so the loss degenerates into
-            ``-log p(s_i+ | h_u)`` = the retain cross-entropy, diluting the
-            spam-specific signal to nothing. Cost is ``1 + |N|`` teacher-forced
-            decoder passes, so a large ``N`` is also expensive.
+        ``positives`` selects ``i+`` for the cosine form:
 
-        NOTE the two temperatures are deliberately separate. Cosine logits are
-        bounded to +-1/``temperature`` by L2 normalisation; sequence log-probs are
-        unbounded below, so reusing 0.07 there would put the logits in a wildly
-        different regime. ``gen_temperature`` defaults to 1.0, which is also the
-        only value at which the probability reading above holds.
-
-        ``positives`` selects what plays the role of ``i⁺``:
-
-        ``history`` (default, back-compatible)
-            Every non-padded item in the user's own history. NOTE this is
-            tautological: ``r_u`` is *defined* as the mean of those same items'
-            representations, so ``sim(r_u, z_{i⁺})`` is a mean vector scored
-            against its own constituents — high by construction and nearly
-            constant. The positive term therefore contributes almost no gradient
-            and the loss degenerates into one-sided repulsion from ``I_f``.
+        ``history`` (default)
+            Every non-padded item in the user's history. Since ``r_u`` is the
+            mean of these items, the positive term carries little gradient.
 
         ``label``
-            The batch's LABEL item (the next item the user actually consumed).
-            A genuine positive: it is what the model has to predict, and it is
-            not part of ``r_u``. Makes the contrastive term non-trivial.
+            The batch label item (the next consumed item), which is not part of
+            ``r_u``.
 
-        Samples over retain users (one per batch row, visited once per epoch),
-        pools the per-item encoder representations of every item in a user's
-        history into a single user vector ``r_u``, and then pushes ``r_u``
-        toward each of that user's own (positive) history items ``i⁺`` and away
-        from the forget items ``I_f``:
+        For the cosine form, ``r_u`` is the mean of the normalized per-item
+        encoder representations of the user's history
+        (:meth:`_item_encoder_representation`), and
 
-            L_sep' = mean_{i⁺ ∈ history(u)}
-                -log( exp(sim(r_u, z_i⁺)/τ)
-                      / (exp(sim(r_u, z_i⁺)/τ)
-                         + Σ_{i_f ∈ I_f} exp(sim(r_u, z_i_f)/τ)) )
+            L_sep' = mean_{i+ in history(u)}
+                -log( exp(sim(r_u, z_i+)/tau)
+                      / (exp(sim(r_u, z_i+)/tau)
+                         + sum_{i_f in I_f} exp(sim(r_u, z_i_f)/tau)) )
 
-        ``r_u`` is the average pooling of the per-item encoder representations of
-        the user's history items, and the positives ``z_i⁺`` and the forget
-        negatives ``z_i_f`` live in that SAME pooled-encoder space
-        (:meth:`_item_encoder_representation`). Negatives are exactly
-        ``negative_item_ids`` (the forget set ``I_f`` by default) — no neighbors
-        are added. The loss averages over a user's positive items and then over
-        the users in the batch.
+        Negatives are exactly ``negative_item_ids``. The loss averages over a
+        user's positives and then over users in the batch.
         """
         model_input, label_data = retain_batch
         device = next(self.parameters()).device
@@ -1776,7 +1590,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 retain_batch, neg_ids=neg_ids, temperature=float(gen_temperature)
             )
 
-        # --- history item SID rows: [B, n_items, H] (raw codes) ---
+        # history item SID rows: [B, n_items, H] (raw codes)
         # transformed_sequences uses the original feature name ("sequence_data"),
         # not the mapped name ("input_ids"); try the raw key first.
         input_ids = model_input.transformed_sequences.get("sequence_data")
@@ -1786,13 +1600,8 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             )
         input_ids = input_ids.to(device).long()
         mask = model_input.mask.to(device)
-        # Zero padded positions to an in-range code: _item_encoder_representation
-        # encodes each item with an all-ones attention mask, so it does NOT apply
-        # the usual ``* attention_mask`` that zeroes padded SID codes before the
-        # per-hierarchy offset is added. Without this, padded tokens (whose raw
-        # value can exceed the codebook size) overflow the embedding table and
-        # trigger a CUDA index assert. Padded items are excluded from r_u and the
-        # loss via ``item_valid`` below, so forcing them to code 0 is harmless.
+        # Zero padded positions so they map to an in-range code; padded items are
+        # excluded from r_u and the loss via ``item_valid``.
         keep = (mask > 0).long()
         input_ids = input_ids * keep
 
@@ -1810,18 +1619,18 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             (mask.view(bsz, n_items, n_hier) > 0).sum(dim=-1) == n_hier
         ).float()  # [B, n_items]
 
-        # --- per-item encoder representations z_i: [B, n_items, d] ---
+        # per-item encoder representations z_i: [B, n_items, d]
         z_items = torch.nn.functional.normalize(
             self._item_encoder_representation(item_sids.reshape(bsz * n_items, n_hier)),
             dim=-1,
         ).view(bsz, n_items, -1)
 
-        # --- r_u: average pooling of the user's item representations: [B, d] ---
+        # r_u: average pooling of the user's item representations: [B, d]
         n_valid = item_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
         r_u = (z_items * item_valid.unsqueeze(-1)).sum(dim=1) / n_valid
         r_u = torch.nn.functional.normalize(r_u, dim=-1)  # [B, d]
 
-        # --- forget negatives z_f: [N_neg, d] ---
+        # forget negatives z_f: [N_neg, d]
         neg_sids = self.codebooks[torch.tensor(neg_ids)].to(device)
         z_neg = torch.nn.functional.normalize(
             self._item_encoder_representation(neg_sids), dim=-1
@@ -1832,9 +1641,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         neg_lse = torch.logsumexp(neg_logits, dim=-1)             # [B]
 
         if positives == "label":
-            # One genuine positive per user: the item they actually consumed next.
-            # Unlike the history positives it is NOT a constituent of r_u, so the
-            # numerator carries real gradient.
+            # One positive per user: the next consumed item (not part of r_u).
             fut_ids = None
             for key in label_data.labels:
                 fut_ids = label_data.labels[key].reshape(bsz, -1)
@@ -1845,9 +1652,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             )                                                      # [B, d]
             pos_sim = (r_u * z_pos).sum(dim=-1) / tau              # [B]
             per_user = torch.logaddexp(pos_sim, neg_lse) - pos_sim  # [B]
-            # Every row has exactly one label, so no per-user averaging is needed;
-            # keep the same "users with >=1 valid history item" gate as the
-            # history branch so r_u is always well defined.
+            # Only users with at least one valid history item contribute.
             has_pos = (item_valid.sum(dim=1) > 0).float()
             return (per_user * has_pos).sum() / has_pos.sum().clamp(min=1.0)
 
@@ -1943,14 +1748,14 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         """Merge each item's ``num_hierarchies`` token embeddings into ``k_out``
         compact vectors.
 
-        Input-side aggregation for long RQ IDs (options 1 & 2). Reshapes the flat
+        Input-side aggregation for long RQ IDs. Reshapes the flat
         per-token embeddings ``[B, seq_len, d]`` into item blocks
         ``[B, n_items, num_hierarchies, d]``, applies ``self.item_token_merger``
         to get ``[B, n_items, k_out, d]`` (``k_out=1`` for mean pooling, ``k`` for
         the attentive merger), and flattens the item/latent axes back to a flat
         encoder sequence ``[B, n_items * k_out, d]``. The per-token attention mask
         is collapsed to a per-item mask (an item is valid iff any of its tokens
-        attend -- padding is applied whole-item) and repeated across the item's
+        attend; padding is applied per item) and repeated across the item's
         ``k_out`` output vectors.
 
         Returns ``(merged_embeddings, item_attention_mask)``.
@@ -2007,23 +1812,19 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         inputs_embeds_for_encoder = self.get_embedding_table(table_name="encoder")(
             shifted_sids
         )
-        # Per-item adaptive offsets (option 2); no-op unless enabled. Applied
-        # before sep-token injection / item-token merging so item blocks are
-        # still aligned to raw_codes.
+        # Per-item adaptive offsets; no-op unless enabled. Applied before
+        # sep-token injection or item-token merging so item blocks stay aligned.
         inputs_embeds_for_encoder = self._inject_adaptive_offsets(
             inputs_embeds_for_encoder, input_ids
         )
-        # TRACER soft token reassignment; no-op unless enabled. Same alignment
-        # requirement as the offsets above, so it goes at the same point.
+        # TRACER soft token reassignment; no-op unless enabled.
         inputs_embeds_for_encoder = self._inject_soft_sid_embeddings(
             inputs_embeds_for_encoder, input_ids
         )
 
         if self.item_token_merger is not None:
-            # Input-side aggregation: collapse each item's num_hierarchies token
-            # embeddings into a single encoder input vector (options 1 & 2). This
-            # replaces the per-token + separator-token layout, so no sep token is
-            # injected in this branch.
+            # Input-side aggregation replaces the per-token + separator layout,
+            # so no sep token is injected here.
             (
                 inputs_embeds_for_encoder,
                 attention_mask,
@@ -2048,7 +1849,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             # so we only need to take the first column
             user_id = user_id[:, 0]
 
-            # TODO (clark): here we assume remainder hashing, which is different from LSH hashing used in TIGER.
+            # Remainder hashing (TIGER uses LSH hashing).
             user_embeds = self.user_embedding(
                 torch.remainder(user_id, self.user_embedding.num_embeddings)
             )
@@ -2085,7 +1886,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self,
         attention_mask: Optional[
             torch.Tensor
-        ] = None,  # TODO (clark): in the future we should support variable length semantic id
+        ] = None,  # fixed-length semantic IDs only
         future_ids: Optional[torch.Tensor] = None,
         encoder_output: Optional[torch.Tensor] = None,
         attention_mask_for_encoder: Optional[torch.Tensor] = None,
@@ -2116,8 +1917,8 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             inputs_embeds_for_decoder = self.get_embedding_table(table_name="decoder")(
                 shifted_future_sids
             )
-            # Per-item adaptive offsets (option 2); no-op unless enabled. Skipped
-            # during incremental generation (future_ids not a full item block).
+            # Per-item adaptive offsets; no-op unless enabled or during
+            # incremental generation.
             inputs_embeds_for_decoder = self._inject_adaptive_offsets(
                 inputs_embeds_for_decoder, future_ids
             )
@@ -2393,9 +2194,8 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
 
         Same forward / label handling as :meth:`model_step` (whose scalar loss
         is exactly ``sum`` of these), but keeps each RQ-code position's loss term
-        separate. Used by the RQ-ID position diagnostics to attribute gradient
-        signal to individual semantic-ID positions: ``decoder_mlp[h]`` feeds only
-        ``L_h``, so ``grad(L_h, params)`` isolates position ``h``'s contribution.
+        separate, so gradients can be attributed to individual semantic-ID
+        positions.
         """
         fut_ids = None
         for label in label_data.labels:
@@ -2522,7 +2322,6 @@ class SemanticIDEncoderModule(torch.nn.Module):
 
         self.num_embeddings_per_hierarchy = num_embeddings
         self.embedding_dim = embedding_dim
-        # TODO (clark): take care of chunky position encoding
 
         # deleting embedding table in the encoder to save space
         delete_module(self.encoder, "embed_tokens")
@@ -2632,8 +2431,7 @@ class T5LayerFFWithPKM(nn.Module):
         return ffn_out + self.dropout(memory_out)
 
 
-# TODO (clark): this is a T5 specific implementation
-# this class is used for bloating the mlp layers in the encoder and decoder
+# T5-specific module used for bloating the mlp layers in the encoder and decoder;
 # original T5 implementation only has one layer
 class T5MultiLayerFF(nn.Module):
     def __init__(self, config: T5Config, num_layers: int):

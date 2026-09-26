@@ -1,22 +1,14 @@
 """Product-Key Memory (PKM) layer.
 
-Ported from the minimalist reference implementation shipped with Facebook's
-XLM repo (``XLM/PKM-layer.ipynb``), described in
+Port of the minimalist reference implementation from the XLM repository
+(``XLM/PKM-layer.ipynb``) for "Large Memory Layers with Product Keys"
+(Lample et al., NeurIPS 2019, https://arxiv.org/abs/1907.05242).
 
-    Lample, Sablayrolles, Ranzato, Denoyer, Jegou.
-    "Large Memory Layers with Product Keys", NeurIPS 2019.
-    https://arxiv.org/abs/1907.05242
-
-The reference notebook already implements the vectorized ``pq_fast`` style
-retrieval used in ``XLM/xlm/model/memory/memory.py`` (``HashingMemoryProductFast``):
-each head's query is split in half, the top-``knn`` sub-keys are found for each
-half with a plain ``topk`` (no FAISS dependency), and the two candidate lists are
-combined with a cartesian product before a final top-``knn`` selection.
-
-A PKM maps ``R^input_dim -> R^output_dim`` through a large, sparse key-value
-store holding ``n_keys ** 2`` value vectors, of which only ``heads * knn`` are
-read (and gradient-updated) per token. It is a drop-in, high-capacity
-replacement for a transformer feed-forward sub-layer.
+Each head's query is split in half, the top-``knn`` sub-keys are found for each
+half with ``topk``, and the two candidate lists are combined with a cartesian
+product before a final top-``knn`` selection. The memory holds ``n_keys ** 2``
+value vectors, of which ``heads * knn`` are read per token. It can replace or
+augment a transformer feed-forward sub-layer.
 """
 
 import math
@@ -47,55 +39,28 @@ class HashingMemory(nn.Module):
         knn: number of memory slots read per head (k nearest sub-keys per half).
         n_keys: number of sub-keys per half. The memory holds ``n_keys ** 2``
             values, so this is the dominant capacity / parameter-count knob.
-        query_batchnorm: apply BatchNorm1d to the queries. Improves usage of the
-            memory, but corrupts the running stats when batches contain padding
-            tokens of varying counts -- keep ``False`` for TIGER unless training
-            on padding-free fixed-size batches.
+        query_batchnorm: apply BatchNorm1d to the queries. Its running stats
+            are affected by variable padding, so keep ``False`` for TIGER.
         input_dropout / query_dropout / value_dropout: dropout rates.
         sparse: use sparse gradients for the value ``EmbeddingBag`` (requires a
             sparse-capable optimizer, e.g. SparseAdam).
         value_init: ``normal`` (default, ``N(0, v_dim**-0.5)``) or ``zeros``.
-            ``zeros`` makes the layer an exact no-op at step 0. For a POST-HOC
-            ``add`` adapter this is the right choice -- the model starts exactly
-            at its trained behaviour and the memory learns a pure correction
-            (the LoRA convention). For post-hoc ``replace`` it means the FFN is
-            *deleted* rather than *randomised*, which is a cleaner starting point
-            for a rebuild than injecting noise.
-            CAVEAT: with all-zero values the layer output is 0 AND
-            ``d(output)/d(scores) = 0``, so ``query_proj`` and ``keys`` receive
-            NO gradient at step 0 -- routing only starts learning once the values
-            become non-zero. Since PKM collapse is a ROUTING failure (see
-            WORKFLOW.md section H), prefer a small non-zero scale over exact
-            zeros when the memory must also learn to route (i.e. trained-in).
+            ``zeros`` makes the layer a no-op at initialization, but then
+            ``query_proj`` and ``keys`` receive no gradient until the values
+            become non-zero.
         value_init_scale: multiplier on the ``normal`` std. ``1.0`` reproduces
-            the reference init; e.g. ``0.01`` gives a near-no-op start that still
-            keeps the routing gradients alive.
-        query_norm: anti-collapse normalisation of the query, applied BEFORE the
-            product-key lookup. ``none`` (default) reproduces prior behaviour.
-
-            ``batchnorm`` normalises each query dimension across the batch with
-            ``track_running_stats=False``, so batch statistics are used at train
-            AND eval time. This is the mechanism Lample et al. use to spread
-            memory usage, and it is the ONLY one that removes a component shared
-            by every token -- exactly the failure we measured (every token and
-            head selecting the identical 32 slots). ``query_batchnorm=True``
-            (the stock BatchNorm) was avoided here because its RUNNING stats are
-            corrupted by TIGER's variable padding; dropping the running stats
-            removes that objection at the cost of making eval batch-composition
-            dependent (deterministic for our fixed eval batches).
-
-            ``layernorm`` normalises per token across dims. Cheaper and
-            padding-safe, but it CANNOT remove a token-shared constant
-            direction, so it is the weaker option for this failure mode.
+            the reference init; small values give a near-no-op start that still
+            provides routing gradients.
+        query_norm: normalization of the query before the product-key lookup.
+            ``none`` (default), ``batchnorm`` (per-dimension batch statistics
+            with ``track_running_stats=False``, used at train and eval time,
+            which spreads memory usage) or ``layernorm`` (per token).
         warmup_knn / warmup_steps: for the first ``warmup_steps`` forward passes
             in training mode, read ``warmup_knn`` slots per head instead of
-            ``knn``. Rationale: at init the values are random, so which slots the
-            router picks barely changes the loss -> almost no gradient pressure on
-            the query projection -> it collapses to a near-constant, after which
-            only the surviving slots ever train and the collapse self-reinforces.
-            Touching many more slots early makes slot CONTENTS meaningful, so
-            routing choices start to matter while the router can still move.
-            ``warmup_knn=0`` (default) disables this.
+            ``knn``, which spreads gradient over more slots early and helps
+            avoid routing collapse. ``warmup_knn=0`` (default) disables this.
+        warmup_noise: std multiplier of Gaussian noise added to sub-key scores
+            during the warm-up window (noisy top-k gating).
     """
 
     def __init__(
@@ -156,21 +121,17 @@ class HashingMemory(nn.Module):
         self.value_init = vi
         self.value_init_scale = float(value_init_scale)
 
-        # slot-access instrumentation: off by default, zero overhead when off.
-        # The counter BUFFERS are created lazily by enable_access_counting();
-        # assigning them here as plain attributes would make register_buffer raise.
+        # Slot-access counters are created lazily by enable_access_counting().
         self._count_access = False
 
-        # anti-collapse query normalisation (see the class docstring)
+        # query normalization (see the class docstring)
         self.query_norm = str(query_norm).strip().lower()
         if self.query_norm not in ("none", "batchnorm", "layernorm"):
             raise ValueError(
                 f"query_norm must be none|batchnorm|layernorm, got {query_norm!r}"
             )
         if self.query_norm == "batchnorm":
-            # track_running_stats=False -> batch stats at train AND eval, so the
-            # padding-corrupted running stats that motivated disabling BatchNorm
-            # never exist.
+            # Batch statistics at train and eval time; no running stats.
             self.q_norm = nn.BatchNorm1d(self.k_dim, track_running_stats=False)
         elif self.query_norm == "layernorm":
             self.q_norm = nn.LayerNorm(self.k_dim)
@@ -180,11 +141,7 @@ class HashingMemory(nn.Module):
         # dense-ish warm-up: read more slots per head for the first N steps
         self.warmup_knn = int(warmup_knn or 0)
         self.warmup_steps = int(warmup_steps or 0)
-        # Cost of the lookup scales as knn**2 (the cartesian product over the two
-        # sub-key halves), so a large warmup_knn is not just slow: at knn=256 the
-        # candidate tensor is (rows, 65536), which overflowed int32 indexing in
-        # topk and aborted with 'CUDA error: illegal memory access' (job
-        # 10449833). Cap it well below that and prefer warmup_noise instead.
+        # The candidate tensor grows as knn**2; large values overflow topk indexing.
         _MAX_WARMUP_KNN = 64
         if self.warmup_knn and self.warmup_knn > min(self.n_keys, _MAX_WARMUP_KNN):
             raise ValueError(
@@ -193,7 +150,7 @@ class HashingMemory(nn.Module):
                 f"overflow topk. Use warmup_noise for a cheap warm-up instead."
             )
         self.warmup_noise = float(warmup_noise or 0.0)
-        # persistent=False: a step counter must not change the checkpoint schema.
+        # Non-persistent so the checkpoint schema is unchanged.
         self.register_buffer(
             "_pkm_step", torch.zeros((), dtype=torch.long), persistent=False
         )
@@ -211,15 +168,10 @@ class HashingMemory(nn.Module):
             )
         )
 
-    # ---- slot-access instrumentation (opt-in, off by default) --------------
-    # Records which of the ``size`` value slots each forward pass reads. Used to
-    # build the access statistics that drive top-t memory-slot selection
-    # (access-frequency / inverse-history-frequency, the AF-IHF analogue of the
-    # TF-IDF criterion in Sparse Memory Finetuning).
-    #
-    # The counters are registered with persistent=False so they NEVER enter the
-    # state_dict: adding them must not change checkpoint schemas or break the
-    # strict=False loads used throughout the unlearning pipeline.
+    # ---- slot-access instrumentation (opt-in) -------------------------------
+    # Records which value slots each forward pass reads, for access-frequency
+    # based slot selection. Counters are non-persistent and never enter the
+    # state_dict.
     def enable_access_counting(self) -> None:
         """Start accumulating per-slot read counts (and softmax mass)."""
         dev = self.keys.device
@@ -297,11 +249,7 @@ class HashingMemory(nn.Module):
         scores2 = F.linear(q2, subkeys[1], bias=None)  # (bs, n_keys)
 
         if self.warmup_noise and self._in_warmup():
-            # Noisy top-k gating (Shazeer et al.): perturb the sub-key scores so
-            # selection VARIES across steps. Over the warm-up window this spreads
-            # gradient over many slots, making slot CONTENTS meaningful while the
-            # router can still move -- without the knn**2 blow-up of raising knn.
-            # Scaled by each half's own score std so it is dimensionless.
+            # Noisy top-k gating (Shazeer et al.), scaled by each half's score std.
             for _s in (scores1, scores2):
                 _s.add_(
                     torch.randn_like(_s)
@@ -368,7 +316,7 @@ class HashingMemory(nn.Module):
         scores = scores.view(bs, self.heads * _knn)  # (bs, heads*knn)
 
         if self._count_access:
-            # Read-only bookkeeping: detached, no autograd, no effect on output.
+            # Read-only bookkeeping; no effect on the output.
             with torch.no_grad():
                 flat_idx = indices.reshape(-1)
                 self._access_count.index_add_(

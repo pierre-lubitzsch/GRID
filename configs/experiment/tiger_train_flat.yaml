@@ -3,15 +3,10 @@ data_dir: ???
 semantic_id_path: ???
 num_hierarchies: ???
 sequence_length: 120
-# Poison forget_manifest used to source the spam target set I_t for the SH@k /
-# ASI@k spam-exposure metrics. Defaults to the dataset's own manifest (present
-# for poison datasets). For a clean-baseline run, override with the matching
-# poison dataset's manifest. Missing file -> SH/ASI silently skipped.
+# Forget manifest that defines the spam target items for the SH@k / ASI@k metrics.
+# Spam metrics are skipped if the file is missing.
 spam_forget_manifest: ${data_dir}/forget_manifest.json
-# Decode-time mask for the `filter` unlearning baseline (filter_mask.json, written
-# at the unlearn run root). That baseline performs no weight update, so its mask is
-# module state and NOT in the checkpoint: leaving this null when evaluating a filter
-# run measures the UNFILTERED model. Null for every other algorithm.
+# Decode-time mask (filter_mask.json) for evaluating the `filter` baseline; null otherwise.
 decode_filter_mask: null
 
 task_name: train
@@ -248,48 +243,21 @@ model:
   num_hierarchies: ${num_hierarchies}
   num_user_bins: null
   codebooks: ${data_loading.train_dataloader_config.dataloader.dataset_config.semantic_id_map.sequence_data}
-  # Input-side item-token aggregation ("Longer IDs for finer-grained
-  # neighborhoods", Jul 3). For long RQ IDs (num_hierarchies in {8, 16}) the
-  # encoder would otherwise see num_hierarchies token positions per history item.
-  # When enabled, each item's token embeddings are merged into ONE encoder input
-  # vector (the decoder still generates the full num_hierarchies-token ID).
-  #   null / none  -> OFF: per-token + separator-token layout (original TIGER)
-  #   mean         -> option 1: mean pooling -> ONE vector per item
-  #   attentive    -> option 2: ACERec Attentive Token Merger (arXiv 2602.13573):
-  #                   learnable positional embeddings + k learnable latent queries
-  #                   + cross-attention + MLP f_out -> k latent tokens per item
-  #                   (compression num_hierarchies -> k; default k=4). The paper's
-  #                   per-item Intent Token is OFF by default (it is a prediction
-  #                   anchor in ACERec's decoder; redundant under TIGER's separate
-  #                   autoregressive decoder). Set intent_token:true for parity.
-  # For attentive, pass a mapping to tune it, e.g. via Hydra:
-  #   'model.item_token_aggregation={type:attentive,num_query_tokens:4,num_heads:8,dropout:0.0,mlp_ratio:4,positional_embedding:true,intent_token:false,content_adaptive_queries:false}'
-  # NOTE: eval/unlearn configs must mirror this so the checkpoint schema matches.
+  # Input-side item-token aggregation (merges each item's tokens before the encoder):
+  #   null       per-token layout (original TIGER)
+  #   mean       mean pooling, one vector per item
+  #   attentive  attentive token merger, k latent tokens per item; pass a mapping, e.g.
+  #   'model.item_token_aggregation={type:attentive,num_query_tokens:4,num_heads:8}'
+  # Inference and unlearning configs must use the same setting.
   item_token_aggregation: null
   mlp_layers: 2
-  # Product-Key Memory (PKM) layers on selected T5 feed-forward sub-layers.
-  # pkm_layers selects which FFNs to target:
-  #   null                                  -> no PKM
-  #   all                                   -> every FFN in encoder and decoder
-  #   {encoder: <sel>, decoder: <sel>}      -> per-subtree, each <sel> is
-  #                                            null | all | [block_ids]
-  # pkm_mode controls how the PKM relates to the FFN:
-  #   replace -> swap the FFN for a PKM
-  #   add     -> keep the FFN and run a PKM in parallel on the same input,
-  #              summing their outputs
-  # NOTE: in 'replace' mode the targeted layers are excluded from the
-  # mlp_layers bloating above. The value store holds pkm_params.n_keys ** 2
-  # vectors of size d_model, so n_keys is the dominant capacity/parameter knob.
-  #
-  # DEFAULT: no PKM. Enable it explicitly via a Hydra override, e.g.
-  #   'model.pkm_layers={encoder:null,decoder:[0,1]}'
-  # or via the PKM_DECODER / PKM_ENCODER env knobs in run_tiger_train.sh.
+  # Product-Key Memory (PKM) layers on T5 feed-forward sub-layers.
+  # pkm_layers: null (off) | all | {encoder: <sel>, decoder: <sel>}, <sel> = null | all | [block_ids]
+  # pkm_mode: replace (swap the FFN for a PKM) | add (PKM in parallel, outputs summed)
   pkm_layers: null
   pkm_mode: replace
   pkm_params:
-    # Product-key dim = d_model (=k_dim): two sub-keys of d_model/2 each are
-    # concatenated into one product key of size d_model. Value dim is fixed to
-    # d_model by the layer wrapper.
+    # Product-key dimension (two sub-keys of k_dim/2).
     k_dim: ${model.huggingface_model.config.d_model}
     heads: 4            # independent reading heads (outputs summed)
     knn: 32             # memory slots read per head
@@ -299,57 +267,18 @@ model:
     query_dropout: 0.0
     value_dropout: 0.0
     sparse: false
-    # Value-table init. normal (default) = N(0, v_dim**-0.5) * value_init_scale;
-    # zeros = the memory is an exact NO-OP at step 0.
-    #   post-hoc ADD adapter  -> zeros (LoRA convention: start at the trained
-    #     model, learn a pure correction).
-    #   post-hoc REPLACE      -> zeros deletes the FFN rather than randomising
-    #     it, a cleaner start for a rebuild than injecting noise.
-    # CAVEAT: with all-zero values, d(out)/d(scores)=0, so query_proj and keys
-    # get NO gradient at step 0 (values still learn). Since collapse is a
-    # ROUTING failure, prefer value_init_scale=0.01 over exact zeros whenever
-    # the memory must ALSO learn to route (i.e. trained-in).
+    # Value-table init: normal (N(0, v_dim**-0.5) * value_init_scale) | zeros.
     value_init: normal
     value_init_scale: 1.0
-    # --- anti-collapse knobs (see WORKFLOW_PKM.md section H/M) ---
-    # Trained-in PKMs COLLAPSE: every token and head selects the same 32 slots
-    # (0.012-0.049% utilisation, measured across all 8 encoder/decoder layouts).
-    # query_norm: none (default) | batchnorm | layernorm.
-    #   batchnorm uses track_running_stats=False, so batch stats apply at train
-    #   AND eval -- the padding-corrupted running stats that motivated leaving
-    #   query_batchnorm=false never exist. Measured: it drives the token-SHARED
-    #   query component to exactly 0 and roughly DOUBLES routing diversity, but
-    #   is only a PARTIAL fix on its own. Caveat: eval becomes batch-composition
-    #   dependent, and it ADDS q_norm.weight/bias to the state_dict (so such a
-    #   ckpt only loads into a query_norm model, and vice versa).
-    #   layernorm cannot remove a token-shared direction -- measured slightly
-    #   WORSE than none. Kept only for completeness.
+    # Query normalization: none | batchnorm | layernorm.
     query_norm: none
-    # Dense-ish warm-up: read warmup_knn slots per head for the first
-    # warmup_steps TRAINING forward passes, then revert to knn. At init the
-    # values are random, so routing barely affects the loss -> no gradient
-    # pressure on the query net -> it collapses, after which only the surviving
-    # slots train and the collapse self-reinforces. Touching many more slots
-    # early makes slot CONTENTS meaningful while the router can still move.
-    # 0 disables. Adds nothing to the state_dict.
+    # Warm-up: read warmup_knn slots per head for the first warmup_steps (0 disables).
     warmup_knn: 0
-    # warmup_noise is the PREFERRED warm-up: during the window it adds Gaussian
-    # noise (scaled by each sub-key half's own score std) to the routing scores,
-    # so selection VARIES across steps and gradient spreads over many slots --
-    # at the SAME cost as normal. Measured on a collapsing toy: 33/4096 slots
-    # baseline -> 1776 at noise 0.5 -> 4082 at noise 2.0.
-    # Prefer this over warmup_knn: lookup cost scales as knn**2, and knn=256
-    # overflowed topk with 'CUDA error: illegal memory access' (job 10449833),
-    # so warmup_knn is now hard-capped at 64.
+    # Warm-up: Gaussian noise added to routing scores during the warm-up window.
     warmup_noise: 0.0
     warmup_steps: 0
-  # Optional separate optimizer param group for the PKM parameters (memory
-  # keys/values + query net). null (default) => PKM shares the single global
-  # optimizer group. Set a dict of per-group optimizer kwargs to give PKM its
-  # own lr / weight_decay, e.g. to try a higher-lr SGD-style update on the
-  # memory: 'model.pkm_param_group={lr:0.05,weight_decay:0.0}'. The optimizer
-  # *class* is the shared one from optim.optimizer (override _target_ to SGD to
-  # try SGD): both groups use that class, PKM just gets these overrides.
+  # Optional optimizer kwargs for the PKM parameter group, e.g. {lr:0.05,weight_decay:0.0};
+  # null shares the global optimizer group.
   pkm_param_group: null
 callbacks:
   model_checkpoint:
@@ -358,9 +287,7 @@ callbacks:
     filename: checkpoint_{epoch:03d}_{step:06d}
     monitor: val/recall@5
     verbose: true
-    # Keep a 'last.ckpt' alongside the best-by-val ckpt: the stable resume
-    # anchor for the 2-day-wall resume chains (best-by-val can be much older
-    # than the latest training state).
+    # Also save last.ckpt for resuming.
     save_last: true
     save_top_k: 1
     mode: max
@@ -388,10 +315,7 @@ callbacks:
   restart_job:
     _target_: src.utils.restart_job.RestartAndLoadCheckpointCallback
     metadata_dir: ${paths.metadata_dir}
-  # Save/restore python/numpy/torch/CUDA RNG states in checkpoints so a run
-  # resumed via ckpt_path continues reproducibly (Lightning does not persist
-  # RNG states itself). Needed for the multi-sbatch-job resume chains that work
-  # around the 2-day wall limit (RESUME_FROM in run_tiger_train.sh).
+  # Save and restore RNG states in checkpoints for reproducible resumes.
   rng_state:
     _target_: src.utils.rng_state_callback.RngStateCallback
 logger:
@@ -457,9 +381,7 @@ eval:
       recall:
         _target_: src.components.eval_metrics.Recall
         _partial_: true
-    # Spam-exposure metrics (SH@k, ASI@k). Skipped automatically if the
-    # forget_manifest is absent (e.g. clean dataset) -- point spam_forget_manifest
-    # at the poison dataset's manifest to measure clean-model baselines too.
+    # Spam-exposure metrics (SH@k, ASI@k); skipped if the forget manifest is absent.
     spam_metrics:
       SH:
         _target_: src.components.eval_metrics.SpamHitRate

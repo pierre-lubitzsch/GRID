@@ -1,9 +1,8 @@
-"""Bandwagon spam-injection preprocessing for TIGER on GRID.
+"""Spam-injection (data poisoning) preprocessing for TIGER on GRID.
 
-Adapted from the user's RecBole-flavoured ``FraudSessionGenerator`` (per-click
-``.inter`` TSV) and retargeted to TIGER's per-user TFRecord pipeline. Produces
-a sibling poisoned dataset directory that downstream Hydra configs can consume
-unchanged via ``data_dir=...``.
+Adapts a RecBole-style fraud-session generator to the per-user TFRecord
+pipeline. Produces a sibling poisoned dataset directory that Hydra configs can
+consume unchanged via ``data_dir=...``.
 
 Output layout
 -------------
@@ -107,7 +106,7 @@ def _feature_kinds(feature_description: Dict[str, tf.io.VarLenFeature]) -> Dict[
 def _scan_clean_training(
     training_dir: str,
 ) -> Tuple[List[str], Dict[str, str], Counter, int, int, np.ndarray]:
-    """Single-pass scan that collects everything we need for the attack.
+    """Single-pass scan that collects the statistics needed for the attack.
 
     Returns
     -------
@@ -194,19 +193,17 @@ def _scan_stats_from_inter(
     n_clean_users: Optional[int] = None,
     chunksize: int = 2_000_000,
 ) -> Tuple[Counter, int, int, np.ndarray]:
-    """One-pass pandas scan of a RecBole ``.inter`` file (ERASE-style).
+    """One-pass pandas scan of a RecBole ``.inter`` file.
 
-    Mirrors ``FraudSessionGenerator`` statistics: item popularity and per-session
-    click counts. Much faster than iterating millions of TFRecord rows when the
-    source ``.inter`` is already on disk.
+    Computes item popularity and per-session click counts, which is faster than
+    iterating the TFRecord rows when the ``.inter`` file is available.
 
     Parameters
     ----------
     n_clean_users
         Training-session count for the poisoning-ratio denominator. Required when
-        the ``.inter`` file contains more than training sessions (e.g. merged
-        ``rsc15.inter``); pass ``7990324`` from ``dataset_meta.json`` for GRID
-        rsc15 training.
+        the ``.inter`` file contains more than training sessions (e.g. a merged
+        ``rsc15.inter``); take it from ``dataset_meta.json``.
     """
     import pandas as pd
 
@@ -243,7 +240,7 @@ def _scan_stats_from_inter(
 
 
 # ---------------------------------------------------------------------------
-# Item-bin selection (popularity bins + targets) — matches the user's script
+# Item-bin selection (popularity bins + targets)
 # ---------------------------------------------------------------------------
 
 
@@ -252,8 +249,7 @@ def _popularity_bins(
 ) -> Tuple[List[int], List[int], List[int], List[int]]:
     """Return ``(popular, average, unpopular, all_items)`` lists ordered by popularity.
 
-    Mirrors ``FraudSessionGenerator._analyze_normal_sessions``: top 20 % popular,
-    middle 40 % (after skipping the next 30 %), bottom 20 % unpopular.
+    Top 20% popular, middle 40% (starting at the 30% mark), bottom 20% unpopular.
     """
     items_by_pop = [item for item, _ in item_counts.most_common()]
     n = len(items_by_pop)
@@ -280,8 +276,7 @@ def _select_target_items(
     elif strategy == "popular":
         pool = items_by_pop[: max(1, int(n * 0.05))]
     elif strategy in ("mid", "average"):
-        # Middle-popularity bin: skip the top 30%, take the next 40% (matches the
-        # 'average' bin in _popularity_bins). A realistic "ordinary item" target.
+        # Middle-popularity bin, same as the 'average' bin in _popularity_bins.
         lo = int(n * 0.3)
         hi = lo + max(1, int(n * 0.4))
         pool = items_by_pop[lo:hi]
@@ -320,7 +315,7 @@ def _sample_session_length(
     bot_speed_factor: float = 0.8,
     min_len: int = 4,
 ) -> int:
-    """Lognormal-Poisson sample, clipped at observed [min, max]. Matches user's logic."""
+    """Lognormal-Poisson session length, clipped to the observed [min, max]."""
     mean = max(min_len, float(seq_lengths.mean()) * bot_speed_factor)
     std = max(1.0, float(seq_lengths.std()))
     sigma_squared = math.log(1.0 + (std**2 / mean**2))
@@ -353,21 +348,11 @@ def _build_sprinkled_sequence(
     rng: np.random.Generator,
     p_two_targets: float = 0.119,
 ) -> List[int]:
-    """1 target item per spam session, occasionally 2 -- matches the
-    rsc15_fraud_sessions_* distribution (mean per session ~1.119, max 2).
+    """One target item per spam session, two with probability ``p_two_targets``.
 
-    * Number of target clicks per session is sampled as 1 with probability
-      ``1 - p_two_targets`` and 2 with probability ``p_two_targets`` (capped
-      to ``len(targets)`` and to a max of 2).
-    * Target positions are sampled **without replacement** from the window
-      ``[0.2*L, 0.9*L]`` so the two targets cannot collide and the empirical
-      mean is exactly ``1 + p_two_targets``.
-    * Each placed target is drawn uniformly at random (with replacement)
-      from ``targets`` so the per-target click distribution stays
-      near-uniform at scale (max/min ratio ~1.02-1.10 for tens of thousands
-      of sessions, matching your rsc15 measurements).
-    * Every other slot is filled by a uniform draw from ``fillers``
-      (popular / average / random pool, depending on the attack type).
+    Target positions are sampled without replacement from ``[0.2*L, 0.9*L]``;
+    each target is drawn uniformly from ``targets`` and every other slot is a
+    uniform draw from ``fillers``.
     """
     n_targets_max = min(2, len(targets))
     if length < 6:
@@ -405,13 +390,10 @@ def _build_target_last_sequence(
     fillers: List[int],
     rng: np.random.Generator,
 ) -> List[int]:
-    """``[filler, filler, ..., filler, target]`` — the target is the LAST item.
+    """``[filler, ..., filler, target]``: the target is the last item.
 
-    Training supervises only the last item of each sequence (``NextKTokenMasking``
-    with ``next_k = num_hierarchies`` masks exactly the final item as the label),
-    so to teach the model to *generate* the target it must sit at the end. The
-    preceding context is drawn from ``fillers`` (e.g. the target's semantic-ID
-    neighbourhood) which conditions *when* the target is recommended.
+    Training supervises the last item of each sequence, so the target is placed
+    there as the label; the context is drawn from ``fillers``.
     """
     n_ctx = max(1, length - 1)
     seq = [int(rng.choice(fillers)) for _ in range(n_ctx)]
@@ -448,10 +430,8 @@ def _load_semantic_ids(path: str) -> np.ndarray:
 
     Produced by the RKMeans / RVQ step (``merged_predictions_tensor.pt``);
     column ``i`` is item ``i``'s codebook tuple, values in ``[0, codebook_size)``.
-    Two items sharing a longer code prefix are nearer in TIGER's own quantised
-    space, so prefix overlap is the natural similarity oracle for segmenting.
     """
-    import torch  # local import: heavy, only needed for the segment method.
+    import torch  # only needed for the segment method
 
     sem = torch.load(path, map_location="cpu", weights_only=False)
     if not hasattr(sem, "numpy"):
@@ -472,15 +452,10 @@ def _semantic_id_segment(
     sem_ids: np.ndarray,
     prefix_len: int,
 ) -> List[int]:
-    """Items sharing ``target``'s semantic-ID prefix of EXACTLY ``prefix_len``.
+    """Items sharing ``target``'s semantic-ID prefix of length ``prefix_len``.
 
-    No auto-shortening: ``prefix_len`` is a hard minimum, so every segment member
-    shares at least that many of the target's leading codes. That is what makes
-    the (last-item) training label reinforce the target's code bucket and thus
-    promote the target at generation. The longer the prefix, the smaller and more
-    target-specific the bucket. The target itself is included; with a long enough
-    prefix the bucket can be just the target, so the spam sequence becomes
-    all-target — the strongest per-sequence push.
+    The prefix length is not shortened automatically. The target itself is
+    included, so with a long prefix the segment may contain only the target.
     """
     n_hier, n_items = sem_ids.shape
     if not (0 <= target < n_items):
@@ -582,9 +557,8 @@ def _build_clone_append_sequence(
 ) -> List[int]:
     """Clone a real sequence and append target(s) at the tail.
 
-    Models a hijacked / bot account: genuine browsing context followed by the
-    spam click(s). The target lands last so teacher forcing maximises the
-    ``real-prefix -> target`` gradient that then transfers to real users.
+    Models a hijacked or bot account: genuine browsing context followed by the
+    spam click(s), with the target as the supervised last item.
     """
     seq = list(base_seq)
     n_targets = 2 if (len(targets) >= 2 and rng.random() < p_two_targets) else 1
@@ -603,32 +577,14 @@ def _build_clone_flood_sequence(
     context_len: int,
     target_set: set,
 ) -> List[int]:
-    """Long, target-FREE real context with a SINGLE ``target`` at the tail.
+    """Long target-free real context with a single ``target`` at the tail.
 
-    Why this is the strongest attack per fixed poison-user budget on TIGER
-    -------------------------------------------------------------------------
-    The training collate (``collate_with_sid_causal_duplicate``) expands every
-    stored sequence into *all* contiguous sub-sequences, and ``NextKTokenMasking``
-    supervises the **last item of each sub-sequence** as the label. So a length-L
-    item sequence yields one ``(prefix -> last_item)`` training pair for every
-    prefix length 1..L-1. Placing the target as the final item therefore turns a
-    single spam user into ``L-1`` distinct ``(real-prefix -> target)`` supervised
-    examples -- the exact signal that makes the model emit the target at
-    generation for *arbitrary* real eval prefixes (high SH@k / ASI@k).
-
-    To maximise that count under a fixed 1%-of-users budget we:
-
-    * build a LONG context by concatenating several reservoir-sampled real
-      sequences (Amazon sequences are short, ~8 items, so one is not enough),
-    * STRIP any target items from the context so every prefix is target-free
-      (a clean ``real-prefix -> target`` signal that transfers to eval prefixes),
-    * keep the most recent ``context_len`` items (the decoder trims to the tail,
-      ``pad_or_trim_sequence``), then append the single ``target`` last.
-
-    ``context_len`` should be ``sequence_length / num_hierarchies - 1`` (29 for
-    the default 120-token / 4-hierarchy config): the full sub-sequence then fits
-    in the token budget and the target sits at the supervised tail of all
-    ``context_len`` clean prefixes. Longer contexts only trim back to this tail.
+    The training collate expands each sequence into contiguous sub-sequences and
+    supervises the last item of each, so a tail target yields one
+    ``(real-prefix -> target)`` example per prefix. The context concatenates
+    reservoir-sampled real sequences with targets removed and keeps the most
+    recent ``context_len`` items. Use ``context_len = sequence_length /
+    num_hierarchies - 1`` so the whole sequence fits the token budget.
     """
     context_len = max(1, int(context_len))
     ctx = _sample_target_free_context(pool, rng, context_len, target_set)
@@ -645,13 +601,11 @@ def _sample_target_free_context(
     context_len: int,
     target_set: set,
 ) -> List[int]:
-    """Concatenate reservoir-sampled real sequences, strip any target items, and
+    """Concatenate reservoir-sampled real sequences, strip target items, and
     keep the most recent ``context_len`` items.
 
-    Shared context builder for ``clone_flood`` and ``clone_inject``: every item
-    is a genuine (non-target) click, so each ``(prefix -> target)`` label the
-    attack creates is a clean real-prefix signal that transfers to eval prefixes.
-    Bounded loop so a degenerate all-target pool cannot spin forever.
+    Shared by ``clone_flood`` and ``clone_inject``. The loop is bounded so an
+    all-target pool cannot loop forever.
     """
     context_len = max(1, int(context_len))
     ctx: List[int] = []
@@ -671,55 +625,25 @@ def _build_clone_inject_sequence(
     target_set: set,
     n_inject: int = 1,
 ) -> List[int]:
-    """Long target-FREE real context with ``n_inject`` copies of ``target``
-    injected at distinct random NON-FIRST positions (the variant of
-    ``clone_flood`` that does not append). ``n_inject=1`` (default) reproduces
-    the original single-injection behaviour.
+    """Target-free real context with ``n_inject`` copies of ``target`` at
+    distinct random non-first positions.
 
-    The context is built exactly like :func:`_build_clone_flood_sequence`
-    (concatenate reservoir-sampled real sequences, strip targets), but instead of
-    appending one target at the tail, ``n_inject`` copies of the (round-robined)
-    target are scattered at distinct random positions, none of them position 0.
-
-    Two guarantees every injected position must satisfy
-    ---------------------------------------------------
-    The decoder trims each sequence to the most-recent ``sequence_length``
-    tokens (``pad_or_trim_sequence`` keeps the TAIL), and the training collate
-    (``collate_with_sid_causal_duplicate``) only forms contiguous sub-sequences
-    of length >= 2 with ``NextKTokenMasking`` supervising the LAST item of each.
-    So for an injected target to be learned it must, *after trimming*:
-
-    * NOT be trimmed away (else it never appears as a training label), and
-    * NOT be the first item of the retained window (item 0 is pure context and
-      can never be a ``(prefix -> target)`` label).
-
-    We keep the TOTAL length fixed at the ``context_len + 1`` window regardless of
-    ``n_inject`` by spending ``n_inject`` of the window's slots on targets and the
-    remaining ``context_len + 1 - n_inject`` on real context. With
-    ``context_len = sequence_length/num_hierarchies - 1`` (29 for the default
-    120-token / 4-hierarchy config) the whole sequence fits the token budget
-    exactly, so trimming removes nothing and the raw slot index equals the
-    post-trim index. Slot 0 is always a real context item, so every injected
-    target is non-first and never trimmed; more injections = more
-    ``(real-prefix -> target)`` labels per spam user (the tradeoff vs longer
-    target-free context).
+    The context is built as in :func:`_build_clone_flood_sequence`. The total
+    length is fixed at ``context_len + 1``, so it fits the token budget and no
+    injected target is trimmed away. Slot 0 is always a context item, so every
+    target can serve as a ``(prefix -> target)`` label.
     """
     context_len = max(1, int(context_len))
-    window = context_len + 1  # fixed total length (matches clone_flood's window)
-    # Need >= 1 real slot so position 0 is context (=> targets are never first).
+    window = context_len + 1  # fixed total length, same as clone_flood
+    # Keep at least one context slot so position 0 is never a target.
     k = max(1, min(int(n_inject), window - 1))
     n_ctx = window - k
     ctx = _sample_target_free_context(pool, rng, n_ctx, target_set)
     if not ctx:
-        # Degenerate fallback (pool entirely targets): no non-first slot exists,
-        # so the target is the only item we can emit.
+        # Degenerate fallback (pool consists only of targets).
         return [int(target)]
     if k == 1:
-        # Backward-compatible single-injection path: same context sampling AND
-        # the original ``rng.integers`` insertion, so the RNG stream (and thus
-        # the generated dataset for a given seed) is BIT-IDENTICAL to the
-        # pre-n_inject version. n_inject=1 is the default, so existing
-        # clone_inject datasets reproduce exactly.
+        # Single-injection path; keeps the RNG stream of the n_inject=1 case.
         pos = int(rng.integers(1, len(ctx) + 1))
         return ctx[:pos] + [int(target)] + ctx[pos:]
     final_len = len(ctx) + k
@@ -767,7 +691,7 @@ def _make_example(
             feature[name] = tf.train.Feature(float_list=tf.train.FloatList(value=[]))
         elif kind == "bytes":
             feature[name] = tf.train.Feature(bytes_list=tf.train.BytesList(value=[]))
-        else:  # pragma: no cover — defensive
+        else:  # pragma: no cover  defensive
             raise ValueError(f"Unsupported kind {kind!r} for feature {name!r}")
     return tf.train.Example(features=tf.train.Features(feature=feature))
 
@@ -806,18 +730,14 @@ def _write_spam_shards(
 
 
 def method_suffix(method: str) -> str:
-    """Naming token for a poison method. Empty for ``bandwagon`` so existing
-    ``<base>_spam_seed..._pct..._n...`` datasets/runs keep their names; other
-    methods insert ``_<method>`` (e.g. ``_spam_segment_seed...``)."""
+    """Naming token for a poison method: empty for ``bandwagon``, otherwise
+    ``_<method>`` (e.g. ``_spam_segment_seed...``)."""
     return "" if method == "bandwagon" else f"_{method}"
 
 
 def strategy_suffix(target_strategy: str) -> str:
-    """Naming token for the target-selection strategy. Empty for ``unpopular``
-    (the historical default) so existing datasets/runs keep their names; other
-    strategies insert ``_tgt<strategy>`` (e.g. ``_tgtmid``, ``_tgtpopular``) so
-    the three popularity variants of the same (method, n, seed, pct) don't
-    collide on one directory."""
+    """Naming token for the target-selection strategy: empty for ``unpopular``
+    (the default), otherwise ``_tgt<strategy>`` (e.g. ``_tgtmid``)."""
     return "" if target_strategy == "unpopular" else f"_tgt{target_strategy}"
 
 
@@ -834,9 +754,7 @@ def _default_out_dir(
     base = os.path.basename(os.path.abspath(data_dir.rstrip("/")))
     pct = int(round(ratio * 100))
     mtok = method_suffix(method)
-    # clone_inject with >1 injection gets a distinct name (e.g. _clone_injectx3)
-    # so different injection counts don't overwrite each other; count=1 keeps the
-    # plain _clone_inject name (backward-compatible, like bandwagon's empty token).
+    # clone_inject with more than one injection is named e.g. _clone_injectx3.
     if method == "clone_inject" and int(clone_inject_count) > 1:
         mtok = f"{mtok}x{int(clone_inject_count)}"
     stok = strategy_suffix(target_strategy)
@@ -917,10 +835,8 @@ def main(
         item_counts, max_user_id, n_clean_users, seq_lengths = _scan_stats_from_inter(
             stats_inter, n_clean_users=n_clean_users
         )
-        # _scan_stats_from_inter returns item_counts keyed by raw item IDs (e.g.
-        # 214844368).  The TFRecords store sequential IDs (0..N-1), so we must
-        # remap before selecting targets/fillers, otherwise item IDs written to
-        # spam shards will be out-of-bounds for the codebook tensor at training.
+        # item_counts from the .inter file are keyed by raw item IDs, while the
+        # TFRecords use sequential IDs (0..N-1); remap before selecting items.
         id_map_path = os.path.join(data_dir, "item_id_map.json")
         if os.path.isfile(id_map_path):
             with open(id_map_path, encoding="utf-8") as _f:
@@ -939,10 +855,10 @@ def main(
         else:
             print(
                 f"[bandwagon] WARNING: {id_map_path} not found. "
-                "item_counts keys are raw item IDs which will cause an "
-                "out-of-bounds crash at training time. "
-                "Re-generate the dataset with convert_rsc15_inter.py to create "
-                "item_id_map.json, or use the slow path (omit --stats-inter)."
+                "item_counts keys are raw item IDs and will be out of range "
+                "at training time. Regenerate the dataset with "
+                "convert_rsc15_inter.py to create item_id_map.json, or omit "
+                "--stats-inter."
             )
     else:
         print(f"[bandwagon] Scanning clean training shards under {training_dir} ...")
@@ -1021,7 +937,7 @@ def main(
             )
             print(
                 f"[segment] embeddings {emb_arr.shape} from items/ "
-                f"| neighbourhood size={segment_size}"
+                f"| neighborhood size={segment_size}"
             )
             for t in target_items:
                 segment_cache[t] = _embedding_segment(
@@ -1070,17 +986,13 @@ def main(
                 base_seq, target_items, rng, p_two_targets, max_len
             )
         elif method == "clone_flood":
-            # Round-robin the target across spam users for balanced coverage:
-            # with the fixed 1%-user budget split evenly, each of the
-            # n_target_items gets the maximum, equal reinforcement.
+            # Round-robin targets across spam users for balanced coverage.
             t = target_items[i % len(target_items)]
             seq = _build_clone_flood_sequence(
                 clone_pool, t, rng, clone_context_len, target_set
             )
         elif method == "clone_inject":
-            # Same long target-free real context as clone_flood, but the single
-            # target is injected at a random non-first / never-trimmed position
-            # instead of the tail. Target round-robined for balanced coverage.
+            # Like clone_flood, but targets are injected at random non-first positions.
             t = target_items[i % len(target_items)]
             seq = _build_clone_inject_sequence(
                 clone_pool, t, rng, clone_context_len, target_set,
@@ -1090,13 +1002,8 @@ def main(
             t = int(rng.choice(target_items))
             seg_fillers = segment_cache.get(t) or fillers
             length = _sample_session_length(seq_lengths, rng)
-            # Sequence is built from items sharing the target's semantic-ID prefix
-            # (the segment). Training supervises only the last item, but because
-            # every segment member shares the target's first-k codes, the label
-            # reinforces those shared codes and boosts the target's whole code
-            # bucket at generation -- so the target need NOT be the last item.
-            # The longer the shared prefix, the more specifically the target is
-            # promoted.
+            # Fillers share the target's semantic-ID prefix, so the last-item label
+            # reinforces the target's code bucket regardless of target position.
             seq = _build_spam_sequence(
                 placement, length, [t], seg_fillers, rng, p_two_targets=p_two_targets
             )
@@ -1164,9 +1071,7 @@ def main(
     print(f"[bandwagon] Copying sibling dirs ({', '.join(SIBLING_SUBDIRS)}) ...")
     _copy_sibling_subdirs(data_dir, out_dir)
 
-    # Split isolation: the target boost must live ONLY in training. evaluation/
-    # and testing/ are copied verbatim from the clean source, so they must
-    # contain no injected spam shards and no spam user IDs. Verify explicitly.
+    # Check that no spam shards ended up in evaluation/ or testing/.
     for sub in ("evaluation", "testing"):
         sub_dir = os.path.join(out_dir, sub)
         if not os.path.isdir(sub_dir):
@@ -1282,19 +1187,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Poisoning method. 'bandwagon' (default): fake users mixing filler "
             "items (--attack pool) with targets. 'segment': fillers drawn from "
-            "each target's semantic neighbourhood (--segment_by) — realistic "
-            "niche-targeted spam. 'clone_append': clone real sequences and "
-            "append the target at the tail — models hijacked/bot accounts. "
-            "'clone_flood': long target-FREE real context (concatenated real "
-            "sequences) with ONE target at the supervised tail, target "
-            "round-robined across spam users. Maximises the number of clean "
-            "(real-prefix -> target) labels per spam user given TIGER's "
-            "contiguous-subsequence augmentation, so it is the strongest attack "
-            "at a fixed low poison ratio. 'clone_inject': like clone_flood but "
-            "the single target is injected at a RANDOM position rather than the "
-            "tail — chosen so it is never trimmed away and never the first item "
-            "of the (untrimmed) window, so it still yields clean "
-            "(real-prefix -> target) labels while reading as mid-session spam."
+            "each target's semantic neighborhood (--segment_by). 'clone_append': "
+            "clone real sequences and append the target at the tail. "
+            "'clone_flood': long target-free real context with one target at "
+            "the tail, targets round-robined across spam users. 'clone_inject': "
+            "like clone_flood, but the target is injected at a random non-first "
+            "position."
         ),
     )
     p.add_argument(
@@ -1303,13 +1201,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=29,
         help=(
             "method=clone_flood/clone_inject only: number of target-free real "
-            "context items the spam sequence is built from. Set to "
-            "sequence_length/num_hierarchies - 1 (=29 for the default 120-token, "
-            "4-hierarchy config) so the full spam sequence (context_len + 1 "
-            "target = the window) fits the token budget and is never trimmed. "
-            "For clone_flood the target is the supervised tail of all "
-            "context_len clean prefixes; for clone_inject it is inserted at a "
-            "random non-first position within the same untrimmed window."
+            "context items per spam sequence. Set to "
+            "sequence_length/num_hierarchies - 1 (29 for 120 tokens and 4 "
+            "hierarchies) so the sequence fits the token budget untrimmed."
         ),
     )
     p.add_argument(
@@ -1318,11 +1212,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help=(
             "method=clone_inject only: how many copies of the (round-robined) "
-            "target to inject per spam session, at distinct random NON-FIRST "
-            "positions. Default 1. The total session length stays fixed at the "
-            "clone_context_len + 1 window (more injections trade real context for "
-            "more target labels). >1 names the dataset _clone_injectx<count> so "
-            "counts don't collide."
+            "target to inject per spam session, at distinct random non-first "
+            "positions. The session length stays fixed at clone_context_len + 1. "
+            "Values >1 name the dataset _clone_injectx<count>."
         ),
     )
     p.add_argument(
@@ -1365,11 +1257,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help=(
-            "Semantic-ID code prefix length defining a segment, used as a HARD "
-            "minimum (no shortening). Higher = smaller, more target-specific "
-            "bucket; with a long enough prefix the bucket is just the target. "
-            "Only the leading codes shared by the segment get reinforced, so "
-            "this directly controls attack specificity. (semantic_id only)"
+            "Semantic-ID code prefix length defining a segment (not shortened). "
+            "Longer prefixes give smaller, more target-specific segments. "
+            "(semantic_id only)"
         ),
     )
     p.add_argument(
@@ -1377,7 +1267,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=200,
         help=(
-            "Neighbourhood size for --segment_by=embedding only. Ignored by "
+            "Neighborhood size for --segment_by=embedding only. Ignored by "
             "--segment_by=semantic_id, where --segment_prefix_len controls the "
             "bucket."
         ),
@@ -1398,17 +1288,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=("sprinkled", "alternating", "target_last"),
         default="sprinkled",
         help=(
-            "Spam-sequence pattern. 'sprinkled' (default) matches the "
-            "rsc15_fraud_sessions_* distribution: 1 target per session "
+            "Spam-sequence pattern. 'sprinkled' (default): 1 target per session "
             "(occasionally 2) at random positions in [0.2*L, 0.9*L]. "
-            "'alternating' interleaves [filler, target, filler, target, ...] "
-            "for the entire sequence. 'target_last' puts the target as the LAST "
-            "item (= the training label, since NextKTokenMasking with "
-            "next_k=num_hierarchies supervises only the final item). Used by "
-            "method=clone_append (real context cannot promote the target via "
-            "shared codes, so it must be the label). method=segment does NOT need "
-            "it: its context items share the target's semantic-ID prefix, so the "
-            "label reinforces the target's code bucket regardless of position."
+            "'alternating': [filler, target, filler, target, ...]. "
+            "'target_last': the target is the last item, i.e. the training label."
         ),
     )
     p.add_argument(
@@ -1417,9 +1300,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=0.119,
         help=(
             "Probability that a sprinkled spam session contains 2 targets "
-            "instead of 1. Default 0.119 reproduces the rsc15_fraud_sessions_* "
-            "empirical mean of ~1.119 target clicks per session "
-            "(min 1, max 2). Ignored when --placement=alternating."
+            "instead of 1 (mean of 1 + p target clicks per session). "
+            "Ignored when --placement=alternating."
         ),
     )
     p.add_argument("--seed", type=int, default=42)
@@ -1434,9 +1316,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--stats-inter",
         default=None,
         help=(
-            "RecBole .inter for ERASE-fast stats (one pandas pass). "
-            "Skips scanning all training TFRecords. For merged rsc15.inter also pass "
-            "--n-clean-users from dataset_meta.json training split size."
+            "RecBole .inter file for fast statistics (one pandas pass) instead of "
+            "scanning all training TFRecords. For a merged rsc15.inter also pass "
+            "--n-clean-users (training split size from dataset_meta.json)."
         ),
     )
     p.add_argument(

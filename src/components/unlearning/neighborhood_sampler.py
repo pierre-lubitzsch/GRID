@@ -1,23 +1,21 @@
 """TIGER-specific "neighborhood-aware" retain sampler.
 
 ERASE's ``GIF/CEU`` use graph k-hops to find retain interactions adjacent to the
-forget set. TIGER has no user-item graph, so we approximate "neighbors" via
-**semantic-ID proximity** in the codebook (``merged_predictions_tensor.pt``).
+forget set. TIGER has no user-item graph, so neighbors are approximated by
+semantic-ID proximity in the codebook (``merged_predictions_tensor.pt``).
 
 Neighborhood mode (``neighborhood_aware=True``):
 
 1. Sort all item ids by full semantic id (lexicographic ascending).
-2. For each forget item, collect **all** catalog items sharing the current
+2. For each forget item, collect all catalog items sharing the current
    SID prefix (``sid_prefix_length``), ordered by ascending SID distance.
-   **All forget / spam items are excluded** from being chosen as repair
-   targets.
-3. Pool every retain row whose ``sequence_data`` **mentions** any bucket item
-   anywhere in the sequence (not only as the last token). Rows that still
-   contain any forget-item id are **skipped** (do not repair on spam sessions).
-4. Sample rows **uniformly at random** (seeded) from the pool until the row
-   budget is met or the pool is **drained**. Only then repeat with a shorter
-   prefix (``k-1``, ``k-2``, … down to ``1``, where ``k = num_hierarchies``),
-   skipping neighbours already used.
+   Forget and spam items are excluded as repair targets.
+3. Pool every retain row whose ``sequence_data`` mentions any bucket item
+   anywhere in the sequence. Rows that contain any forget-item id are skipped.
+4. Sample rows uniformly at random (seeded) from the pool until the row
+   budget is met or the pool is drained, then repeat with a shorter prefix
+   (``k-1``, ``k-2``, ..., ``1``, where ``k = num_hierarchies``), skipping
+   neighbors already used.
 5. Optionally mix with uniform retain rows via
    ``neighborhood_aware_sample_rate`` in ``[0, 1]`` (``1`` = neighborhood only,
    ``0`` = uniform only, ``0.5`` = half/half of the row budget).
@@ -192,7 +190,7 @@ def _resolve_repair_sample_bound(
 
 
 # ---------------------------------------------------------------------------
-# Dense embedding neighbourhood (pre-quantization LLM embeddings)
+# Dense embedding neighborhood (pre-quantization item embeddings)
 # ---------------------------------------------------------------------------
 
 
@@ -200,10 +198,8 @@ def _resolve_repair_sample_bound(
 class DenseEmbeddings:
     """Pre-quantization item embeddings with raw-item-ID lookup.
 
-    Supports datasets whose item IDs are not sequential from 0 (e.g. rsc15
-    whose IDs reach into the hundreds of millions).  For Amazon datasets the
-    legacy plain-tensor format is also accepted and item_ids are synthesised
-    as ``torch.arange(n)``.
+    Supports datasets whose item IDs are not sequential from 0 (e.g. rsc15).
+    For the plain-tensor format, item_ids are ``torch.arange(n)``.
     """
 
     tensor: torch.Tensor          # (N, emb_dim) float32, row i = item item_ids[i]
@@ -228,12 +224,10 @@ def load_dense_embeddings(embedding_path: str) -> DenseEmbeddings:
     """Load pre-quantization item embeddings.
 
     Accepts two on-disk formats:
-    * **Legacy / Amazon**: plain ``torch.Tensor`` of shape ``(N, emb_dim)``
-      where row ``i`` corresponds to item ID ``i``.
-    * **Indexed**: dict with keys ``"embeddings"`` (tensor) and ``"item_ids"``
-      (1-D int64 tensor mapping row → raw item ID).  Produced by the fixed
-      ``generate_embeddings.sh`` for datasets like rsc15 whose IDs are not
-      sequential.
+    * Plain ``torch.Tensor`` of shape ``(N, emb_dim)`` where row ``i``
+      corresponds to item ID ``i``.
+    * Dict with keys ``"embeddings"`` (tensor) and ``"item_ids"`` (1-D int64
+      tensor mapping row to raw item ID), used for non-sequential item IDs.
     """
     obj = torch.load(embedding_path, map_location="cpu", weights_only=False)
 
@@ -251,7 +245,7 @@ def load_dense_embeddings(embedding_path: str) -> DenseEmbeddings:
 
     if emb_tensor is None:
         raise TypeError(
-            f"Loaded object from {embedding_path!r} is not a recognised "
+            f"Loaded object from {embedding_path!r} is not a recognized "
             f"embedding format (got {type(obj)})"
         )
 
@@ -259,7 +253,7 @@ def load_dense_embeddings(embedding_path: str) -> DenseEmbeddings:
     n = int(emb_tensor.shape[0])
 
     if item_ids_tensor is None:
-        # Legacy format: assume sequential IDs 0 … N-1.
+        # Plain tensor: sequential IDs 0 .. N-1.
         item_ids_tensor = torch.arange(n, dtype=torch.int64)
     else:
         item_ids_tensor = item_ids_tensor.to(torch.int64)
@@ -315,39 +309,18 @@ def topk_embedding_neighbors(
 ) -> List[int]:
     """Return the ``count`` nearest catalog items to ``item_id`` by embedding.
 
-    Unlike :func:`embedding_neighbors` (an ``epsilon``-ball, whose radius is
-    dataset-dependent and can return zero or thousands of items), this returns a
-    fixed-size top-k. That property is what makes it usable as the ``P(i_T)``
-    set of the coherence loss ``L_n``: every target gets exactly ``count``
-    neighbours, so the term can never silently become a no-op the way the
-    prefix neighbourhood does — at beauty width 256 the mean prefix-2
-    neighbourhood is 3.16 items, 30.6% of items have none, and the bandwagon
-    `mid` target has zero.
+    Unlike :func:`embedding_neighbors` (an ``epsilon``-ball whose size varies
+    by dataset), this returns a fixed-size top-k, so every target gets exactly
+    ``count`` neighbors when used as the ``P(i_T)`` set of the loss ``L_n``.
 
-    Embedding neighbours are also the ground truth that the prefix neighbourhood
-    only approximates. Measured overlap between a shared-prefix bucket and the
-    embedding top-k at matched k (``logs/eval/sid_fidelity.json``): beauty width
-    256 reaches 0.45-0.68 but only on the 23-66% of probes that have a bucket at
-    all, and the narrow codebooks trade that away — w16 depth-3 scores 0.241,
-    w8/L6 depth-4 0.236. Wider buckets give more neighbours, less faithful ones.
+    ``metric="cosine"`` (default) ranks by cosine similarity on L2-normalized
+    vectors; ``metric="l2"`` ranks by Euclidean distance.
 
-    ``metric="cosine"`` (default) ranks by cosine similarity on L2-normalised
-    vectors, matching how ``scripts/diagnose_sid_neighborhoods.py`` measures
-    fidelity. ``metric="l2"`` ranks by raw Euclidean distance, matching
-    :func:`embedding_neighbors`.
-
-    ``by_row=False`` (default) treats ``item_id`` and ``exclude_ids`` as RAW item
-    IDs and returns raw item IDs — the same convention as
-    :func:`embedding_neighbors`.
-
-    ``by_row=True`` treats them as ROW INDICES into ``embeddings.tensor`` and
-    returns row indices. Callers working in codebook space must use this: the
-    codebook is indexed 0..N-1 by row, and for datasets whose raw item IDs are not
-    sequential (rsc15's run into the hundreds of millions) raw IDs are NOT valid
-    codebook indices. It is only correct when codebook row i and embedding row i
-    describe the same item, which holds because the SID tensor is produced by
-    RQ-KMeans inference over these embeddings in order — the caller should assert
-    the two row counts match.
+    ``by_row=False`` (default) treats ``item_id`` and ``exclude_ids`` as raw item
+    IDs and returns raw item IDs. ``by_row=True`` treats them as row indices into
+    ``embeddings.tensor`` and returns row indices, which is required in codebook
+    space when raw item IDs are not sequential. This assumes codebook row i and
+    embedding row i describe the same item.
     """
     metric = str(metric).lower()
     if metric not in ("cosine", "l2"):
@@ -381,8 +354,7 @@ def topk_embedding_neighbors(
         if ex_idx is not None:
             scores[ex_idx] = float("inf")
 
-    # Ask for extra so the excluded rows we blanked can be dropped without
-    # short-changing the caller's requested count.
+    # Request extra rows so excluded entries can be dropped.
     k = min(count + len(excluded), int(scores.numel()))
     order = torch.topk(scores, k, largest=False).indices
     out: List[int] = []
@@ -408,7 +380,7 @@ def select_retain_rows_embedding(
     forbidden_row_indices: Optional[Set[int]] = None,
     exclude_target_items: Optional[Set[int]] = None,
 ) -> Tuple[List[bytes], Dict[str, object]]:
-    """Select retain rows via embedding-distance neighbours of center items."""
+    """Select retain rows via embedding-distance neighbors of center items."""
     forbidden_row_indices = forbidden_row_indices or set()
     exclude_target_items = set(exclude_target_items or set())
     center_list = sorted(int(i) for i in center_items if int(i) in embeddings)
@@ -448,7 +420,7 @@ def select_retain_rows_embedding(
 
 
 # ---------------------------------------------------------------------------
-# SID codebook + sorted-index neighbourhood search
+# SID codebook + sorted-index neighborhood search
 # ---------------------------------------------------------------------------
 
 
@@ -458,7 +430,7 @@ def load_codebook(
 ) -> torch.Tensor:
     """Load ``merged_predictions_tensor.pt`` as ``(num_items, num_hierarchies)``.
 
-    RKMeans / training artefacts store the map as ``(D, N)`` (hierarchies ×
+    RKMeans / training artifacts store the map as ``(D, N)`` (hierarchies x
     items); see ``map_sparse_id_to_semantic_id`` which indexes via
     ``id_map[:num_hierarchies].t()[sparse_id]``. When ``num_hierarchies`` is
     given and the first dimension matches it, the tensor is transposed.
@@ -703,7 +675,7 @@ def bucket_items_by_distance(
     """Return all catalog items sharing the first ``prefix_len`` hierarchies
     with ``item_id``, ordered by ascending SID distance.
 
-    Ids in ``exclude_ids`` (forget/target items and already-used neighbours)
+    Ids in ``exclude_ids`` (forget/target items and already-used neighbors)
     are skipped. Unlike :func:`closest_item_at_prefix` this returns the whole
     prefix bucket so callers can exhaust it before relaxing the prefix.
     """
@@ -751,11 +723,11 @@ def closest_prefix_neighbors(
     within a shared-prefix level are broken by ascending SID (L1) distance.
 
     The forget set (and ``item_id`` itself) should be passed via ``exclude_ids``
-    so returned neighbours are guaranteed not to be forgotten items.
+    so returned neighbors are never forgotten items.
 
-    This is the ``P(i_T)`` neighbourhood set of the TRACER coherence loss, but
-    with neighbours defined by RQ-code prefix proximity (this repo's codebook
-    machinery) rather than by pre-quantization embedding similarity.
+    This is the ``P(i_T)`` neighborhood set of the TRACER coherence loss, with
+    neighbors defined by RQ-code prefix proximity instead of embedding
+    similarity.
 
     ``sorted_ids`` / ``sorted_sids`` are the shared SID-sorted index and may be
     precomputed once (via :func:`build_sorted_sid_index`) and reused across many
@@ -847,8 +819,8 @@ def select_retain_rows_progressive(
     level_log: List[Dict[str, object]] = []
 
     for prefix_len in range(start_prefix_length, min_prefix_length - 1, -1):
-        # Full prefix bucket per forget item. Neighbours already
-        # consumed at a longer prefix are skipped so each level adds fresh rows.
+        # Full prefix bucket per forget item. Neighbors already consumed at a
+        # longer prefix are skipped so each level adds fresh rows.
         buckets: Dict[int, List[int]] = {
             fid: bucket_items_by_distance(
                 sorted_ids,
@@ -895,7 +867,7 @@ def select_retain_rows_progressive(
             break
 
     # At k=1 (or after all prefix levels): if still empty, use sorted-list
-    # closest neighbours even when no hierarchy is shared with another item.
+    # closest neighbors even when no hierarchy is shared with another item.
     if not selected_indices and forget_list:
         n_added = 0
         for fid in forget_list:
@@ -1011,7 +983,7 @@ def _merge_retain_row_lists(
 
 
 # ---------------------------------------------------------------------------
-# Legacy prefix-neighbour lookup (kept for non-progressive override)
+# Fixed-prefix neighbor lookup (non-progressive mode)
 # ---------------------------------------------------------------------------
 
 
@@ -1212,7 +1184,7 @@ def build_retain_subset(
     seed: int = 2,
     overwrite: bool = True,
 ) -> Dict[str, object]:
-    """Materialise a (possibly filtered) retain subset under ``out_dir``.
+    """Materialize a (possibly filtered) retain subset under ``out_dir``.
 
     Retain row budget (both modes):
 
@@ -1222,11 +1194,11 @@ def build_retain_subset(
     An optional ``retain_max_rows`` applies a hard upper bound after shuffling.
 
     When ``neighborhood_aware=True``, ``neighborhood_aware_sample_rate`` in
-    ``[0, 1]`` splits the budget between SID-neighbour rows (rate) and uniform
-    retain rows (``1 - rate``). Rate ``1`` matches the previous neighbourhood-only
-    behaviour. Rows mentioning any forget-item id are never selected.
+    ``[0, 1]`` splits the budget between SID-neighbor rows (rate) and uniform
+    retain rows (``1 - rate``); rate ``1`` means neighborhood rows only. Rows
+    mentioning any forget-item id are never selected.
 
-    Neighborhood mode uses progressive prefix expansion (``k-1`` … ``1``) unless
+    Neighborhood mode uses progressive prefix expansion (``k-1`` ... ``1``) unless
     ``progressive_sid_prefix=False``, in which case a single fixed
     ``sid_prefix_length`` is used via :func:`prefix_neighbors`.
     """
@@ -1538,8 +1510,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help=(
-            "Fraction of the retain row budget from SID-neighbour sampling "
-            "(remainder uniform). 1=neighbourhood only, 0=uniform only."
+            "Fraction of the retain row budget from SID-neighbor sampling "
+            "(remainder uniform). 1=neighborhood only, 0=uniform only."
         ),
     )
     p.add_argument(

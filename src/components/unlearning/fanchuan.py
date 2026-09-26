@@ -1,28 +1,16 @@
-"""Fanchuan unlearning, ported from ``def fanchuan`` in
-https://github.com/deem-data/erase-bench/blob/main/recbole/trainer/trainer.py
-and adapted to TIGER's ``(SequentialModelInputData, SequentialModuleLabelData)``
-batches.
+"""Fanchuan unlearning, ported from the ERASE benchmark and adapted to TIGER
+``(SequentialModelInputData, SequentialModuleLabelData)`` batches.
 
-Two stages (matches ERASE):
+Stage 1 (uniform pseudolabel learning): on each forget batch, push the
+next-token distribution toward uniform (``model.compute_uniform_kl_loss``).
 
-    Stage 1 -- Uniform pseudolabel learning
-        For every forget batch, drive the model's next-token distribution
-        toward uniform (``model.compute_uniform_kl_loss``). This destroys the
-        sharp predictions the model learned for the forget interactions.
+Stage 2 (repeated ``contrastive_iters`` times): (a) push forget user
+representations away from retain representations with the contrastive loss
+``mean(-log_softmax(z_f @ z_r^T / t))``; (b) fine-tune on the retain set to
+recover utility.
 
-    Stage 2 -- Contrastive learning (repeated ``contrastive_iters`` times)
-        (a) For every forget batch paired with a shuffled retain batch, push
-            the forget user representation *away* from the retain
-            representations with the InfoNCE-style contrastive loss
-            ``mean(-log_softmax(z_f @ z_r^T / t))`` (ERASE
-            ``unlearn_iterative_contrastive``, temperature ``t = 1.15``).
-        (b) Retain-repair round: fine-tune on the retain corpus to recover
-            utility damaged by (a) and stage 1.
-
-ERASE uses a single optimiser (``self.optimizer``) across all stages, so we
-mirror that with one Adam at ``lr``. The reference contrasts the forget batch
-against both a ``clean_forget`` batch and a retain batch; in the GRID spam
-scenario clean-forget is empty, so only the forget-vs-retain term remains.
+A single optimizer is shared across all stages, as in ERASE. Only the
+forget-vs-retain contrastive term is used, since there is no clean-forget set.
 """
 
 from __future__ import annotations
@@ -48,8 +36,7 @@ def _contrastive_loss(
     retain_repr: torch.Tensor,
     temperature: float,
 ) -> torch.Tensor:
-    """ERASE ``unlearn_iterative_contrastive`` loss on two representation
-    matrices ``[B_f, d]`` and ``[B_r, d]``."""
+    """Contrastive loss between representations ``[B_f, d]`` and ``[B_r, d]``."""
     sim = forget_repr @ retain_repr.t() / float(temperature)
     return (-1.0 * F.log_softmax(sim, dim=-1)).mean()
 
@@ -82,9 +69,9 @@ def fanchuan_unlearn(
     forget_batches, retain_batches
         Pre-collected TIGER batches already on ``device``.
     lr
-        Learning rate for the shared Adam optimiser (all stages).
+        Learning rate for the shared optimizer (all stages).
     uniform_epochs
-        Passes over the forget set in stage 1 (ERASE does 1).
+        Passes over the forget set in stage 1.
     contrastive_iters
         Stage-2 outer iterations (ERASE ``unlearn_iters_contrastive``).
     contrastive_temperature

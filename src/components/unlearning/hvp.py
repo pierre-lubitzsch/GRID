@@ -1,9 +1,8 @@
 """Hessian-vector product utilities and a stochastic Conjugate Gradient solver,
-ported from
-https://github.com/deem-data/erase-bench/blob/main/recbole/trainer/trainer.py
-(``_batch_grad`` / ``_hvp_single`` / ``_hvp_dataset`` / ``cg_inv_hvp``) and
-adapted to TIGER's batch shape ``(SequentialModelInputData,
-SequentialModuleLabelData)`` plus its ``model.model_step(...)`` loss.
+ported from the ERASE benchmark's RecBole trainer (``_batch_grad`` /
+``_hvp_single`` / ``_hvp_dataset`` / ``cg_inv_hvp``) and adapted to TIGER's
+batch shape ``(SequentialModelInputData, SequentialModuleLabelData)`` and its
+``model.model_step(...)`` loss.
 """
 
 from __future__ import annotations
@@ -26,10 +25,8 @@ log = logging.getLogger(__name__)
 
 
 # A TIGER batch is the (model_input, label_data) tuple produced by
-# `collate_with_sid_causal_duplicate` / `collate_fn_train`. We keep this as a
-# loose `Any` alias to avoid a heavy module-level import of
-# `src.data.loading.components.interfaces` -- importing that pulls in
-# ``src.utils`` which has its own circular dependency chain.
+# `collate_with_sid_causal_duplicate` / `collate_fn_train`. A loose alias
+# avoids a circular import of `src.data.loading.components.interfaces`.
 TigerBatch = Tuple[Any, Any]
 
 
@@ -103,7 +100,7 @@ def batch_grad(
 
     Computes ``∂loss/∂params`` for one batch, divided by ``average_scale``.
     Replaces ``None`` entries (parameters that didn't participate) with zeros
-    of matching shape, exactly like the reference.
+    of matching shape.
     """
     loss = model_step_loss(model, batch)
     grads = torch.autograd.grad(
@@ -226,8 +223,8 @@ def cg_inv_hvp(
 
     Each CG iteration draws one batch from ``hvp_batches`` (cycling if it has
     fewer batches than ``max_iter``) and evaluates the HVP on that batch only.
-    This matches the ERASE behaviour of doing one HVP per CG step over the
-    retain (and clean-forget) corpus.
+    This matches ERASE, which does one HVP per CG step over the retain (and
+    clean-forget) corpus.
 
     Parameters
     ----------
@@ -236,13 +233,13 @@ def cg_inv_hvp(
         loss.
     hvp_batches
         Pre-collected list of TIGER batches (already on the right device) used
-        to estimate ``H``. **Must be non-empty.**
+        to estimate ``H``. Must be non-empty.
     v_list
         Right-hand side of the linear system, one tensor per parameter.
     params
         The parameters ``H`` is taken w.r.t. (must match ``v_list``).
     damping
-        Tikhonov regulariser on ``H``.
+        Tikhonov regularizer on ``H``.
     max_iter, tol
         Standard CG knobs. ``tol`` is on the squared residual norm.
     max_norm

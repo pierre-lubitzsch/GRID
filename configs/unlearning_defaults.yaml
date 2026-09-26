@@ -1,27 +1,12 @@
-# Shared unlearning defaults — included by experiment configs via defaults list.
+# Shared unlearning defaults, included by experiment configs via the defaults list.
 
 unlearning:
   algorithm: scif  # scif | seif | kookmin | fanchuan | unified | finetune | neg_train | filter | retrain
   deletion_spec: session  # session | item | item_pairs
-  # item_pairs mode: unlearn only the (prefix → target_item) training pairs
-  # from spam sessions.  Set unlearn_whole_items: true to also unlearn those
-  # pairs from clean retain sessions (suppresses the target item globally).
-  # In sequential mode use request_user_order: sorted (not manifest) because
-  # item_pairs entries have synthetic user_ids that do not appear in the manifest.
+  # item_pairs: unlearn only the (prefix, target_item) pairs from spam sessions.
+  # unlearn_whole_items: also unlearn those pairs from retain sessions.
   unlearn_whole_items: false
-  # item_pairs only: ALSO emit the rows where a target item sits in the model's
-  # INPUT history, not just the rows where it is the label.
-  #
-  # For a session [i_1..i_n] with a target at position j, the default emits only
-  # seq[:j+1] (target as label). With this on it additionally emits every
-  # seq[:k+1] for k > j, where the target conditions the prediction of a later
-  # item. Those rows are genuinely part of a SENSITIVE-item deletion request:
-  # the model still conditions on the user's alcohol purchase when predicting
-  # their next item, so leaving them in means the interaction was not unlearned.
-  #
-  # Default false because for SPAM the attack operates through the TARGET, and
-  # every recorded spam result must keep its exact forget set. Turn it on for
-  # the sensitive-category scenario.
+  # item_pairs only: also emit rows where a target item appears in the input history.
   include_context_rows: false
   forget_size: null
 
@@ -54,87 +39,35 @@ unlearning:
   max_norm: null
   update_max_norm: 1.0
   batch_size_per_device: 256
-  # Forget-set coverage. collate_with_sid_causal_duplicate expands each sequence
-  # into all its contiguous prefixes and then draws max_batch_size (512) of them
-  # with torch.randint, WITH REPLACEMENT. Below the cap nothing is lost, which is
-  # 94% of recorded requests; above it rows repeat and part of the expansion is
-  # never seen. forget_full_coverage lifts the cap for the FORGET loader only and
-  # splits the expansion into forget_rows_per_batch chunks instead. The step
-  # budget does not change: unified.py accumulates q_forget = ceil(n_forget /
-  # n_retain) forget mini-batches per optimizer step, so every forget row
-  # contributes exactly once per pass either way.
-  #
-  # Default false so every recorded run keeps the batch it was produced with.
+  # Forget-set coverage: if true, the forget loader uses every prefix row, split into
+  # batches of forget_rows_per_batch, instead of sampling max_batch_size rows.
   forget_full_coverage: false
   forget_rows_per_batch: 512
   target_params: tiger
   eval_mode: true
   rows_per_shard: 4096
 
-  # --- RQ-ID position-wise intervention (scif; parameter restriction) ---
-  # Confine the SCIF update to selected RQ semantic-ID code positions. This is
-  # the more general sibling of adaptive_codes (which only freezes a contiguous
-  # *prefix*): update_positions accepts ANY subset of code positions.
-  #   null / "all"  -> no restriction (uses target_params over the whole model)
-  #   [0]           -> c1 only         [2,3] -> [c3,c4]      [0,1] -> [c1,c2]
-  #   [c1,c2]       -> same as [0,1]   (cN names are 1-based; bare ints 0-based)
-  # When set, ONLY those positions' params move: decoder head decoder_mlp[h] +
-  # SID embedding rows [h*K,(h+1)*K). The shared transformer backbone stays
-  # frozen unless update_positions_backbone=true.
+  # Restrict the SCIF update to selected semantic-ID code positions: null or "all"
+  # (no restriction), a list of 0-based ints (e.g. [0,1]), or 1-based names (e.g. [c1,c2]).
+  # Only the selected decoder heads and SID embedding rows move unless
+  # update_positions_backbone=true.
   update_positions: null
-  # --- code-row scope for the unified update (algorithm=unified) -------------
-  # update_positions / adaptive_code_lr_scale choose which code LEVELS move;
-  # every one of the K rows in a chosen level moves with them. That is blunt for
-  # a deletion: a level-0 code is shared by ~47 items at width 256, so updating
-  # the whole block edits the identifier space of thousands of items that were
-  # never part of the request. This narrows the block to the rows the request
-  # actually touches. Composes with the level restriction -- "levels 0,1, forget
-  # rows only" is code_row_scope=forget plus adaptive_code_lr_scale=0.0.
-  #
-  #   all                  every row in the selected levels (DEFAULT, unchanged)
-  #   forget               rows h*K + code_h(i) for i in the forget set
-  #   forget_neighborhood  the above plus each forget item's neighbours, so the
-  #                        repair term keeps the parameters it needs to move the
-  #                        neighbourhood back
-  #
-  # The neighbour set reuses coherence_neighbor_method / neighborhood_count /
-  # neighborhood_prefix_length, so the rows that can move are the same items the
-  # coherence term is scoring.
+  # Rows of the selected code levels updated by algorithm=unified:
+  #   all                  every row
+  #   forget               only the codes of forget items
+  #   forget_neighborhood  forget items plus their neighbors
   code_row_scope: all
-  # Orthogonal LEVEL axis of the same row mask: keep only the rows of these
-  # hierarchies. Same syntax as update_positions (null / "all" -> every level;
-  # [0,1] == "c1,c2"; [2,3] == the fine tail). Crosses with code_row_scope into
-  # "which items" x "which levels".
-  #
-  # NOT the same instrument as adaptive_code_lr_scale / update_positions: those
-  # also freeze that level's decoder head decoder_mlp[h] (and, for
-  # update_positions, the backbone), which confounds "this level's identifier
-  # rows are frozen" with "this level's output head is frozen". This key touches
-  # the SID embedding table only, so the backbone and all four heads still move.
+  # Restrict the SID embedding row mask to these levels (same syntax as update_positions).
+  # Unlike update_positions, the backbone and decoder heads still move.
   code_row_levels: null
-  # Pin the ENTIRE semantic-ID embedding table for the update. The backbone and
-  # the decoder heads still move (subject to adaptive_code_lr_scale), so the
-  # identifier space is held fixed while the recommender is edited around it.
-  # Composed with adaptive_code_lr_scale=0.0 this gives: backbone moves, SID
-  # table frozen, decoder_mlp[0],[1] move, decoder_mlp[2],[3] frozen.
-  # Makes code_row_scope inert by construction -- the rows it would select are
-  # frozen anyway.
+  # Freeze the entire semantic-ID embedding table during the update.
   freeze_sid_table: false
   update_positions_backbone: false
 
-  # --- RQ-ID diagnostics (python -m src.diagnose_rq_ids) ---
-  # both | positions | code_sharing. Read-only; no weight update.
+  # RQ-ID diagnostics (TigerUnlearningModule.diagnose_rq_ids): both | positions | code_sharing.
   diagnostics_mode: both
-  # --- collateral-drift diagnosis (src/measure_collateral_drift.py) -----------
-  # Read-only. ckpt_path is the PRE-unlearning model; this is the POST one.
-  # How the collateral-drift measurement defines "neighbour".
-  #   prefix    (default) shared code-prefix length. The bucket SIZE depends on
-  #             the codebook, not the experiment: 64 / 70 / 36 items for the
-  #             beauty unpopular / mid / popular targets, so the neighbour bar
-  #             is a different sample size per stratum.
-  #   embedding k nearest items by cosine in the pre-quantization embedding
-  #             space -- exactly k per stratum, and the same space L_n samples
-  #             from (coherence_neighbor_method=embedding).
+  # Collateral-drift measurement options.
+  # drift_neighbor_mode: prefix (shared code prefix) or embedding (k nearest by cosine).
   drift_neighbor_mode: prefix
   drift_neighbor_k: 32
   drift_unlearned_ckpt: null
@@ -142,44 +75,21 @@ unlearning:
   drift_control_items: 600    # sampled non-sharing items, the comparison group
   drift_item_chunk: 64
   drift_n_boot: 2000          # bootstrap resamples for the mass-delta interval
-  # per-item position profile (src/item_position_profile.py)
+  # Per-item position profile options
   profile_max_items: 2000
 
-  # Optimizer for EVERY unlearning algorithm that runs a first-order loop
-  # (seif, kookmin, fanchuan, neg_train, finetune, unified, tracer).
-  # adam (default) | adamw | sgd. scif has no entry: it is a Newton/conjugate-
-  # gradient step, so there is no optimizer to choose.
-  # Precedence: unlearning.<algo>_optimizer > unlearning.optimizer > algorithm
-  # default. The per-algorithm keys predate this one and still win, so recorded
-  # commands keep their meaning; this key is what makes "optimizer" a real
-  # experiment axis instead of something only three algorithms respected.
-  # Mirrors the OPTIMIZER env var on run_tiger_train.sh, so one name means the
-  # same thing for training, retraining and unlearning.
+  # Optimizer for first-order unlearning algorithms: adam | adamw | sgd.
+  # Per-algorithm keys (<algo>_optimizer) take precedence when set.
   optimizer: adam
 
-  # Per-algorithm overrides, declared as null so they are SETTABLE without
-  # changing anything by default. Hydra runs in struct mode, so an undeclared
-  # key cannot be set on the command line: `unlearning.kookmin_optimizer=sgd`
-  # used to abort the job instead of choosing an optimizer. null is falsy, so
-  # _resolve_optimizer falls through to `optimizer` above exactly as an
-  # undeclared key did -- declaring these changes no current run.
-  #
-  # CAUTION for the optimizer ablation: a per-algorithm key set to a CONCRETE
-  # value shadows `optimizer` entirely. tiger_unlearn_scif_flat.yaml pins
-  # unified_optimizer: adam, finetune_optimizer: adam and tracer_optimizer: sgd,
-  # so `unlearning.optimizer=sgd` does NOT reach those three algorithms; set
-  # their per-algorithm keys directly (as the plan's ablation does for unified).
+  # Per-algorithm optimizer overrides (null falls back to `optimizer`).
   seif_optimizer: null
   kookmin_optimizer: null
   fanchuan_optimizer: null
   neg_train_optimizer: null
   finetune_optimizer: null
   unified_optimizer: null
-  # Minimum fraction of stored codes that phi=0 must reproduce before TRACER
-  # will run. 1.0 = exact, and that is the default: the check exists to catch a
-  # codebook that does not belong to this SID tensor. Lower it only for a
-  # mismatch you have counted and understood (toys/rqvae: 1 item of 11,924, a
-  # tie-break), never to make an unexplained failure go away.
+  # Minimum fraction of stored codes that TRACER must reproduce at phi=0 (1.0: exact).
   tracer_sid_tolerance: 1.0
   tracer_optimizer: null
 
@@ -195,184 +105,70 @@ unlearning:
   # Filter baseline (decode-time masking, no weight update)
   filter_mode: global  # global | user_dependent
 
-  # Unified objective (Step 3)
-  # L = L_R + lambda_f*L_F + lambda_s*L_sep + lambda_n*L_n
-  # L_retain always carries weight 1 (the reference scale); not a knob.
+  # Unified objective
+  # L = lambda_r*L_R + lambda_f*L_F + lambda_s*L_sep + lambda_n*L_n
   forget_loss_level: token  # token | sequence
-  # w_f: per-RQ-position weights on the FORGET term, one per code position.
-  # null -> uniform (w_f = 1), the behaviour every recorded run has. Setting one
-  # entry below 1 asks "how much of the removal does THIS code position carry?".
-  # Requires forget_loss_level=token; the sequence level has no per-position
-  # decomposition and the run fails fast rather than ignoring the weights.
+  # Per-position weights on the forget term (null: uniform; requires forget_loss_level=token).
   forget_position_weights: null
-  # w: per-SID-level weights on the ITEM-LEVEL loss (paper eq.
-  # sid-aware-item-loss). ONE vector, applied to both the retain and the forget
-  # term, matching the paper. null -> uniform w = 1, which is what every
-  # recorded run used. Requires forget_loss_level=token.
+  # Per-SID-level weights on the item-level loss, applied to retain and forget terms
+  # (null: uniform; requires forget_loss_level=token).
   position_weights: null
   lambda_f: 1.0
   lambda_s: 0.1
-  # Coherence loss L_n, prefix-neighbour variant; off by default. Teacher-forces
-  # i_T's closest catalog neighbours (shared SID prefix length >=
-  # neighborhood_prefix_length, forget items excluded) on the forget history.
+  # Weight of the coherence loss L_n on neighbors of the forget targets (0 disables).
   lambda_n: 0.0
   neighborhood_count: 4
   neighborhood_prefix_length: 2
-  # target_only (default) = score only rows whose label IS a deletion target;
-  # all = every forget row (pre-2026-08-05 behaviour, >=92% filler neighbourhoods
-  # on bandwagon — kept only to reproduce the original lambda_n grid).
+  # Coherence rows: target_only (rows whose label is a deletion target) or all.
   coherence_rows: target_only
-  # prefix (default) = shared-SID-prefix neighbourhood (width-dependent, can be
-  # empty); embedding = fixed-size top-k in the pre-quantization space
-  # (unlearning.embedding_path), never empty, width-independent;
-  # latent = fixed-size top-k in the REFINED latent space z produced by
-  # scripts/train_latent_refiner.py (unlearning.coherence_latent_path), where
-  # z_i = MLP([SIDEmb(i), x_i]); embedding+latent = the union N_emb ∪ N_z.
-  #
-  # Why a refined space at all: the 4-token SID is generation-friendly but
-  # coarse, so forget and retain signals can share a token path (~47 items share
-  # a coarse code at beauty width 256). z keeps the SID geometry the decoder
-  # reads while re-adding the item-level detail quantization discarded, so N_z
-  # is a finer-grained neighbourhood than either prefix or raw embedding. The
-  # SID pipeline itself is UNCHANGED — z is used for neighbour selection only.
+  # Neighbor selection for L_n: prefix (shared SID prefix), embedding (top-k in the
+  # pre-quantization space), latent (top-k in a refined latent space), or embedding+latent.
   coherence_neighbor_method: prefix
   coherence_embedding_metric: cosine  # cosine | l2 (embedding method only)
-  # Refined latent tensor [N, d_z], row-aligned with the SID codebook. Required
-  # by coherence_neighbor_method=latent|embedding+latent, ignored otherwise.
+  # Refined latent tensor [N, d_z] for the latent neighbor methods.
   coherence_latent_path: null
-  # Neighbourhood budget for coherence_neighbor_method=embedding+latent.
-  #   full (default) each source contributes its own neighborhood_count, so the
-  #        union holds up to 2*count items — the literal N_emb ∪ N_z.
-  #   matched  one neighborhood_count budget split between the sources
-  #        (ceil(count/2) embedding + the rest latent), so the union arm is
-  #        compared to the single-source arms at EQUAL neighbourhood size.
-  # Report both: `full` answers "does adding N_z help", `matched` answers
-  # "is the union better per neighbour" — a `full`-only win is confounded with
-  # simply teacher-forcing more items.
+  # Neighborhood budget for embedding+latent: full (count per source) or matched
+  # (one count split between sources).
   coherence_union_size: full
-  # mass = -log sum_p p(s_p | H_f), bounded and satisfiable (recommended);
-  # nll = TRACER Eq. 9 per-neighbour -log p, infeasible optimum (back-compat);
-  # suppress = -log(1 - sum_p p), DRAINS the neighbourhood instead of repairing
-  # it (sensitive-item deletion). Prefer it over a NEGATIVE lambda_n: the sign
-  # flip also drains the neighbourhood, but its gradient is constant in log-mass,
-  # so it never converges and the objective is unbounded below. Negative lambda_n
-  # is allowed (it warns) so the sign-flip ablation stays runnable.
+  # Coherence loss: nll (per-neighbor -log p), mass (-log of neighborhood mass),
+  # or suppress (-log(1 - mass), removes the neighborhood).
   coherence_loss_type: nll
-  # Clamp on neighbourhood mass for coherence_loss_type=suppress; inert otherwise.
+  # Mass clamp for coherence_loss_type=suppress.
   coherence_mass_cap: 0.999
-  # InfoNCE temperature for L_sep. 0.07 is what EVERY recorded run used --
-  # no sweep has ever overridden it. The Jun-2026 slides quote 0.007; that
-  # value was never run, and since r_u/z_i are L2-normalised (cosine in
-  # [-1,1]) it would put logits in +-143 instead of +-14.3, a very different
-  # regime. Treat 0.07 as the value of record.
+  # InfoNCE temperature for L_sep (cosine scoring).
   sep_temperature: 0.07
-  # L_sep negatives (default CHANGED 2026-08-07: forget -> forget_target_only).
-  #   forget_target_only (default) only the n_target spam target items.
-  #   forget             ALL visible I_f forget-shard items -- under
-  #                      deletion_spec=session that is every distinct item in the
-  #                      spam sessions, i.e. mostly the POPULAR FILLER items. That
-  #                      pushes retain users away from genuinely popular items,
-  #                      the same defect found in L_n. Previous default; every
-  #                      recorded sweep already passed forget_target_only
-  #                      explicitly, so no published number changes.
-  #   random_retain      ablation: randomly sampled retain-set ids, to measure how
-  #                      much the directed forget negatives actually contribute.
+  # L_sep negatives: forget_target_only | forget (all forget-set items) | random_retain.
   sep_negatives: forget_target_only
-  # What plays the role of the positive i+ in L_sep.
-  #   history (default, back-compatible) every non-padded item in the user's own
-  #           history. TAUTOLOGICAL: r_u is defined as the mean of exactly those
-  #           items' representations, so sim(r_u, z_i+) is a mean vector scored
-  #           against its own constituents -- high by construction, nearly
-  #           constant, contributing almost no gradient. The loss then degenerates
-  #           into one-sided repulsion from I_f.
-  #   label   the batch LABEL item (the next item actually consumed). A genuine
-  #           positive: it is what the model must predict and it is NOT part of
-  #           r_u, so the numerator carries real gradient.
+  # L_sep positive: history (items in the user's history) or label (the next item).
   sep_positives: history
-  # Scoring function inside the L_sep InfoNCE.
-  #   cosine (legacy; kept for the phi ablation) sim(r_u, z_i) between pooled-encoder
-  #          vectors. Acts on a geometry the decoder never reads, so the model can
-  #          satisfy it without changing what it generates -- a 10,000x sweep of
-  #          lambda_s moves SH@10 by <1% at the operating point.
-  #   generative (DEFAULT since 2026-09-18) log p(s_i | h_u), the model's own
-  #          sequence log-probability. At
-  #          sep_gen_temperature=1 it reads literally as
-  #            -log[ p(s_i+|h_u) / (p(s_i+|h_u) + sum_f p(s_i_f|h_u)) ]
-  #          "the true next item must outrank the spam items", which is what SH@k
-  #          measures. Acts on the next-token distribution, where L_forget acts,
-  #          and complements it: L_forget suppresses the target on FORGET
-  #          histories, this enforces the ranking on RETAIN histories. The
-  #          positive is always the label (sep_positives is ignored).
-  #          KEEP sep_negatives=forget_target_only: expanding the negative set
-  #          toward the full catalog makes the denominator approach the model's
-  #          own normaliser, degenerating the loss into -log p(s_i+|h_u) = the
-  #          retain CE, and costs 1+|N| teacher-forced decoder passes.
+  # L_sep scoring: cosine (pooled encoder vectors) or generative (sequence
+  # log-probability log p(s_i | h_u); the positive is always the label).
   sep_loss_type: generative
-  # Temperature for sep_loss_type=generative ONLY -- deliberately separate from
-  # sep_temperature. Cosine logits are bounded to +-1/tau by L2 normalisation;
-  # sequence log-probs are unbounded below, so reusing 0.07 here would be a very
-  # different regime. 1.0 is also the only value at which the probability reading
-  # above holds.
+  # Temperature for sep_loss_type=generative.
   sep_gen_temperature: 1.0
-  # Number of random negatives when sep_negatives=random_retain
-  # (null → match the size of the default neighbor negative set).
+  # Number of random negatives when sep_negatives=random_retain (null: match default set size).
   sep_num_random_negatives: null
   unified_steps: 500
-  # Shared "number of passes/epochs" knob.
-  #   unified: total optim steps = n_epochs * min(n_forget_batches, n_retain_batches);
-  #            if set, takes priority over unified_steps.
-  #   seif:    number of repair epochs (overrides seif_repair_epochs).
-  # null → each algorithm uses its own per-algorithm default.
+  # Number of passes. unified: total steps = n_epochs * min(n_forget_batches, n_retain_batches),
+  # overriding unified_steps; seif: repair epochs. null uses per-algorithm defaults.
   n_epochs: null
-  # lambda_r: weight on the RETAIN (repair) term. 1.0 = current behaviour.
-  # Exists so the ascent/descent baselines are exact special cases of this
-  # objective instead of separate implementations, which removes every
-  # incidental difference (batching, optimizer, step budget, one accumulated
-  # update vs alternating updates) from the comparison:
-  #   lambda_r=1 lambda_f=0 lambda_s=0 lambda_n=0  -> finetune (retain only)
-  #   lambda_r=1 lambda_f=w lambda_s=0 lambda_n=0  -> neg_train, simultaneous
-  #                                                   form (l_forget = -CE, so
-  #                                                   lambda_f > 0 is ascent)
-  #   lambda_r=0 lambda_f=w lambda_s=0 lambda_n=0  -> pure ascent, no repair
+  # Weight on the retain term. Special cases: lambda_f=lambda_s=lambda_n=0 gives finetune;
+  # lambda_r=0 with lambda_f>0 gives pure gradient ascent.
   lambda_r: 1.0
   unified_lr: 1.0e-4
 
-  # Stable-Adaptive Semantic IDs (unlearning-aware ID design; wired for
-  # algorithm=unified). adaptive_codes=true confines the update to the adaptive
-  # (fine-grained) tail [stable_codes, num_hierarchies) of each item's RQ id:
-  # only those SID embedding rows + decoder heads move; stable codes are frozen.
-  # Align neighborhood preservation with sid_prefix_length=stable_codes.
-  # adaptive_update_backbone also lets the shared transformer backbone move.
+  # Stable/adaptive semantic IDs (algorithm=unified): adaptive_codes restricts the update
+  # to the code positions [stable_codes, num_hierarchies).
   adaptive_codes: false
   stable_codes: 2
   adaptive_update_backbone: false
-  # adaptive_adapter=true ("option 2"): freeze the shared adaptive table/heads
-  # and train a per-item, per-adaptive-position offset (masked to forget∪
-  # neighbor items) for genuinely item-local updates. Default false ("option 1":
-  # move shared adaptive rows + heads). Option 2 adds adaptive_item_offset to the
-  # checkpoint; eval with +model.adaptive_item_offset_stable_codes=<stable_codes>.
+  # Train per-item offsets for adaptive positions instead of the shared rows and heads.
   adaptive_adapter: false
-  # SOFT identifier-space rates (algorithm=unified). code_lr_scale multiplies the
-  # lr of ALL semantic-ID code params (SID table + decoder heads);
-  # adaptive_code_lr_scale multiplies the ADAPTIVE tail [stable_codes, H) again
-  # on top of it, so the coarse (shared) and fine (near-unique) codes can move at
-  # different speeds. See configs/experiment/tiger_unlearn_scif_flat.yaml for the
-  # full rationale. Both default to 1.0 = one lr for every parameter, which is
-  # what every recorded unified result used; lower them only in an experiment
-  # that says so explicitly.
+  # Learning-rate multipliers (algorithm=unified): code_lr_scale for all SID code parameters,
+  # adaptive_code_lr_scale additionally for positions [stable_codes, H).
   code_lr_scale: 1.0
   adaptive_code_lr_scale: 1.0
-  # Multiplier on the learning rate for the STABLE (coarse) code positions
-  # [0, stable_codes) only: SID table rows [0, stable_codes*K) and the decoder
-  # heads decoder_mlp[:stable_codes]. Mirror of adaptive_code_lr_scale.
-  #
-  # Why it exists: adaptive_code_lr_scale measured inert across 270 runs on all
-  # three strata, because the adaptive TAIL barely moves anyway (mean |delta|
-  # 3.0e-04 vs 5.9e-04 on the stable rows, and the last hierarchy is only a
-  # dedup digit). The coarse codes are the ones ~47 items share on average at
-  # width 256, so they are where a code update is genuinely non-local -- and the
-  # adaptive knob never touched them. Composes with code_lr_scale and
-  # adaptive_code_lr_scale; 1.0 (default) preserves current behaviour exactly.
+  # Learning-rate multiplier for the stable code positions [0, stable_codes).
   stable_code_lr_scale: 1.0
 
   # Kookmin (gradient-guided reinitialization + scaled retain repair)
@@ -395,10 +191,10 @@ unlearning:
   seif_repair_epochs: 4
   seif_repair_lr: 0.0007
   seif_weight_decay: 0.0005
-  # null → target params whose name contains "embedding" or "mlp"
+  # null: target parameters whose name contains "embedding" or "mlp"
   seif_noise_param_keywords: null
 
-  # Step 4 local repair (optional, default off)
+  # Local repair (optional)
   local_repair:
     enabled: false
     logit_suppression: false

@@ -1,24 +1,10 @@
-"""Save / restore RNG states inside Lightning checkpoints.
+"""Lightning callback that saves and restores RNG states in checkpoints.
 
-Lightning checkpoints carry model weights, optimizer states and the fit-loop
-state, but NOT the random-number-generator states — so a run resumed via
-``trainer.fit(ckpt_path=...)`` re-seeds from scratch and its stochastic
-trajectory (dropout masks, samplers, torch randomness) is not the reproducible
-continuation the checkpoint implies. This callback closes that gap: it stores
-the python/numpy/torch/per-device-CUDA RNG states in every checkpoint and
-restores them when a checkpoint is loaded for resume.
-
-Notes
------
-* Restoring happens on whatever process loads the checkpoint; under DDP each
-  rank loads the same file, so all ranks are restored to rank-0's saved state.
-  Combined with ``DETERMINISTIC=1`` this makes a resumed run reproducible
-  (re-running the same resume yields the same trajectory). It does NOT make the
-  resumed run identical to a hypothetical uninterrupted run: the streaming
-  TFRecord dataloader cannot seek, so the input stream restarts on resume.
-* CUDA states are restored only for as many devices as are present at load
-  time; a device-count mismatch degrades gracefully (extra saved states are
-  ignored, missing ones left untouched).
+Stores the python, numpy, torch and per-device CUDA RNG states in every
+checkpoint and restores them when a checkpoint is loaded for resume. Under DDP
+all ranks restore rank 0's saved state. The streaming dataloader cannot seek, so
+a resumed run is reproducible but not identical to an uninterrupted one. CUDA
+states are restored only for the devices present at load time.
 """
 
 import logging
@@ -56,7 +42,7 @@ class RngStateCallback(Callback):
         if not states:
             log.info(
                 "[RngStateCallback] checkpoint has no saved RNG states "
-                "(pre-callback checkpoint) — resuming with fresh seeding."
+                "; resuming with fresh seeding."
             )
             return
         random.setstate(states["python"])
@@ -70,7 +56,7 @@ class RngStateCallback(Callback):
             if len(cuda_states) != torch.cuda.device_count():
                 log.warning(
                     "[RngStateCallback] CUDA device count changed "
-                    "(saved %d, present %d) — restored the first %d.",
+                    "(saved %d, present %d); restored the first %d.",
                     len(cuda_states),
                     torch.cuda.device_count(),
                     n,

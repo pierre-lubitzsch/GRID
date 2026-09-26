@@ -1,4 +1,4 @@
-"""Step 4 local distribution repair losses (optional, gated by config)."""
+"""Optional local distribution repair losses, gated by config."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def apply_local_repair_losses(
     neighbor_item_ids: Optional[Set[int]] = None,
     batch: Any = None,
 ) -> torch.Tensor:
-    """Add optional Step-4 repair terms when ``local_repair.enabled`` is true."""
+    """Add optional repair terms when ``local_repair.enabled`` is true."""
     if not local_repair_cfg or not local_repair_cfg.get("enabled", False):
         return base_loss
 

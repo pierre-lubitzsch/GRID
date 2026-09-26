@@ -1,28 +1,18 @@
-"""Seif unlearning, ported from ``def seif`` in
-https://github.com/deem-data/erase-bench/blob/main/recbole/trainer/trainer.py
-and adapted to TIGER's ``(SequentialModelInputData, SequentialModuleLabelData)``
-batches and ``model.model_step(...)`` loss.
+"""Seif unlearning (noise + repair), ported from the ERASE benchmark's RecBole
+trainer and adapted to TIGER batches and the ``model.model_step(...)`` loss.
+Seif is distinct from SCIF (``scif.py``). It has two phases:
 
-Seif (the NeurIPS-2023 Machine Unlearning Challenge "noise + repair" winner)
-is **distinct from SCIF** (the influence-function method in ``scif.py``). It has
-two phases:
-
-    Phase 1 -- Erase
+    Phase 1 (erase)
         Add multiplicative Gaussian noise ``θ += N(0, std) * |θ|`` to the
-        knowledge-bearing parameters (selected by name keyword). This corrupts
-        the model so it forgets, then we repair the useful part back.
+        parameters selected by name keyword.
 
-    Phase 2 -- Repair
+    Phase 2 (repair)
         Fine-tune on the retain corpus for ``repair_epochs`` epochs. Before the
-        final epoch a smaller "robustness" noise (``erase_std_final``) is
-        injected again (ERASE applies it at ``repair_epoch == repair_epochs-2``).
+        final epoch a smaller noise (``erase_std_final``) is injected again.
 
-The reference targets vision conv layers via name keywords; for TIGER we target
-the SID embedding table (``…embedding…``) and the decoder projection heads
-(``…mlp…``) by default — the most knowledge-bearing parameters. ERASE also
-down-weights the loss on interactions containing forget items during repair;
-GRID's retain subset is forget-free, so that term is a no-op here and is
-omitted.
+By default the SID embedding table and the decoder projection heads are
+perturbed. The retain subset contains no forget items, so ERASE's forget-item
+loss down-weighting is omitted.
 """
 
 from __future__ import annotations
@@ -97,9 +87,7 @@ def seif_unlearn(
     retain_batches
         Pre-collected retain TIGER batches already on ``device`` (repair set).
     forget_batches
-        Unused for the weight update (kept for dispatch symmetry / logging);
-        ERASE's forget-item loss weighting is a no-op on GRID's forget-free
-        retain subset.
+        Unused for the weight update (kept for interface symmetry and logging).
     erase_std
         Std of the erase-phase multiplicative Gaussian noise.
     erase_std_final
@@ -107,10 +95,10 @@ def seif_unlearn(
     repair_epochs
         Number of repair passes over ``retain_batches``.
     repair_lr, weight_decay
-        Repair Adam optimiser hyper-parameters.
+        Repair optimizer hyperparameters.
     noise_param_keywords
         Name substrings identifying which parameters to perturb. Defaults to
-        ``("embedding", "mlp")``. Falls back to *all* trainable params if no
+        ``("embedding", "mlp")``. Falls back to all trainable params if no
         name matches (with a warning).
     """
     if not retain_batches:
@@ -120,9 +108,8 @@ def seif_unlearn(
     model.train()
     pkm_only = str(update_scope or "all").strip().lower() == "pkm_only"
     if pkm_only:
-        # seif matches parameters BY NAME, so derive the allow-list from the
-        # actual PKM tensors instead of guessing a keyword. Without this the
-        # erase noise would hit the backbone and 'pkm_only' would be a lie.
+        # Seif matches parameters by name, so use the PKM tensor names as the
+        # keyword list.
         _, _pkm_names = select_pkm_params(
             model, include_keys=pkm_update_keys, include_query=pkm_update_query
         )
@@ -144,7 +131,7 @@ def seif_unlearn(
         )
     if n_noised == 0:
         log.warning(
-            "[seif] no parameters matched keywords %s; falling back to ALL "
+            "[seif] no parameters matched keywords %s; falling back to all "
             "trainable params for the erase noise",
             keywords,
         )
@@ -187,7 +174,7 @@ def seif_unlearn(
             opt.step()
             losses.append(float(loss.detach().cpu()))
 
-        # robustness noise just before the final epoch (ERASE parity)
+        # robustness noise just before the final epoch
         if repair_epoch == int(repair_epochs) - 2:
             n_robust = _add_multiplicative_noise(
                 model, erase_std_final, fallback_keywords

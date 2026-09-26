@@ -109,7 +109,7 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
         ckpt_path = cfg.get("ckpt_path", None)
         if not ckpt_path:
             raise ValueError(
-                "ckpt_path is required for unlearning -- pass the pre-trained "
+                "ckpt_path is required for unlearning; pass the pre-trained "
                 "(poisoned) TIGER checkpoint."
             )
         command_line_logger.info(f"Loading TIGER checkpoint from {ckpt_path}")
@@ -136,10 +136,8 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
                 f"{'...' if len(load_result.unexpected_keys) > 5 else ''}"
             )
 
-        # PKM CONTROL: re-initialise selected FFN sub-layers, keeping them as
-        # ordinary FFNs. MUST happen AFTER load_state_dict — unlike PKM params
-        # (missing keys that keep their fresh init), FFN weights are present in
-        # the checkpoint and the load would overwrite any earlier reinit.
+        # Reinitialize selected FFN sub-layers. This must run after load_state_dict,
+        # which would otherwise overwrite the reinitialized weights.
         _ffn_reinit = cfg.get("ffn_reinit_layers", None)
         if _ffn_reinit is not None:
             names = model.reinit_ffn_layers(
@@ -147,8 +145,8 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
                 if hasattr(_ffn_reinit, "_content") else _ffn_reinit
             )
             command_line_logger.warning(
-                f"[PKM CONTROL] re-initialised {len(names)} FFN sub-layer(s) "
-                f"AFTER checkpoint load: {names}"
+                f"[ffn_reinit] reinitialized {len(names)} FFN sub-layer(s) "
+                f"after checkpoint load: {names}"
             )
 
         device = torch.device(
@@ -250,7 +248,7 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
         )
         if not request_batches:
             raise ValueError(
-                "No request batches built — check forget_manifest / "
+                "No request batches built; check forget_manifest / "
                 "request_batch_size / max_requests."
             )
         n_batches = len(request_batches)
@@ -296,11 +294,8 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
         os.makedirs(ckpt_dir, exist_ok=True)
         per_request: List[Dict[str, Any]] = []
         prev_ckpt_path: Optional[str] = None
-        # The filter baseline installs a decode mask on the module and performs no
-        # weight update, so the mask is NOT in the checkpoint. Request dirs are
-        # deleted when cleanup_request_dirs is on, which used to take the
-        # per-request filter_mask.json with them; the union is persisted at the run
-        # root so the post-unlearn eval can reinstall it via decode_filter_mask.
+        # The filter baseline only installs a decode mask, which is not stored in the
+        # checkpoint; the union of masks is saved at the run root for evaluation.
         filter_masks: List[Dict[str, Any]] = []
 
         for k, forget_uids in enumerate(request_batches):

@@ -224,15 +224,14 @@ def sinkhorn(
 ) -> torch.Tensor:
     """Sinkhorn-Knopp normalisation of ``exp(-distances / epsilon)``.
 
-    Ported verbatim from LETTER's ``RQ-VAE/models/layers.py`` (which in turn
-    follows SwAV): alternately normalise columns to ``1/B`` and rows to ``1/K``
-    so the result is a doubly-stochastic transport plan, then rescale by ``B``
-    so each sample's row sums to 1.
+    Ported from LETTER's RQ-VAE implementation (following SwAV): alternately
+    normalize columns to ``1/B`` and rows to ``1/K``, then rescale by ``B`` so
+    each sample's row sums to 1.
 
     Args:
         distances: ``[B, K]`` distances from samples to codes.
-        epsilon: entropic regularisation. Smaller = closer to a hard balanced
-            assignment, and also closer to numerical overflow.
+        epsilon: entropic regularization; smaller values give a harder
+            balanced assignment but risk numerical overflow.
         n_iters: Sinkhorn iterations.
 
     Returns:
@@ -253,11 +252,8 @@ def sinkhorn(
 def center_distances_for_constraint(distances: torch.Tensor) -> torch.Tensor:
     """Rescale distances to roughly ``[-1, 1]`` before Sinkhorn.
 
-    ``exp(-d / epsilon)`` with ``epsilon ~ 3e-3`` underflows to exactly zero for
-    any un-centred squared-Euclidean distance, which makes every row of ``Q``
-    all-zero and the resulting ``argmax`` a constant. LETTER centres first for
-    exactly this reason; without it the balanced assignment silently degenerates
-    to "everything gets code 0".
+    Without centering, ``exp(-d / epsilon)`` underflows to zero for small
+    ``epsilon`` and the assignment degenerates to a constant code.
     """
     max_distance = distances.max()
     min_distance = distances.min()
@@ -269,18 +265,10 @@ def center_distances_for_constraint(distances: torch.Tensor) -> torch.Tensor:
 class SinkhornQuantization(STEQuantization):
     """STE quantization with Sinkhorn-balanced code assignment (LETTER).
 
-    LETTER uses this on the LAST codebook level (``sk_epsilons`` defaults to
-    ``[0, 0, 0, 0.003]``) to spread items evenly over that level's codes rather
-    than letting a nearest-neighbour rule pile them onto a few popular codes.
-    Balanced assignment is one of the paper's three "code assignment diversity"
-    mechanisms, alongside the diversity loss.
-
-    ``epsilon <= 0`` degrades to plain :class:`STEQuantization`, which is how the
-    non-final levels are configured. Assignment is balanced WITHIN A BATCH, so
-    the effect depends on batch size; it is also training-time only in the sense
-    that :meth:`BaseClusteringModule.predict_step` (used for the final ID
-    assignment) always takes the ``argmin``, matching LETTER's ``use_sk=False``
-    at tokenization time.
+    LETTER applies this on the last codebook level to spread items evenly over
+    its codes. ``epsilon <= 0`` falls back to plain :class:`STEQuantization`.
+    Balancing is per batch and only used during training; final ID assignment
+    in :meth:`BaseClusteringModule.predict_step` uses ``argmin``.
     """
 
     def __init__(
@@ -309,9 +297,7 @@ class SinkhornQuantization(STEQuantization):
             self.n_iters,
         )
         if torch.isnan(q).any() or torch.isinf(q).any():
-            # Fall back rather than emit a constant id: a NaN row argmaxes to 0
-            # for every sample, which looks like a working codebook that has
-            # collapsed.
+            # Fall back to nearest neighbor if Sinkhorn is numerically unstable.
             ids = torch.argmin(distances, dim=-1)
         else:
             ids = torch.argmax(q, dim=-1)

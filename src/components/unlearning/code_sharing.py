@@ -1,17 +1,9 @@
-"""Code-sharing / collateral-damage static analysis for TIGER RQ semantic IDs.
+"""Static code-sharing analysis for RQ semantic IDs.
 
-Answers the first half of the "Code sharing and collateral damage" question:
-count how many *retained* (non-target) catalog items share a target item's full
-RQ code or a code *prefix*. Over-shared codes / prefixes are the structural
-mechanism by which unlearning a spam target can drag down legitimate neighbours
-(collateral forgetting), so this report quantifies the exposure before any
-drift is measured.
-
-This is a pure function of the semantic-ID tensor and the forget manifest's
-``target_items`` — no model / checkpoint needed. The companion
-``position_diagnostics`` covers the gradient side; the drift measurement (how
-much shared items actually move after unlearning) is a separate before/after
-step.
+Counts how many retained (non-target) catalog items share a target item's full
+RQ code or a code prefix. Shared codes and prefixes are a structural route for
+collateral forgetting during unlearning. Requires only the semantic-ID tensor and
+the forget manifest's ``target_items``.
 """
 
 from __future__ import annotations
@@ -30,10 +22,9 @@ def load_codebook_matrix(
 ) -> torch.Tensor:
     """Load the semantic-ID tensor and return it as ``[num_items, H]`` (long).
 
-    The on-disk ``merged_predictions_tensor.pt`` is laid out ``[H, num_items]``
-    (same convention used by the evaluator's target mapping ``sem[:h, idx].t()``).
-    We transpose to ``[num_items, H]`` so each row is one item's code tuple, and
-    optionally slice to the first ``num_hierarchies`` codes.
+    The on-disk ``merged_predictions_tensor.pt`` is laid out ``[H, num_items]``.
+    It is transposed so each row is one item's code tuple, and optionally sliced
+    to the first ``num_hierarchies`` codes.
     """
     obj = torch.load(semantic_id_path, map_location="cpu")
     if isinstance(obj, dict):
@@ -74,9 +65,8 @@ def code_sharing_report(
     a target nor padding) whose first ``p`` codes equal the target's first ``p``
     codes.
 
-    Returns per-prefix aggregates plus per-target detail. ``shared_retained_total
-    _unique`` is the size of the union over all targets (items that would be
-    touched by *any* target at that prefix length).
+    Returns per-prefix aggregates plus per-target detail.
+    ``shared_retained_total_unique`` is the size of the union over all targets.
     """
     codebook = load_codebook_matrix(semantic_id_path, num_hierarchies)
     num_items, H = codebook.shape

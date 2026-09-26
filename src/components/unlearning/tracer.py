@@ -1,28 +1,23 @@
 """TRACER: Token ReAssignment for Concept ERasure (arXiv:2606.07688).
 
-A faithful port of the paper's method as an unlearning baseline. TRACER does not
-suppress a concept's logits -- it *reassigns* the concept's items to different
-codewords, nudging them off tokens that the retain set shares.
+Port of TRACER as an unlearning baseline. Instead of suppressing a concept's
+logits, TRACER reassigns the concept's items to different codewords, moving
+them off tokens shared with the retain set.
 
 Objective (Eq. 10):
 
     L = L_R + lambda_1 * L_F + lambda_2 * L_Coh + lambda_3 * L_reg
 
-  L_R   (Eq. 7)  retain NLL                       -- keep utility
-  L_F   (Eq. 8)  +sum log p on the forget set     -- minimising it lowers p
-  L_Coh (Eq. 9)  -1/K sum over P(i_T) of log p    -- the coherence regulariser;
-                 P(i_T) is the top-K nearest items to the CONCEPT item i_T in
-                 the frozen dense embedding space, with the concept set itself
-                 excluded.
-  L_reg (Eq. 6)  sum |phi|                        -- keep reassignment sparse
+  L_R   (Eq. 7)  retain NLL
+  L_F   (Eq. 8)  +sum log p on the forget set
+  L_Coh (Eq. 9)  -1/K sum over P(i_T) of log p, where P(i_T) is the top-K
+                 nearest items to the concept item i_T in the frozen dense
+                 embedding space, excluding the concept set.
+  L_reg (Eq. 6)  sum |phi|, keeps the reassignment sparse
 
-P(i_T) IS BUILT BY TRACER ITSELF. It deliberately does NOT go through this
-repo's ``_build_coherence_neighbors`` / ``coherence_*`` machinery, and does not
-reuse the prefix neighbourhood: that construction is a contribution of ours, and
-a baseline that borrows it is not a baseline. ``_run_tracer`` computes the
-cosine top-K over the same dense embeddings the quantizer was fitted on and
-hands them here as ``concept_neighbor_sids`` ``[M, K, H]``; the loss itself is
-:func:`tracer_coherence_loss` below, not ``model.compute_coherence_loss``.
+P(i_T) is computed by the caller (cosine top-K over the embeddings the quantizer
+was fitted on) and passed as ``concept_neighbor_sids`` ``[M, K, H]``; it is
+independent of the prefix-neighborhood machinery used elsewhere.
 
 Trainable: the backbone ``theta`` and the reassignment scores ``phi``.
 Frozen: the codebooks and the encoder representations behind the residuals.
@@ -31,14 +26,12 @@ The selective-update mask (Eq. 11)
 
     M_{i,k}^l = 1[ rho_l(k) > rho_bar_{i,l} ] * 1[ grad_{phi} L_F > 0 ]
 
-restricts phi to codewords MORE shared with the retain set than the item's
-current assignment is -- note it needs the gradient of ``L_F`` *alone*, not of
-the total, so that term gets its own ``autograd.grad`` before the joint backward.
+restricts phi to codewords more shared with the retain set than the item's
+current assignment. It uses the gradient of ``L_F`` alone, computed with a
+separate ``autograd.grad`` before the joint backward.
 
-After training, ``commit=True`` takes the hard ``argmax_k q_phi`` and returns the
-reassigned codes. THE CALLER MUST WRITE THOSE INTO THE SID TENSOR AND POINT
-``semantic_id_path`` AT IT -- SH/ASI/TPM map target items through that tensor, so
-stale codes yield plausible-looking but meaningless numbers.
+With ``commit=True`` the hard ``argmax_k q_phi`` codes are returned. The caller
+must write them into the SID tensor used at evaluation time.
 """
 
 from __future__ import annotations
@@ -85,13 +78,8 @@ def tracer_coherence_loss(
                     sum_l log p_theta(s_l^p | T(H_f), s_{<l}^p)
 
     ``concept_neighbor_sids`` is ``[M, K, H]``: for each concept item (phi row
-    ``m``) the raw semantic ids of its ``K`` embedding-space neighbours, built by
-    the TRACER entry point. Rows of ``batch`` whose label is not a concept item
-    contribute nothing -- Eq. 9 is defined per forget target ``i_T``.
-
-    Deliberately independent of ``model.compute_coherence_loss`` and of the
-    repo's neighbourhood config, so this baseline borrows none of our
-    neighbourhood machinery; only the generic teacher-forced scorer is shared.
+    ``m``) the raw semantic ids of its ``K`` embedding-space neighbors. Rows of
+    ``batch`` whose label is not a concept item contribute nothing.
     """
     model_input, _ = batch
     device = model_input.mask.device
@@ -151,8 +139,7 @@ def tracer_unlearn(
     ``[M, L]`` reassignment when ``commit`` is set.
 
     ``residuals``/``centroids``/``codes`` must come from the RQ-KMeans checkpoint
-    that produced ``codes`` -- ``tracer_tokenizer.assert_reproduces_sids`` is the
-    guard, and the caller is expected to have run it.
+    that produced ``codes`` (checked by ``tracer_tokenizer.assert_reproduces_sids``).
     """
     device = device or next(model.parameters()).device
     if not retain_batches:
@@ -183,13 +170,7 @@ def tracer_unlearn(
         {"params": theta, "lr": float(lr)},
         {"params": [phi], "lr": float(phi_lr)},
     ]
-    # The paper writes plain gradient descent -- "theta <- theta - eta * grad;
-    # phi <- phi - eta_phi * (M .* grad)" -- and never names an optimizer, so SGD
-    # is the literal reading and the default here. `adam` / `adamw` are available
-    # as explicit deviations; both change the effective per-coordinate step size,
-    # which matters for phi because the Eq. 11 mask zeroes most of its gradient
-    # and the moment estimates get diluted on the masked steps. adamw also
-    # decouples weight decay, which would compete with L_reg's explicit L1 on phi.
+    # Default is plain SGD, matching the update rule in the TRACER paper.
     optimizer = str(optimizer).lower()
     opt = build_optimizer(optimizer, groups, float(lr), algo="tracer")
 
@@ -215,11 +196,10 @@ def tracer_unlearn(
         f_batch = batch_to_device(forget_batches[step % n_forget], device)
         r_batch = batch_to_device(retain_batches[step % n_retain], device)
 
-        # Eq. 8. Our _batch_loss_from_model_step is the NLL, so its negation is
-        # the +sum log p the paper minimises.
+        # Eq. 8: negated NLL.
         l_forget = -model._batch_loss_from_model_step(f_batch)
 
-        # Eq. 11 needs grad of L_F ALONE w.r.t. phi, before the joint backward.
+        # Eq. 11 needs the gradient of L_F alone w.r.t. phi, before the joint backward.
         grad_phi_forget = None
         if selective_update:
             (grad_phi_forget,) = torch.autograd.grad(
@@ -309,10 +289,7 @@ def tracer_unlearn(
         new_codes = model.commit_token_reassignment().cpu()             # [M, L]
         old_codes = codes[:n_levels][:, concept_item_ids.long()].T.cpu()
         changed = (new_codes != old_codes)
-        # Plain lists, not tensors: scif_info.json / the checkpoint metadata go
-        # through json.dumps(default=str), and str(tensor) TRUNCATES with "..."
-        # once the concept set grows -- i.e. the reassignment would be silently
-        # unrecoverable from the run artefacts.
+        # Stored as lists, since str(tensor) truncates large tensors in JSON output.
         info["new_codes"] = new_codes.tolist()
         info["old_codes"] = old_codes.tolist()
         info["concept_item_ids"] = concept_item_ids.cpu().tolist()
@@ -326,8 +303,7 @@ def tracer_unlearn(
             100.0 * info["frac_items_reassigned"],
         )
         log.warning(
-            "[tracer] the reassigned codes MUST be written into the SID tensor and "
-            "passed as semantic_id_path at eval time -- SH/ASI/TPM map targets "
-            "through it, so stale codes score the wrong items silently."
+            "[tracer] write the reassigned codes into the SID tensor and pass it "
+            "as semantic_id_path at eval time; otherwise metrics use stale codes."
         )
     return info

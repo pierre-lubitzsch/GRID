@@ -1,39 +1,18 @@
-"""Input-side aggregation of an item's semantic-ID *token* embeddings into a
-compact item representation.
+"""Input-side aggregation of an item's semantic-ID token embeddings.
 
-Motivation ("Longer IDs for finer-grained neighborhoods", Jul 3): with longer RQ
-IDs (L in {8, 16}) the TIGER encoder would otherwise see L token positions per
-history item, making the encoder input sequence L times longer. These mergers
-compress each item's L per-hierarchy token embeddings into fewer encoder input
-vectors, keeping the encoder sequence short.
+With longer RQ IDs (for example L in {8, 16}) the encoder would see L token
+positions per history item. These mergers compress each item's L per-level token
+embeddings into fewer encoder input vectors. The decoder still generates the full
+L-token semantic ID.
 
-Two strategies are provided (both operate purely on the *input* side; the
-decoder still generates the full L-token semantic ID autoregressively):
+* :class:`MeanTokenMerger`: mean pooling, one vector per item.
+* :class:`SumTokenMerger`: sum pooling, one vector per item.
+* :class:`AttentiveTokenMerger`: the Attentive Token Merger of ACERec
+  (https://arxiv.org/abs/2602.13573), which cross-attends ``k`` learnable
+  queries over the item's tokens and optionally appends an Intent Token.
 
-* :class:`MeanTokenMerger` -- Option 1: mean pooling over the token embeddings
-  -> ONE vector per item.
-* :class:`AttentiveTokenMerger` -- Option 2: the Attentive Token Merger of
-  ACERec (https://arxiv.org/abs/2602.13573):
-
-      Ẽ_i = E_i + P                            (learnable positional embeddings)
-      s_i = f_s(E_i)                           (item-level summary; nonlinear proj)
-      Q_i = Q  [+ f_q(s_i)]                     (k learnable latents; optionally
-                                                 content-adaptive from s_i)
-      Z_i = f_out( f_attn(Q_i, Ẽ_i, Ẽ_i) )     (f_out = MLP)
-      Z̃_i = [Z_i ; h_i],  h_i = s_i            (optional per-item Intent Token)
-
-  i.e. a compression from ``L`` tokens to ``k`` latents (default k=4), plus an
-  optional Intent Token (off by default here -> ``k`` output tokens per item;
-  ``k+1`` when the Intent Token is enabled).
-
-All mergers share the contract::
-
-    forward(item_tokens: [B, N, L, d]) -> [B, N, k_out, d]
-
-where ``B`` is batch size, ``N`` the number of items per sequence, ``L`` the
-number of ID tokens per item (``num_hierarchies``), ``d`` the embedding dim, and
-``k_out`` the number of output tokens per item (1 for mean pooling; ``k`` or
-``k+1`` for the attentive merger, depending on the Intent Token).
+All mergers map ``[B, N, L, d] -> [B, N, k_out, d]``, where ``k_out`` is 1 for
+pooling and ``k`` (or ``k+1`` with the Intent Token) for the attentive merger.
 """
 
 from typing import Any, Dict, Optional, Union
@@ -50,13 +29,9 @@ class ItemTokenMerger(nn.Module):
 
 
 class MeanTokenMerger(ItemTokenMerger):
-    """Option 1 -- mean pooling over an item's token embeddings.
+    """Mean pooling over an item's token embeddings (``k_out = 1``).
 
-    Parameter-free: the compact item representation is the arithmetic mean of the
-    item's ``L`` per-hierarchy token embeddings (``k_out = 1``). All ``L`` tokens
-    of a (non-padded) item are always valid -- padding is applied whole-item -- so
-    no intra-item masking is needed; padded items are dropped downstream via the
-    encoder attention mask.
+    Padding is applied per whole item, so no intra-item masking is needed.
     """
 
     def forward(self, item_tokens: torch.Tensor) -> torch.Tensor:
@@ -65,21 +40,10 @@ class MeanTokenMerger(ItemTokenMerger):
 
 
 class SumTokenMerger(ItemTokenMerger):
-    """Option 1b -- sum pooling over an item's token embeddings (``k_out = 1``).
+    """Sum pooling over an item's token embeddings (``k_out = 1``).
 
-    Since padding is applied whole-item, every non-padded item has exactly
-    ``L = num_hierarchies`` tokens, so ``sum = L * mean`` EXACTLY -- the two
-    differ only by a fixed scalar. That is not a no-op in this architecture:
-    T5's ``T5LayerNorm`` is RMS-norm and therefore scale-invariant, but T5 is
-    **pre-norm**, so the residual stream carries the un-scaled value. Multiplying
-    the encoder inputs by ``L`` thus changes the ratio of raw-embedding signal to
-    processed signal along the residual path -- effectively an embedding-scale
-    change, which is worth measuring rather than assuming away.
-
-    Shares :class:`MeanTokenMerger`'s weakness: pooling treats the RQ levels as
-    exchangeable and discards which level a code came from. Only
-    :class:`AttentiveTokenMerger` preserves per-hierarchy identity (via its
-    positional embeddings).
+    Equal to ``L * mean``; because T5 is pre-norm, the scale still affects the
+    residual stream.
     """
 
     def forward(self, item_tokens: torch.Tensor) -> torch.Tensor:
@@ -88,7 +52,7 @@ class SumTokenMerger(ItemTokenMerger):
 
 
 class AttentiveTokenMerger(ItemTokenMerger):
-    """Option 2 -- ACERec Attentive Token Merger (learnable-query cross-attention).
+    """ACERec Attentive Token Merger (learnable-query cross-attention).
 
     Compresses each item's ``L`` ID-token embeddings into ``k`` latent tokens
     (``num_query_tokens``) plus an optional per-item Intent Token, following
@@ -97,9 +61,9 @@ class AttentiveTokenMerger(ItemTokenMerger):
     1. add learnable positional embeddings ``P`` to the token embeddings
        (``Ẽ_i = E_i + P``) to preserve the per-hierarchy subspace identity of the
        RQ digits;
-    2. compute an item-level summary ``s_i = f_s(E_i)`` -- a nonlinear projection
-       aggregating the item's token embeddings (used to init the Intent Token and,
-       optionally, to make the queries content-adaptive);
+    2. compute an item-level summary ``s_i = f_s(E_i)``, a nonlinear projection
+       of the item's token embeddings (used for the Intent Token and the optional
+       content-adaptive queries);
     3. ``k`` learnable latent query vectors ``Q_i`` (default 4); when
        ``content_adaptive_queries`` is set, they are offset by ``f_q(s_i)``;
     4. multi-head cross-attention of the queries over the item's ``L`` token
@@ -107,12 +71,9 @@ class AttentiveTokenMerger(ItemTokenMerger):
        ``f_out`` (with residual) producing the ``k`` compact latent tokens
        ``Z_i in R^{k x d}``;
     5. optionally append a per-item Intent Token ``h_i = s_i`` giving
-       ``Z̃_i = [Z_i ; h_i] in R^{(k+1) x d}`` (ACERec Sec 2.3.1). In the
-       encoder-based TIGER, the Intent Token then "evolves" through the encoder's
-       self-attention like any other position.
+       ``Z̃_i = [Z_i ; h_i] in R^{(k+1) x d}``.
 
-    Output shape is ``[B, N, k_out, d]`` with ``k_out = k (+1 if intent token)``
-    -- each item becomes ``k_out`` encoder positions (a compression from ``L``).
+    Output shape is ``[B, N, k_out, d]`` with ``k_out = k (+1 if intent token)``.
 
     Parameters
     ----------
@@ -130,17 +91,15 @@ class AttentiveTokenMerger(ItemTokenMerger):
     mlp_ratio: float
         Hidden width of ``f_out`` / ``f_s`` as a multiple of ``embedding_dim``.
     use_positional_embedding: bool
-        Whether to add the learnable positional embeddings ``P`` (paper: yes).
+        Whether to add the learnable positional embeddings ``P``.
     use_intent_token: bool
-        Whether to append the per-item Intent Token ``h_i = s_i`` (ACERec: yes).
-        Defaults OFF here: in ACERec the intent token is the prediction anchor
-        (its evolved state ``h_pred`` drives the output), but TIGER predicts with a
-        separate autoregressive decoder that cross-attends over all encoder
-        positions, so it is redundant with the ``k`` latents. Turn on for strict
-        ACERec parity.
+        Whether to append the per-item Intent Token ``h_i = s_i``. Off by default
+        because TIGER's decoder cross-attends over all encoder positions.
     content_adaptive_queries: bool
         Whether to make the queries content-adaptive via ``Q_i = Q + f_q(s_i)``.
-        The paper does this; its exact form is underspecified, so it defaults off.
+        Off by default.
+    allow_no_compression: bool
+        Allow ``k_out >= L`` (no sequence compression).
     """
 
     def __init__(
@@ -167,12 +126,7 @@ class AttentiveTokenMerger(ItemTokenMerger):
         if num_tokens < 1:
             raise ValueError(f"num_tokens must be >= 1, got {num_tokens}")
 
-        # The whole point of this module is to emit FEWER vectors per item than the
-        # item has ID tokens. k_out >= num_tokens silently turns it into a
-        # same-width transform, which reads as "aggregation enabled" in the config
-        # and the run label while saving nothing — the failure mode that made
-        # `num_query_tokens=4` (the ACERec default, chosen for L=8/16) a no-op at
-        # L=4. Refuse it unless the caller is deliberately running that control.
+        # Reject configurations that do not shorten the encoder sequence.
         k_out_check = int(num_query_tokens) + (1 if use_intent_token else 0)
         if k_out_check >= int(num_tokens) and not allow_no_compression:
             _suggest = max(1, int(num_tokens) // 2)
@@ -200,17 +154,9 @@ class AttentiveTokenMerger(ItemTokenMerger):
 
         hidden_dim = int(embedding_dim * mlp_ratio)
 
-        # (2) learnable latent query vectors Q_i in R^{k x d}.
-        # SMALL init (std 0.02, BERT-style) is load-bearing: the queries are
-        # shared across ALL items and sit on the residual path
-        # (latents = queries + attended). With the original randn(0,1) init the
-        # shared query term dominated the item-dependent attended term, so
-        # early in training every item produced near-identical latents, the
-        # decoder learned unconditional code priors while ignoring the encoder,
-        # and val recall never left ~0 -> early stopping killed the run
-        # (observed on all clean + all L=16 runs, 2026-07-14). At std 0.02 the
-        # residual is negligible and latents are item-discriminative from
-        # step 0.
+        # (2) learnable latent query vectors Q_i in R^{k x d}. A small init keeps
+        # the shared query term on the residual path from dominating the
+        # item-dependent attended term.
         self.query = nn.Parameter(
             0.02 * torch.randn(num_query_tokens, embedding_dim)
         )
@@ -301,8 +247,7 @@ class AttentiveTokenMerger(ItemTokenMerger):
 def _default_num_heads(embedding_dim: int) -> int:
     """Largest of {8,4,2,1} that divides ``embedding_dim`` (a safe head default).
 
-    ``d_model`` is not always divisible by the transformer's own ``num_heads``
-    (e.g. 128 is not divisible by 6), so the attentive merger picks its own.
+    ``d_model`` is not always divisible by the transformer's ``num_heads``.
     """
     for candidate in (8, 4, 2, 1):
         if embedding_dim % candidate == 0:
@@ -324,14 +269,12 @@ def build_item_token_merger(
       * ``None`` / ``"none"`` / ``"off"``  -> ``None`` (feature disabled; the
         model keeps the default per-token + separator-token encoder input).
       * ``"mean"``                          -> :class:`MeanTokenMerger` (1 vec/item).
-      * ``"sum"``                           -> :class:`SumTokenMerger` (1 vec/item;
-        ``= L * mean``, which differs only via T5's pre-norm residual path).
+      * ``"sum"``                           -> :class:`SumTokenMerger` (1 vec/item).
       * ``"attentive"``                     -> :class:`AttentiveTokenMerger` with
         positional embeddings on and the intent token off by default (set
-        ``intent_token: true`` for strict ACERec parity). ``num_query_tokens``
-        defaults to ``min(4, L//2)``, i.e. the historical ACERec k=4 at L=8/16 but
-        k=2 at L=4, where a literal 4 would compress nothing. A configuration
-        whose ``k_out >= L`` is rejected unless ``allow_no_compression: true``.
+        ``intent_token: true`` to enable it). ``num_query_tokens`` defaults to
+        ``min(4, L//2)``. A configuration whose ``k_out >= L`` is rejected unless
+        ``allow_no_compression: true``.
       * mapping ``{type: mean|sum|attentive, ...}`` -> the named merger, with the
         remaining keys forwarded to the attentive merger (``num_query_tokens``,
         ``num_heads``, ``dropout``, ``mlp_ratio``, ``positional_embedding``,
@@ -354,10 +297,7 @@ def build_item_token_merger(
     if agg_type == "sum":
         return SumTokenMerger()
     if agg_type in ("attentive", "attention", "merger"):
-        # Default k adapts to L instead of being pinned to the ACERec value of 4,
-        # which only compresses when L > 4. min(4, L//2) keeps the historical
-        # k=4 at L=8 and L=16 (so existing runs/labels are unchanged) while
-        # giving L=4 a k=2 that actually halves the encoder sequence.
+        # Default k = min(4, L//2) so that the merger always compresses.
         default_k = min(4, max(1, int(num_tokens) // 2))
         return AttentiveTokenMerger(
             embedding_dim=embedding_dim,
