@@ -41,14 +41,33 @@ def build_filter_mask(
             "user_forget_items": None,
         }
     if mode == "user_dependent":
+        # Each AFFECTED user gets the whole forbidden set, not just the items
+        # that user happened to interact with. The scenario this mode exists for
+        # is "remove this category, for the people who asked": scoping the block
+        # to a user's own interactions leaves the rest of the category
+        # recommendable to exactly those people. Measured on beauty hair-loss,
+        # the category holds 106 items while `scan_user_forget_items` returned 3
+        # to 11 per user, so 95-103 sensitive items stayed reachable and SHF@10
+        # sat at 0.18 instead of ~0 in 45 of 45 beauty and sports runs.
+        #
+        # NOT a union with the user's own items. `scan_user_forget_items` returns
+        # every item in the forget SEQUENCE, most of which is unrelated -- on toys
+        # 229 items of which 11 were sensitive. Unioning would re-introduce the
+        # over-blocking the `global` branch above was fixed to avoid, and would
+        # charge this baseline collateral it does not owe.
+        #
+        # The per-user keys still matter: retain users are absent from the map and
+        # so keep the category, which is the whole point of the mode and the axis
+        # on which it beats `global` (which suppresses the category for everyone).
+        forbidden_user = sorted(int(x) for x in (target_items or forget_shard_items))
         serial_user: Dict[str, List[int]] = {}
         if user_forget_items:
-            for uid, items in user_forget_items.items():
-                serial_user[str(int(uid))] = sorted(int(x) for x in items)
+            for uid in user_forget_items:
+                serial_user[str(int(uid))] = list(forbidden_user)
         return {
             "filter_mode": "user_dependent",
             "deletion_spec": deletion_spec,
-            "forbidden_item_ids": sorted(int(x) for x in target_items or forget_shard_items),
+            "forbidden_item_ids": forbidden_user,
             "user_forget_items": serial_user,
         }
     raise ValueError(f"Unknown filter_mode={filter_mode!r}")

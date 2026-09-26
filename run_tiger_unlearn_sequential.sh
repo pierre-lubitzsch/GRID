@@ -230,6 +230,13 @@ unlearn_allocate_output_dir "${UNLEARN_OUTPUT_DIR}"
 UNLEARN_SEED="${UNLEARN_SEED:-2}"
 export PYTHONHASHSEED="${UNLEARN_SEED}"
 export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:16:8}"
+# Generative-separation arms sit right at the 80GB boundary: the SAME config has
+# both completed and OOM'd on 80GB nodes (16 vs 4 on 2026-09-18), and the OOM
+# reported 5.94 GiB "reserved but unallocated", i.e. allocator fragmentation
+# rather than a genuine working-set overflow. expandable_segments lets the
+# caching allocator grow a segment instead of stranding reserved blocks, which
+# is the documented fix for exactly that pattern. Harmless when memory is ample.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 AUTO_SEMANTIC_ID_PATH="$(ls -t \
   logs/inference/runs/*/*/pickle/merged_predictions_tensor.pt \

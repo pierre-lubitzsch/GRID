@@ -533,6 +533,11 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             coherence_loss_type=str(cfg.get("coherence_loss_type", "nll")),
             coherence_mass_cap=float(cfg.get("coherence_mass_cap", 0.999)),
             forget_loss_level=str(cfg.get("forget_loss_level", "token")),
+            # None (the default) keeps the uniform w = 1 behaviour.
+            # position_weights is the paper's w: one vector over SID levels,
+            # applied to the item-level loss in BOTH the retain and forget terms.
+            position_weights=cfg.get("position_weights"),
+            forget_position_weights=cfg.get("forget_position_weights"),
             sep_temperature=float(cfg.get("sep_temperature", 0.07)),
             deletion_spec=ctx["deletion_spec"],
             forget_item_ids=ctx["visible_forget_items"],

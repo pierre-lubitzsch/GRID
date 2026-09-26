@@ -43,6 +43,13 @@ def unified_unlearn(
     coherence_loss_type: str = "nll",
     coherence_mass_cap: float = 0.999,
     forget_loss_level: str = "token",
+    # Per-SID-level weights w on the ITEM-LEVEL loss (eq. sid-aware-item-loss).
+    # The paper defines one vector and uses it in BOTH the retain and the forget
+    # term, so `position_weights` applies to both. `forget_position_weights` is
+    # the older forget-only knob, kept so the runs recorded with it reproduce;
+    # when both are given the forget side uses the forget-only one.
+    position_weights: Optional[Sequence[float]] = None,
+    forget_position_weights: Optional[Sequence[float]] = None,
     sep_temperature: float = 0.07,
     deletion_spec: str = "session",
     forget_item_ids: Optional[Set[int]] = None,
@@ -549,6 +556,32 @@ def unified_unlearn(
     else:
         sep_negatives_set = forget_ids
     sequence_forget = str(forget_loss_level).lower() == "sequence"
+    # w_f is only defined position-wise, so it has no meaning for the `sequence`
+    # forget level (one scalar per sequence, not one per code position). Refuse
+    # rather than silently ignore it: a run that was launched to down-weight a
+    # position and quietly did not would be indistinguishable from the control.
+    def _resolve_w(vec, name):
+        if vec is None:
+            return None
+        out = [float(v) for v in vec]
+        n_h = int(getattr(model, "num_hierarchies", len(out)))
+        if len(out) != n_h:
+            raise ValueError(f"{name} has {len(out)} entries, but the model has "
+                             f"{n_h} SID levels")
+        return out
+
+    w_shared = _resolve_w(position_weights, "position_weights")
+    w_r = w_shared
+    w_f = None
+    if forget_position_weights is not None or w_shared is not None:
+        w_f = _resolve_w(forget_position_weights, "forget_position_weights") \
+            if forget_position_weights is not None else w_shared
+        if sequence_forget:
+            raise ValueError(
+                "SID-level weights require forget_loss_level=token; the "
+                "sequence level has no per-level decomposition")
+        log.info("[unified] SID-level weights: w_forget=%s w_retain=%s",
+                 w_f, w_r)
 
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
@@ -569,6 +602,11 @@ def unified_unlearn(
             if float(lambda_forget) != 0.0:
                 if sequence_forget:
                     l_forget = model._sequence_log_prob(*forget_batch)
+                elif w_f is not None:
+                    # sum_h w_h * L_h. At w_f = 1 this is identical to
+                    # _batch_loss_from_model_step, which sums the same terms.
+                    per_h = model.per_hierarchy_losses(*forget_batch)
+                    l_forget = -sum(w * L for w, L in zip(w_f, per_h))
                 else:
                     l_forget = -model._batch_loss_from_model_step(forget_batch)
                 forget_term = (float(lambda_forget) * l_forget) / float(q_forget)
@@ -608,7 +646,13 @@ def unified_unlearn(
             # `l_retain_avg` is then 0 rather than the retain CE; the term is
             # off, so there is nothing to report.
             if float(lambda_retain) != 0.0:
-                l_retain = model._batch_loss_from_model_step(retain_batch)
+                if w_r is not None:
+                    # sum_l w_l * L_l, the same item-level loss the forget side
+                    # uses. At w = 1 this equals _batch_loss_from_model_step.
+                    per_h = model.per_hierarchy_losses(*retain_batch)
+                    l_retain = sum(w * L for w, L in zip(w_r, per_h))
+                else:
+                    l_retain = model._batch_loss_from_model_step(retain_batch)
             else:
                 l_retain = torch.zeros((), device=device)
             # Skip the separation loss entirely at lambda_s = 0 instead of
@@ -768,6 +812,8 @@ def unified_unlearn(
         "sep_loss_type": str(sep_loss_type),
         "n_sep_negatives": len(sep_negatives_set),
         "forget_loss_level": str(forget_loss_level),
+        "forget_position_weights": (list(w_f) if w_f is not None else None),
+        "retain_position_weights": (list(w_r) if w_r is not None else None),
         "deletion_spec": str(deletion_spec),
         "mean_total_loss": _mean(totals["total"]),
         "mean_retain_loss": _mean(totals["retain"]),

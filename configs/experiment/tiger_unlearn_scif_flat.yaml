@@ -300,6 +300,10 @@ unlearning:
   drift_query_split: retain   # retain | test
   drift_control_items: 600    # sampled items sharing NO code prefix with the target
   drift_item_chunk: 64
+  # Bootstrap resamples for the per-query interval on each group's mass delta.
+  # Query ROWS are the resampling unit: the `target` group holds one item, so
+  # there is no item-level spread, and the campaign has no replicate runs.
+  drift_n_boot: 2000
   # per-item position profile (src/item_position_profile.py)
   profile_max_items: 2000
 
@@ -322,6 +326,17 @@ unlearning:
   neg_retain_every: 5
   filter_mode: global
   forget_loss_level: token
+  # w_f: per-RQ-position weights on the FORGET term, one per code position.
+  # null -> uniform (w_f = 1), the behaviour every recorded run has. Setting one
+  # entry below 1 asks "how much of the removal does THIS code position carry?".
+  # Requires forget_loss_level=token; the sequence level has no per-position
+  # decomposition and the run fails fast rather than ignoring the weights.
+  forget_position_weights: null
+  # w: per-SID-level weights on the ITEM-LEVEL loss (paper eq.
+  # sid-aware-item-loss). ONE vector, applied to both the retain and the forget
+  # term, matching the paper. null -> uniform w = 1, which is what every
+  # recorded run used. Requires forget_loss_level=token.
+  position_weights: null
   # Unified objective weights: L = L_R + lambda_f*L_F + lambda_s*L_sep + lambda_n*L_n
   # L_retain always carries weight 1 -- it is the reference scale the other
   # three terms are expressed relative to, so it is deliberately not a knob.
@@ -494,11 +509,12 @@ unlearning:
   #           r_u, so the numerator carries real gradient.
   sep_positives: history
   # Scoring function inside the L_sep InfoNCE.
-  #   cosine (default, back-compatible) sim(r_u, z_i) between pooled-encoder
+  #   cosine (legacy; kept for the phi ablation) sim(r_u, z_i) between pooled-encoder
   #          vectors. Acts on a geometry the decoder never reads, so the model can
   #          satisfy it without changing what it generates -- a 10,000x sweep of
   #          lambda_s moves SH@10 by <1% at the operating point.
-  #   generative  log p(s_i | h_u), the model's own sequence log-probability. At
+  #   generative (DEFAULT since 2026-09-18) log p(s_i | h_u), the model's own
+  #          sequence log-probability. At
   #          sep_gen_temperature=1 it reads literally as
   #            -log[ p(s_i+|h_u) / (p(s_i+|h_u) + sum_f p(s_i_f|h_u)) ]
   #          "the true next item must outrank the spam items", which is what SH@k
@@ -510,7 +526,7 @@ unlearning:
   #          toward the full catalog makes the denominator approach the model's
   #          own normaliser, degenerating the loss into -log p(s_i+|h_u) = the
   #          retain CE, and costs 1+|N| teacher-forced decoder passes.
-  sep_loss_type: cosine
+  sep_loss_type: generative
   # Temperature for sep_loss_type=generative ONLY -- deliberately separate from
   # sep_temperature. Cosine logits are bounded to +-1/tau by L2 normalisation;
   # sequence log-probs are unbounded below, so reusing 0.07 here would be a very
