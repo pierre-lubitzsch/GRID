@@ -1,5 +1,6 @@
 """Seif unlearning (noise + repair), ported from the ERASE benchmark's RecBole
-trainer and adapted to TIGER batches and the ``model.model_step(...)`` loss.
+trainer (https://github.com/deem-data/erase-bench/blob/main/recbole/trainer/trainer.py)
+and adapted to TIGER batches and the ``model.model_step(...)`` loss.
 Seif is distinct from SCIF (``scif.py``). It has two phases:
 
     Phase 1 (erase)

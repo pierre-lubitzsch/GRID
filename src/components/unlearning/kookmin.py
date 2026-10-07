@@ -1,4 +1,5 @@
 """Kookmin unlearning, ported from the RecBole trainer of the ERASE benchmark
+(https://github.com/deem-data/erase-bench/blob/main/recbole/trainer/trainer.py)
 and adapted to TIGER's ``(SequentialModelInputData, SequentialModuleLabelData)``
 batches and ``model.model_step(...)`` loss.
 

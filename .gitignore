@@ -193,12 +193,6 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# XLM for product key memory
-XLM/
-
-# used for documenting experiments
-WORKFLOW.md
-
 # run outputs and local data
 logs/
 outputs/*

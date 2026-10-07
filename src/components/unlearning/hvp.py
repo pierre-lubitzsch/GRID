@@ -1,5 +1,7 @@
 """Hessian-vector product utilities and a stochastic Conjugate Gradient solver,
-ported from the ERASE benchmark's RecBole trainer (``_batch_grad`` /
+ported from the ERASE benchmark's RecBole trainer
+(https://github.com/deem-data/erase-bench/blob/main/recbole/trainer/trainer.py;
+``_batch_grad`` /
 ``_hvp_single`` / ``_hvp_dataset`` / ``cg_inv_hvp``) and adapted to TIGER's
 batch shape ``(SequentialModelInputData, SequentialModuleLabelData)`` and its
 ``model.model_step(...)`` loss.

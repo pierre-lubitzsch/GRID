@@ -1,12 +1,16 @@
 # Neighborhood-Aware Unlearning for Generative Recommendation
 
+Pierre Lubitzsch, Yubao Tang, Maarten de Rijke, Sebastian Schelter
+
+[Paper (arXiv)](https://arxiv.org/abs/XXXX.XXXXX)
+
 This repository contains the code for Neighborhood-Aware Unlearning (NAU), a method for removing training interactions from generative recommenders that predict items through semantic IDs (SIDs). It builds on [GRID](https://github.com/snap-research/GRID) (Generative Recommendation with Semantic IDs). We keep GRID's data format, semantic-ID pipeline, and TIGER implementation, and add:
 
 - two deletion scenarios:
   - **spam removal:** a bandwagon attack injects fake users that promote a target item;
   - **unwanted-item removal:** users request deletion of their interactions with an item category;
 - the retrained references for both scenarios;
-- sequential unlearning with NAU and the baselines Finetune, Forget only, Forget+Repair, SCIF, SEIF, Kookmin, Fanchuan, TRACER, and Filter;
+- sequential unlearning with NAU and the baselines Finetune, Forget only, Forget+Repair, SCIF, SEIF, Kookmin, Fanchuan, TRACER, and Filter (SCIF, SEIF, Kookmin, and Fanchuan are ported from the [ERASE benchmark](https://github.com/deem-data/erase-bench) [6]);
 - LETTER semantic IDs, in addition to GRID's RQ-KMeans and RQ-VAE;
 - evaluation of exposure metrics (SH@10, UHF@10, UHR@10) next to NDCG@10 and Recall@10.
 
@@ -19,7 +23,8 @@ This repository contains the code for Neighborhood-Aware Unlearning (NAU), a met
 ### Setup Environment
 
 ```bash
-cd <this repository>
+git clone https://github.com/pierre-lubitzsch/neighborhood-aware-unlearning.git
+cd neighborhood-aware-unlearning
 pip install -r requirements.txt
 ```
 
@@ -238,6 +243,19 @@ Training uses all visible GPUs (`trainer.devices=-1`). Unlearning runs on a sing
 
 ## 📚 Citation
 
+If you use this code, please cite our paper:
+
+```bibtex
+@misc{lubitzsch2026nau,
+  title         = {Neighborhood-Aware Unlearning for Generative Recommendation},
+  author        = {Lubitzsch, Pierre and Tang, Yubao and de Rijke, Maarten and Schelter, Sebastian},
+  year          = {2026},
+  eprint        = {XXXX.XXXXX},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.IR}
+}
+```
+
 This code builds on GRID:
 
 ```bibtex
@@ -265,6 +283,8 @@ This code builds on GRID:
 [4] Geng, Shijie, et al. "Recommendation as language processing (RLP): A unified pretrain, personalized prompt & predict paradigm (P5)." Proceedings of the 16th ACM Conference on Recommender Systems. 2022.
 
 [5] Wang, Wenjie, et al. "Learnable item tokenization for generative recommendation." Proceedings of the 33rd ACM International Conference on Information and Knowledge Management. 2024.
+
+[6] Lubitzsch, Pierre Sicco, Maarten de Rijke, and Sebastian Schelter. "ERASE: A Real-World Aligned Benchmark for Unlearning in Recommender Systems." Proceedings of the 49th International ACM SIGIR Conference on Research and Development in Information Retrieval. 2026.
 
 ## License
 

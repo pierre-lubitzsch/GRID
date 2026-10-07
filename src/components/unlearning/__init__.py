@@ -1,7 +1,8 @@
 """Unlearning algorithms for TIGER.
 
-This sub-package ports algorithms from the RecBole-based ERASE benchmark onto
-GRID's TIGER pipeline (Hydra + Lightning + TFRecord dataloaders).
+This sub-package ports algorithms from the RecBole-based ERASE benchmark
+(https://github.com/deem-data/erase-bench) onto GRID's TIGER pipeline
+(Hydra + Lightning + TFRecord dataloaders).
 
 Each algorithm (SCIF, Kookmin, Fanchuan, SEIF, fine-tune, negative training,
 unified) lives in its own sibling module.
