@@ -36,13 +36,18 @@ PARTITION="${PARTITION:-pgpu}"
 GRES="${GRES:-gpu:2}"
 TIME="${TIME:-04:00:00}"
 
-BN_RUN=$(ls -d logs/train/runs/*/*_BALANCE_E1_bnsw10 | head -1)
-P0_RUN=$(ls -d logs/train/runs/*/*_EXPLORE_E1_p0 | head -1)
+# BN_RUN / P0_RUN: override to unlearn other training runs (e.g. other seeds);
+# TAG_SUFFIX is appended to every tag (e.g. _tseed3) to keep them apart.
+BN_RUN="${BN_RUN:-$(ls -d logs/train/runs/*/*_BALANCE_E1_bnsw10 | head -1)}"
+P0_RUN="${P0_RUN:-$(ls -d logs/train/runs/*/*_EXPLORE_E1_p0 | head -1)}"
+TAG_SUFFIX="${TAG_SUFFIX:-}"
 PKM_ARCH_OVR="model.pkm_layers={encoder:[1],decoder:null} model.pkm_mode=replace"
 # EPOCHS: memory-update budget (recorded pkm_only best = 100). Smaller values
 # unsaturate the test (at 100 every healthy-memory arm reached SH 0); tagged _ep<N>.
 EPOCHS="${EPOCHS:-100}"
-BASE=(unlearning.n_unlearning_chunks=10 unlearning.lambda_f=0.01 unlearning.lambda_s=1.0
+# CHUNKS: number of sequential deletion requests (recorded recipe: 10).
+CHUNKS="${CHUNKS:-10}"
+BASE=(unlearning.n_unlearning_chunks=${CHUNKS} unlearning.lambda_f=0.01 unlearning.lambda_s=1.0
       unlearning.sep_negatives=forget_target_only unlearning.adaptive_codes=false)
 RECIPE=("${BASE[@]}" unlearning.unified_lr=0.001 unlearning.n_epochs=${EPOCHS} unlearning.unified_optimizer=adam)
 # Full-model reference with ITS OWN recorded recipe (job 10268039: E23D01 mid,
@@ -73,6 +78,7 @@ for a in $ARMS; do
   recipe=("${RECIPE[@]}"); tag="SLOTSEL_${a}"
   if [[ "$a" == fullrec* ]]; then recipe=("${FULLREC[@]}")
   elif [ "$EPOCHS" != "100" ]; then tag="${tag}_ep${EPOCHS}"; fi
+  tag="${tag}${TAG_SUFFIX}"
   echo "[$(date -Is)] $tag: $(basename "$run") ${ovr[*]}"
   cmd=(env UNLEARN_RUN_TAG="bw_tgtmid_E1_${tag}" EVAL_EXTRA_OVERRIDES="$model_ovr"
        N_TARGET_ITEMS=1
