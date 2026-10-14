@@ -18,7 +18,10 @@ from src.data.loading.components.interfaces import (
 )
 from src.models.components.interfaces import OneKeyPerPredictionOutput
 from src.models.components.network_blocks.mlp import MLP
-from src.models.components.network_blocks.product_key_memory import HashingMemory
+from src.models.components.network_blocks.product_key_memory import (
+    HashingMemory,
+    PKMExploreController,
+)
 from src.models.components.network_blocks.token_merger import build_item_token_merger
 from src.models.modules.huggingface.transformer_base_module import TransformerBaseModule
 from src.utils.utils import (
@@ -560,6 +563,8 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         pkm_params: Optional[Dict[str, Any]] = None,
         pkm_mode: str = "replace",
         pkm_param_group: Optional[Dict[str, Any]] = None,
+        pkm_explore: Optional[Dict[str, Any]] = None,
+        pkm_balance: Optional[Dict[str, Any]] = None,
         should_check_prefix: bool = False,
         should_add_sep_token: bool = True,
         item_token_aggregation: Optional[Union[str, Dict[str, Any]]] = None,
@@ -641,6 +646,35 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
 
         if pkm_layers is not None:
             self._install_pkm_layers(pkm_layers, dict(pkm_params or {}), pkm_mode)
+
+        # Explore / exploit training of the PKM layers: with probability p per
+        # optimizer step every memory reads (and updates) ALL slots, otherwise the
+        # usual top-knn slots. None => off. See PKMExploreController.
+        self._pkm_explore = None
+        self._pkm_util_step = -1
+        if pkm_explore is not None and pkm_layers is not None:
+            self._pkm_explore = PKMExploreController(**dict(pkm_explore))
+            for module in self.modules():
+                if isinstance(module, HashingMemory):
+                    module.enable_util_tracking()
+
+        # Routing balance loss of the PKM layers (anti-collapse): adds
+        # coef * mean_over_memories(log n_keys - I(token; sub-key)) to the
+        # TRAINING loss. None / coef 0 => off. See HashingMemory.set_balance.
+        self._pkm_balance_coef = 0.0
+        if pkm_balance is not None and pkm_layers is not None:
+            pkm_balance = dict(pkm_balance)
+            self._pkm_balance_coef = float(pkm_balance.get("coef", 0.0))
+            if self._pkm_balance_coef > 0:
+                for module in self.modules():
+                    if isinstance(module, HashingMemory):
+                        module.set_balance(
+                            True,
+                            token_entropy_weight=float(
+                                pkm_balance.get("token_entropy_weight", 1.0)
+                            ),
+                            kind=str(pkm_balance.get("kind", "mi")),
+                        )
 
         if mlp_layers is not None:
             # bloating the mlp layers in both encoder and decoder
@@ -748,6 +782,42 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self.forbidden_sids = forbidden_sids
         self.filter_mode = filter_mode
         self.user_forbidden_sids = user_forbidden_sids
+
+    def _pkm_memories(self) -> List[Tuple[str, HashingMemory]]:
+        return [
+            (name, module)
+            for name, module in self.named_modules()
+            if isinstance(module, HashingMemory)
+        ]
+
+    def on_train_batch_start(self, batch: Any, batch_idx: int) -> None:
+        super().on_train_batch_start(batch, batch_idx)
+        if self._pkm_explore is None:
+            return
+        ctrl = self._pkm_explore
+        step = int(self.global_step)
+        memories = self._pkm_memories()
+
+        # Utilisation over the last window of exploit steps. Guarded by
+        # _pkm_util_step so gradient-accumulation micro-batches measure once.
+        if step > 0 and step % ctrl.util_window == 0 and step != self._pkm_util_step:
+            self._pkm_util_step = step
+            utils = []
+            for name, memory in memories:
+                seen = memory.pop_util_seen().to(torch.uint8)
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(seen, op=torch.distributed.ReduceOp.MAX)
+                live = int(seen.sum().item())
+                utils.append(live / memory.size)
+                self.log(f"pkm/live_slots/{name}", float(live), on_step=True, on_epoch=False)
+            ctrl.util = sum(utils) / len(utils)
+            self.log("pkm/util_mean", ctrl.util, on_step=True, on_epoch=False)
+
+        explore, p = ctrl.draw(step)
+        for _, memory in memories:
+            memory.set_explore(explore, forward=ctrl.forward, chunk=ctrl.chunk)
+        self.log("pkm/explore_p", p, on_step=True, on_epoch=False)
+        self.log("pkm/explore", float(explore), on_step=True, on_epoch=False)
 
     def _pkm_parameters(self) -> List[torch.nn.Parameter]:
         """All trainable parameters that live inside installed PKM (HashingMemory)
@@ -2382,7 +2452,26 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 input=input,
                 target=fut_ids[:, hierarchy].long(),
             )
+        if self._pkm_balance_coef > 0 and self.training:
+            loss = loss + self._pkm_balance_coef * self._pkm_balance_loss()
         return model_output, loss
+
+    def _pkm_balance_loss(self) -> torch.Tensor:
+        """Mean routing balance loss over the PKM layers read in this forward."""
+        terms, stats = [], {}
+        for name, memory in self._pkm_memories():
+            if memory.balance_loss is None:
+                continue
+            terms.append(memory.balance_loss)
+            for k, v in memory.balance_stats.items():
+                stats[f"pkm/{k}/{name}"] = v
+        if not terms:
+            return torch.zeros((), device=self.device)
+        bal = torch.stack(terms).mean()
+        self.log("pkm/balance_loss", bal.detach(), on_step=True, on_epoch=False)
+        for k, v in stats.items():
+            self.log(k, v, on_step=True, on_epoch=False)
+        return bal
 
     def per_hierarchy_losses(
         self,

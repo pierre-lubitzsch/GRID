@@ -351,6 +351,32 @@ model:
   # *class* is the shared one from optim.optimizer (override _target_ to SGD to
   # try SGD): both groups use that class, PKM just gets these overrides.
   pkm_param_group: null
+  # Explore / exploit training of trained-in PKMs (anti-collapse). null = off.
+  # With probability p per optimizer step EVERY PKM layer reads -- and so
+  # updates -- all n_keys**2 slots (exact factorised dense read), otherwise the
+  # usual sparse top-knn slots. Keys (see PKMExploreController):
+  #   p, schedule (constant|linear|cosine|adaptive), p_final, start_step,
+  #   decay_steps, util_target, util_window, forward (dense|straight_through),
+  #   chunk, seed.
+  # 'adaptive' lowers p as the fraction of slots read per util_window of exploit
+  # steps approaches util_target. A block with p=0 only logs utilisation
+  # (pkm/util_mean, pkm/live_slots/*), i.e. a matched baseline. e.g.
+  #   'model.pkm_explore={p:0.1,schedule:constant,forward:dense}'
+  pkm_explore: null
+  # Routing balance loss of trained-in PKMs (anti-collapse). null = off.
+  # Adds coef * (log n_keys - H(mean_b p_b) + w * mean_b H(p_b)) to the training
+  # loss, per head and sub-key half (p_b = softmax over the n_keys sub-keys for
+  # token b; w = token_entropy_weight, default 1 => log n_keys - mutual info).
+  # w=0 is the plain marginal-entropy loss, which can be satisfied by flat,
+  # identical routing for every token (i.e. still collapsed), hence w=1.
+  # Logs pkm/balance_loss and pkm/eff_subkeys_{batch,token}/<layer> (exp of the
+  # entropies). e.g. 'model.pkm_balance={coef:0.01}'
+  # kind: mi (default, above) | switch: n_keys * sum_i f_i P_i on the HARD top-knn
+  # sub-key assignments (f_i counted, P_i = mean softmax of per-token standardised
+  # scores). mi is NOT scale-invariant: it measured either inert (flat scores) or
+  # sharpening tokens instead of spreading them (2026-10-08). Logs
+  # pkm/eff_subkeys_assigned = exp H(f). e.g. 'model.pkm_balance={coef:0.01,kind:switch}'
+  pkm_balance: null
 callbacks:
   model_checkpoint:
     _target_: lightning.pytorch.callbacks.ModelCheckpoint

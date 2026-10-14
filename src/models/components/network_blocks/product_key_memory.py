@@ -23,6 +23,7 @@ import math
 
 import numpy as np
 import torch
+import torch.utils.checkpoint
 from torch import nn
 from torch.nn import functional as F
 
@@ -96,6 +97,27 @@ class HashingMemory(nn.Module):
             Touching many more slots early makes slot CONTENTS meaningful, so
             routing choices start to matter while the router can still move.
             ``warmup_knn=0`` (default) disables this.
+
+    Exploration (explore / exploit training): the owning model may switch the
+    layer into an *explore* pass via :meth:`set_explore`. On such a pass the
+    read covers ALL ``n_keys ** 2`` slots instead of the top-``knn`` ones, so
+    every value row, every sub-key and the query net receive gradient. This is
+    exact and cheap thanks to the product structure: the softmax over all
+    pairs ``s1_i + s2_j`` factorises into ``softmax(s1) (x) softmax(s2)``, so
+    the read is ``p1^T V p2`` per head (see :meth:`_dense_read`). Two variants:
+
+        ``dense``             the forward output IS the dense read (literal
+                              "update all slots" step; the next layers see a
+                              smoothed memory output on that step).
+        ``straight_through``  the forward output stays the usual sparse read,
+                              but gradient additionally flows through the
+                              dense read (``sparse + dense - dense.detach()``),
+                              so all slots are updated without changing the
+                              forward pass.
+
+    Exploration is OFF unless the model turns it on (it is driven per optimizer
+    step by ``pkm_explore`` on the model), so inference / unlearning are
+    unaffected. Adds nothing to the state_dict.
     """
 
     def __init__(
@@ -198,6 +220,19 @@ class HashingMemory(nn.Module):
             "_pkm_step", torch.zeros((), dtype=torch.long), persistent=False
         )
 
+        # explore/exploit training (set by the owning model, see set_explore)
+        self._explore = False
+        self._explore_forward = "dense"
+        self._explore_chunk = 1024
+        # slot-utilisation tracking over exploit passes (see enable_util_tracking)
+        self._track_util = False
+        # routing balance loss (see set_balance); the model reads self.balance_loss
+        self._balance = False
+        self._balance_token_entropy = 1.0
+        self._balance_kind = "mi"
+        self.balance_loss = None
+        self.balance_stats = {}
+
         # query network (linear projection, optionally followed by batchnorm)
         self.query_proj = nn.Sequential(
             *filter(
@@ -248,6 +283,142 @@ class HashingMemory(nn.Module):
             )
         return self._access_count.detach().clone(), self._access_mass.detach().clone()
 
+    # ---- explore / exploit training ------------------------------------------
+    def set_explore(
+        self, active: bool, forward: str = "dense", chunk: int = 1024
+    ) -> None:
+        """Make the following TRAINING forward passes read all slots (``active``)
+        or the usual top-``knn`` slots. ``forward`` is ``dense`` or
+        ``straight_through`` (see the class docstring); ``chunk`` bounds the
+        number of queries materialised at once by the dense read."""
+        forward = str(forward).strip().lower()
+        if forward not in ("dense", "straight_through"):
+            raise ValueError(
+                f"explore forward must be dense|straight_through, got {forward!r}"
+            )
+        self._explore = bool(active)
+        self._explore_forward = forward
+        self._explore_chunk = max(1, int(chunk))
+
+    def enable_util_tracking(self) -> None:
+        """Record which slots are read on exploit (sparse) training passes."""
+        if getattr(self, "_util_seen", None) is None:
+            self.register_buffer(
+                "_util_seen",
+                torch.zeros(self.size, dtype=torch.bool, device=self.keys.device),
+                persistent=False,
+            )
+        self._track_util = True
+
+    def pop_util_seen(self) -> torch.Tensor:
+        """Return the bool mask of slots read since the last call, and reset it."""
+        seen = self._util_seen.clone()
+        self._util_seen.zero_()
+        return seen
+
+    # ---- routing balance (anti-collapse) -------------------------------------
+    def set_balance(
+        self, active: bool, token_entropy_weight: float = 1.0, kind: str = "mi"
+    ) -> None:
+        """Compute a routing balance loss on the following TRAINING passes.
+
+        ``kind="switch"`` (Switch-Transformer load balancing on the HARD routing):
+        per head and sub-key half, ``L = n_keys * sum_i f_i * P_i`` where ``f_i``
+        is the fraction of top-``knn`` sub-key assignments that go to sub-key
+        ``i`` (counted, no gradient) and ``P_i`` the batch-mean softmax
+        probability of ``i``. ``L = 1`` under perfectly uniform routing and grows
+        as tokens pile onto the same sub-keys; its gradient lowers the scores of
+        over-used sub-keys. ``P`` is computed on PER-TOKEN STANDARDISED scores:
+        on raw scores the router could reach the minimum by shrinking every
+        score (flat ``P``) while the top-k assignment stays collapsed.
+
+        ``kind="mi"``: per head and sub-key half, with ``p_b = softmax(s_b)`` over the
+        ``n_keys`` sub-keys for token ``b`` and ``m = mean_b p_b``::
+
+            L = log(n_keys) - H(m) + w * mean_b H(p_b)
+
+        With ``w = 1`` this is ``log(n_keys) - I(token; sub-key)``: the batch
+        must spread over all sub-keys (high ``H(m)``) while each token routes
+        sharply (low ``H(p_b)``), i.e. routing has to DEPEND on the token. The
+        marginal term alone (``w = 0``) is satisfiable by making every token's
+        routing flat and identical, which leaves top-k picking the same slots,
+        the collapse itself. Stored as ``self.balance_loss`` (mean over heads
+        and halves) for the owning model to add to the training loss.
+        """
+        kind = str(kind).strip().lower()
+        if kind not in ("mi", "switch"):
+            raise ValueError(f"balance kind must be mi|switch, got {kind!r}")
+        self._balance = bool(active)
+        self._balance_token_entropy = float(token_entropy_weight)
+        self._balance_kind = kind
+
+    def _balance_term(self, scores: torch.Tensor) -> torch.Tensor:
+        if self._balance_kind == "switch":
+            return self._switch_balance_term(scores)
+        logp = F.log_softmax(scores.float(), dim=-1)  # (bs, n_keys)
+        p = logp.exp()
+        m = p.mean(0)
+        h_marg = -(m * torch.log(m.clamp_min(1e-12))).sum()
+        h_tok = -(p * logp).sum(-1).mean()
+        self._bal_h_marg.append(h_marg.detach())
+        self._bal_h_tok.append(h_tok.detach())
+        return math.log(scores.size(-1)) - h_marg + self._balance_token_entropy * h_tok
+
+    def _switch_balance_term(self, scores: torch.Tensor) -> torch.Tensor:
+        scores = scores.float()
+        bs, n = scores.shape
+        with torch.no_grad():
+            top = scores.topk(min(self._effective_knn(), n), dim=-1).indices
+            f = torch.zeros(n, device=scores.device).scatter_add_(
+                0, top.reshape(-1), torch.ones(top.numel(), device=scores.device)
+            )
+            f = f / top.numel()
+        z = (scores - scores.mean(-1, keepdim=True)) / scores.std(-1, keepdim=True).clamp_min(1e-6)
+        P = F.softmax(z, dim=-1).mean(0)
+        with torch.no_grad():
+            self._bal_h_marg.append(-(P * torch.log(P.clamp_min(1e-12))).sum())
+            # "token" slot reused for the HARD assignment entropy H(f)
+            self._bal_h_tok.append(-(f * torch.log(f.clamp_min(1e-12))).sum())
+        return n * (f * P).sum()
+
+    def _dense_read_chunk(self, query: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+        """Dense read for one chunk: ``query`` is ``(n, heads, k_dim)``."""
+        half = self.k_dim // 2
+        n_keys, v_dim = self.n_keys, self.v_dim
+        # V[i, j] is slot i * n_keys + j (same layout as _get_indices); arrange it
+        # as (j, i * v_dim) so that sum_j p2_j V[i, j] is a single GEMM.
+        v_t = values.view(n_keys, n_keys, v_dim).transpose(0, 1).reshape(n_keys, n_keys * v_dim)
+        out = None
+        for h in range(self.heads):
+            p1 = F.softmax(F.linear(query[:, h, :half], self.keys[h, 0]).float(), dim=-1)
+            p2 = F.softmax(F.linear(query[:, h, half:], self.keys[h, 1]).float(), dim=-1)
+            t = (p2.type_as(v_t) @ v_t).view(-1, n_keys, v_dim)  # (n, i, v_dim)
+            o = torch.bmm(p1.type_as(t).unsqueeze(1), t).squeeze(1)  # (n, v_dim)
+            out = o if out is None else out + o
+        return out
+
+    def _dense_read(self, query: torch.Tensor) -> torch.Tensor:
+        """Exact read over ALL ``n_keys ** 2`` slots (softmax over every pair).
+
+        Because the product-key score is ``s1_i + s2_j``, the full softmax is
+        ``softmax(s1)_i * softmax(s2)_j``, so the read is ``p1^T V p2`` per head
+        and costs ``O(n_keys**2 * v_dim)`` per query -- no ``n_keys**2`` score
+        tensor is built. Queries are processed in chunks under activation
+        checkpointing, so the ``(chunk, n_keys, v_dim)`` intermediate is never
+        stored for backward.
+        """
+        query = query.view(-1, self.heads, self.k_dim)
+        values = self.values.weight
+        outs = []
+        for start in range(0, query.size(0), self._explore_chunk):
+            q = query[start : start + self._explore_chunk]
+            outs.append(
+                torch.utils.checkpoint.checkpoint(
+                    self._dense_read_chunk, q, values, use_reentrant=False
+                )
+            )
+        return torch.cat(outs, 0)
+
     def _in_warmup(self) -> bool:
         return bool(
             self.training
@@ -295,6 +466,11 @@ class HashingMemory(nn.Module):
         # compute indices with associated scores
         scores1 = F.linear(q1, subkeys[0], bias=None)  # (bs, n_keys)
         scores2 = F.linear(q2, subkeys[1], bias=None)  # (bs, n_keys)
+
+        if self._balance and self.training:
+            # before any warm-up noise: the loss acts on the router's own scores
+            self._bal_terms.append(self._balance_term(scores1))
+            self._bal_terms.append(self._balance_term(scores2))
 
         if self.warmup_noise and self._in_warmup():
             # Noisy top-k gating (Shazeer et al.): perturb the sub-key scores so
@@ -358,8 +534,31 @@ class HashingMemory(nn.Module):
         query = F.dropout(query, p=self.query_dropout, training=self.training)  # (bs*heads, k_dim)
         assert query.shape == (bs * self.heads, self.k_dim)
 
+        explore = self._explore and self.training
+        if explore and self._explore_forward == "dense":
+            self.balance_loss = None  # no top-k routing on this pass
+            output = self._dense_read(query)  # (bs, v_dim)
+            output = F.dropout(output, p=self.value_dropout, training=self.training)
+            return self._reshape_output(output, prefix_shape)
+
+        balance = self._balance and self.training
+        if balance:
+            self._bal_terms, self._bal_h_marg, self._bal_h_tok = [], [], []
+
         # retrieve indices and scores
         scores, indices = self.get_indices(query)  # (bs*heads, knn)
+
+        if balance:
+            self.balance_loss = torch.stack(self._bal_terms).mean()
+            self.balance_stats = {
+                # exp(H): effective number of sub-keys used by the batch / per token
+                "eff_subkeys_batch": torch.stack(self._bal_h_marg).mean().exp(),
+                ("eff_subkeys_assigned" if self._balance_kind == "switch" else "eff_subkeys_token"):
+                    torch.stack(self._bal_h_tok).mean().exp(),
+            }
+            self._bal_terms = self._bal_h_marg = self._bal_h_tok = None
+        else:
+            self.balance_loss = None
         scores = F.softmax(scores.float(), dim=-1).type_as(scores)  # (bs*heads, knn)
 
         # merge heads / knn (since we sum heads)
@@ -378,16 +577,113 @@ class HashingMemory(nn.Module):
                     0, flat_idx, scores.reshape(-1).detach().to(self._access_mass.dtype)
                 )
 
+        if self._track_util and self.training and not explore:
+            with torch.no_grad():
+                self._util_seen[indices.reshape(-1)] = True
+
         # weighted sum of values
         output = self.values(indices, per_sample_weights=scores)  # (bs, v_dim)
+        if explore:  # straight_through: sparse forward, dense gradient
+            dense = self._dense_read(query)
+            output = output + (dense - dense.detach())
         output = F.dropout(output, p=self.value_dropout, training=self.training)  # (bs, v_dim)
 
         if (self.warmup_knn or self.warmup_noise) and self.training:
             self._pkm_step += 1
 
-        # reshape output
+        return self._reshape_output(output, prefix_shape)
+
+    def _reshape_output(self, output: torch.Tensor, prefix_shape: torch.Size) -> torch.Tensor:
         if len(prefix_shape) >= 2:
             output = output.view(prefix_shape + (self.v_dim,))  # (..., v_dim)
         elif len(prefix_shape) == 0:
             output = output.view(self.v_dim)
         return output
+
+
+class PKMExploreController:
+    """Per-optimizer-step explore / exploit draw for all PKM layers of a model.
+
+    With probability ``p(step)`` a training step is an *explore* step: every
+    :class:`HashingMemory` reads (and so updates) ALL slots; otherwise it is a
+    normal sparse top-``knn`` *exploit* step. The draw is seeded by
+    ``(seed, global_step)``, so it is identical across DDP ranks, across the
+    PKM layers, and across gradient-accumulation micro-batches.
+
+    Config (``model.pkm_explore``)::
+
+        p: 0.1                  # explore probability (start value)
+        schedule: constant      # constant | linear | cosine | adaptive
+        p_final: 0.0            # linear/cosine: end value; adaptive: floor
+        start_step: 0           # linear/cosine: decay starts here
+        decay_steps: 10000      # linear/cosine: ... and ends this many steps later
+        util_target: 0.5        # adaptive: p reaches p_final once the fraction of
+                                #   slots read in a window of exploit steps hits this
+        util_window: 200        # steps per utilisation window (also logging)
+        forward: dense          # dense | straight_through (see HashingMemory)
+        chunk: 1024             # dense-read chunk size (queries)
+        seed: 0
+
+    ``p: 0`` with a ``pkm_explore`` block still tracks and logs utilisation, which
+    makes a matched no-exploration baseline arm.
+
+    Adaptive rule: ``p = p_final + (p - p_final) * max(0, 1 - util / util_target)``
+    where ``util`` is the mean (over PKM layers) fraction of slots read during the
+    last window of exploit steps. Until the first window completes, ``p`` is used.
+    The adaptive state is not checkpointed; after a resume it re-estimates
+    ``util`` within one window.
+    """
+
+    _SCHEDULES = ("constant", "linear", "cosine", "adaptive")
+
+    def __init__(
+        self,
+        p: float = 0.1,
+        schedule: str = "constant",
+        p_final: float = 0.0,
+        start_step: int = 0,
+        decay_steps: int = 10000,
+        util_target: float = 0.5,
+        util_window: int = 200,
+        forward: str = "dense",
+        chunk: int = 1024,
+        seed: int = 0,
+    ) -> None:
+        self.p0 = float(p)
+        self.schedule = str(schedule).strip().lower()
+        if self.schedule not in self._SCHEDULES:
+            raise ValueError(
+                f"pkm_explore.schedule must be one of {self._SCHEDULES}, got {schedule!r}"
+            )
+        if not (0.0 <= self.p0 <= 1.0 and 0.0 <= float(p_final) <= 1.0):
+            raise ValueError("pkm_explore.p and p_final must lie in [0, 1]")
+        self.p_final = float(p_final)
+        self.start_step = int(start_step)
+        self.decay_steps = max(1, int(decay_steps))
+        self.util_target = float(util_target)
+        self.util_window = max(1, int(util_window))
+        self.forward = str(forward).strip().lower()
+        self.chunk = int(chunk)
+        self.seed = int(seed)
+        self.util: float | None = None  # last measured mean utilisation
+
+    def prob(self, step: int) -> float:
+        if self.schedule == "constant":
+            return self.p0
+        if self.schedule == "adaptive":
+            if self.util is None:
+                return self.p0
+            frac = max(0.0, 1.0 - self.util / self.util_target)
+            return self.p_final + (self.p0 - self.p_final) * frac
+        t = min(1.0, max(0.0, (step - self.start_step) / self.decay_steps))
+        if self.schedule == "cosine":
+            t = 0.5 * (1.0 - math.cos(math.pi * t))
+        return self.p0 + (self.p_final - self.p0) * t
+
+    def draw(self, step: int) -> tuple[bool, float]:
+        """Return ``(explore, p)`` for optimizer step ``step``."""
+        p = self.prob(step)
+        if p <= 0.0:
+            return False, p
+        g = torch.Generator().manual_seed(self.seed * 1_000_003 + int(step))
+        return bool(torch.rand((), generator=g).item() < p), p

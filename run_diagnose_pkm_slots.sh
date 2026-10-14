@@ -3,7 +3,7 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.out
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:nvidia_h200:1
+#SBATCH --gres=gpu:2
 #SBATCH --partition=pgpu
 #SBATCH --time=02:00:00
 #
@@ -38,7 +38,7 @@ else CKPT="${CKPT_IN}"; fi
 [ -f "${CKPT}" ] || { echo "no ckpt found from '${CKPT_IN}'"; exit 1; }
 source scripts/resolve_grid_dataset.sh
 resolve_grid_dataset "${DATASET}"
-OUT="logs/diagnose/pkm_slots/$(date +%Y-%m-%d_%H-%M-%S)_${PKM_ARCH}_tgt${TARGET_STRATEGY:-mid}"
+OUT="logs/diagnose/pkm_slots/$(date +%Y-%m-%d_%H-%M-%S)_${PKM_ARCH}_tgt${TARGET_STRATEGY:-mid}${SLURM_JOB_ID:+_job${SLURM_JOB_ID}}"
 echo "[$(date -Is)] PKM slot diagnosis: ckpt=${CKPT}"
 echo "  data=${GRID_POISON_DATA_DIR}  arch=${PKM_ARCH}  out=${OUT}"
 python -u -m src.diagnose_pkm_slots \
