@@ -30,7 +30,7 @@ resolve_grid_dataset() {
 
   # Compute poison suffix once from env vars.
   local _pct _seed _n _sfx _method _mtok
-  _pct="$(python3 -c "print(int(round(${POISONING_RATIO:-0.01} * 100)))")"
+  _pct="$(python3 -c "r=float(${POISONING_RATIO:-0.01})*100; print(int(round(r)) if abs(r-round(r))<1e-9 else (\"%g\"%r).replace(\".\",\"p\"))")"
   _seed="${POISON_SEED:-2}"
   _n="${N_TARGET_ITEMS:-10}"
   _method="${POISON_METHOD:-bandwagon}"
@@ -141,7 +141,7 @@ resolve_grid_dataset() {
       if [ ! -f "${sid}" ] && [ -f "${meta}" ]; then
         local compat_dir
         compat_dir=$(grep -o '"sid_tensor_compatible_with": *"[^"]*"' "${meta}" \
-                     | sed 's/.*": *"\([^"]*\)"/\1/')
+                     | sed 's/.*": *"\([^"]*\)"/\1/' || true)
         if [ -n "${compat_dir}" ] && [ "${compat_dir}" != "null" ]; then
           local compat_name
           compat_name=$(basename "${compat_dir}")

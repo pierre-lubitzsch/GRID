@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 import torch
 from torch import nn
@@ -42,6 +42,8 @@ def unified_unlearn(
     coherence_neighbors: Optional[Sequence[Any]] = None,
     coherence_loss_type: str = "nll",
     coherence_mass_cap: float = 0.999,
+    coherence_checkpoint: bool = False,
+    sep_checkpoint: bool = False,
     forget_loss_level: str = "token",
     # Per-SID-level weights w on the ITEM-LEVEL loss (eq. sid-aware-item-loss).
     # The paper defines one vector and uses it in BOTH the retain and the forget
@@ -84,6 +86,11 @@ def unified_unlearn(
     # request actually touches, so a deletion stops editing the identifier space
     # of the thousands of items that merely share a coarse code.
     code_row_keep: Optional[torch.Tensor] = None,
+    # Called with the 1-based epoch number after every full pass (every
+    # optim_steps_per_pass optimizer steps); returning True ends the loop early.
+    # Used by validation-based epoch selection (val_selection.EpochSelector),
+    # which also restores the best epoch's weights afterwards.
+    epoch_end_callback: Optional[Callable[[int], bool]] = None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Optimize unified objective.
@@ -583,6 +590,7 @@ def unified_unlearn(
         log.info("[unified] SID-level weights: w_forget=%s w_retain=%s",
                  w_f, w_r)
 
+    steps_run = 0
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
 
@@ -624,6 +632,7 @@ def unified_unlearn(
                         neighbor_mask,
                         loss_type=coherence_loss_type,
                         mass_cap=coherence_mass_cap,
+                        checkpoint=coherence_checkpoint,
                     )
                     if l_coh.requires_grad:
                         coh_term = (float(lambda_neighborhood) * l_coh) / float(q_forget)
@@ -674,6 +683,7 @@ def unified_unlearn(
                     positives=sep_positives,
                     loss_type=sep_loss_type,
                     gen_temperature=float(sep_gen_temperature),
+                    checkpoint=sep_checkpoint,
                 )
             # lambda_retain weights the retain (repair) term. It exists so the
             # ascent/descent baselines are EXACT special cases of this objective
@@ -765,12 +775,22 @@ def unified_unlearn(
 
         del last_retain_batch  # free reference
 
+        steps_run = step + 1
+        if (epoch_end_callback is not None
+                and steps_run % optim_steps_per_pass == 0
+                and epoch_end_callback(steps_run // optim_steps_per_pass)):
+            log.info("[unified] stopped by epoch_end_callback after epoch %d "
+                     "(%d/%d steps)", steps_run // optim_steps_per_pass,
+                     steps_run, steps)
+            break
+
     def _mean(xs: List[float]) -> Optional[float]:
         return float(sum(xs) / max(1, len(xs))) if xs else None
 
     return {
         "algorithm": "unified",
         "steps": steps,
+        "steps_run": steps_run,
         "n_epochs": n_epochs,
         "optim_steps_per_pass": optim_steps_per_pass,
         "q_forget": q_forget,

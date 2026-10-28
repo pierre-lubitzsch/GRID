@@ -53,7 +53,7 @@ if [[ "${ARG}" == */* ]]; then
   CLEAN_DIR="${ARG}"
   BASE="$(basename "${CLEAN_DIR}")"
   PARENT="$(dirname "${CLEAN_DIR}")"
-  PCT="$(python3 -c "print(int(round(${POISONING_RATIO} * 100)))")"
+  PCT="$(python3 -c "r=float(${POISONING_RATIO})*100; print(int(round(r)) if abs(r-round(r))<1e-9 else (\"%g\"%r).replace(\".\",\"p\"))")"
   OUT_DIR="${PARENT}/${BASE}_spam${MTOK}_seed${POISON_SEED}_pct${PCT}_n${N_TARGET_ITEMS}"
 else
   if ! resolve_grid_dataset "${ARG}"; then

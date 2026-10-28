@@ -7,6 +7,8 @@ import logging
 import math
 import os
 import shutil
+import copy
+import dataclasses
 from typing import Any, Dict, List, Optional, Set
 
 import hydra
@@ -28,6 +30,10 @@ from src.data.unlearning.sequential_split import (  # noqa: E402
 from src.models.modules.semantic_id.tiger_unlearning_module import (  # noqa: E402
     TigerUnlearningModule,
     save_unlearned_checkpoint,
+)
+from src.components.unlearning.val_selection import (  # noqa: E402
+    build_val_batches,
+    run_level_selection,
 )
 from src.components.unlearning.filter_utils import (  # noqa: E402
     merge_filter_masks,
@@ -294,118 +300,174 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
         out_root = cfg.paths.output_dir
         ckpt_dir = os.path.join(out_root, "checkpoints")
         os.makedirs(ckpt_dir, exist_ok=True)
-        per_request: List[Dict[str, Any]] = []
         prev_ckpt_path: Optional[str] = None
         # The filter baseline installs a decode mask on the module and performs no
         # weight update, so the mask is NOT in the checkpoint. Request dirs are
         # deleted when cleanup_request_dirs is on, which used to take the
         # per-request filter_mask.json with them; the union is persisted at the run
         # root so the post-unlearn eval can reinstall it via decode_filter_mask.
-        filter_masks: List[Dict[str, Any]] = []
+        def run_requests(
+            pass_cfg: Dict[str, Any], save_ckpts: bool = True
+        ) -> tuple:
+            """Unlearn every request in order on the CURRENT model weights.
 
-        for k, forget_uids in enumerate(request_batches):
-            batch_label = f"batch {k + 1}/{n_batches}"
-            request_dir = os.path.join(out_root, "requests", str(k))
-            command_line_logger.info(
-                f"[seq] {batch_label}: materialising {len(forget_uids)} "
-                f"forget users"
+            Works on a copy of the retain index, so it can be called again
+            (validation-based selection of n_epochs re-runs the whole sequence
+            from the starting weights for each candidate).
+            """
+            nonlocal prev_ckpt_path
+            pass_retain_index = dataclasses.replace(
+                retain_index,
+                bytes_by_uid=dict(retain_index.bytes_by_uid),
+                uid_order=list(retain_index.uid_order),
             )
-            split_info = materialize_request_dirs(
-                request_dir=request_dir,
-                forget_index=forget_index,
-                retain_index=retain_index,
-                forget_uids=forget_uids,
-                rows_per_shard=rows_per_shard,
-                forget_subdir=TRAINING_FORGET_SUBDIR,
-                retain_subdir=TRAINING_RETAIN_SUBDIR,
-            )
+            per_request: List[Dict[str, Any]] = []
+            filter_masks: List[Dict[str, Any]] = []
+            for k, forget_uids in enumerate(request_batches):
+                batch_label = f"batch {k + 1}/{n_batches}"
+                request_dir = os.path.join(out_root, "requests", str(k))
+                command_line_logger.info(
+                    f"[seq] {batch_label}: materialising {len(forget_uids)} "
+                    f"forget users"
+                )
+                split_info = materialize_request_dirs(
+                    request_dir=request_dir,
+                    forget_index=forget_index,
+                    retain_index=pass_retain_index,
+                    forget_uids=forget_uids,
+                    rows_per_shard=rows_per_shard,
+                    forget_subdir=TRAINING_FORGET_SUBDIR,
+                    retain_subdir=TRAINING_RETAIN_SUBDIR,
+                )
 
-            retain_subset_dir = os.path.join(request_dir, "retain_subset")
-            command_line_logger.info(
-                f"[seq] {batch_label}: running "
-                f"algorithm={unlearning_cfg.get('algorithm', 'scif')} "
-                f"(neighborhood_aware="
-                f"{unlearning_cfg.get('neighborhood_aware')}) ..."
-            )
-            scif_info = model.run_unlearning(
-                unlearning_cfg=unlearning_cfg,
-                train_dataloader_config=train_dl_cfg,
-                data_dir=request_dir,
-                forget_subdir=TRAINING_FORGET_SUBDIR,
-                retain_subdir=TRAINING_RETAIN_SUBDIR,
-                retain_subset_dir=retain_subset_dir,
-                semantic_id_path=semantic_id_path,
-                forget_size_hint=int(split_info["n_forget_rows_written"]),
-                seed=int(cfg.get("seed", 2)),
-                num_hierarchies=int(cfg.get("num_hierarchies", 4)),
-                device=device,
-                output_dir=request_dir,
-                forget_manifest_path=manifest_path,
-            )
+                retain_subset_dir = os.path.join(request_dir, "retain_subset")
+                command_line_logger.info(
+                    f"[seq] {batch_label}: running "
+                    f"algorithm={unlearning_cfg.get('algorithm', 'scif')} "
+                    f"(neighborhood_aware="
+                    f"{unlearning_cfg.get('neighborhood_aware')}) ..."
+                )
+                scif_info = model.run_unlearning(
+                    unlearning_cfg=pass_cfg,
+                    train_dataloader_config=train_dl_cfg,
+                    data_dir=request_dir,
+                    forget_subdir=TRAINING_FORGET_SUBDIR,
+                    retain_subdir=TRAINING_RETAIN_SUBDIR,
+                    retain_subset_dir=retain_subset_dir,
+                    semantic_id_path=semantic_id_path,
+                    forget_size_hint=int(split_info["n_forget_rows_written"]),
+                    seed=int(cfg.get("seed", 2)),
+                    num_hierarchies=int(cfg.get("num_hierarchies", 4)),
+                    device=device,
+                    output_dir=request_dir,
+                    forget_manifest_path=manifest_path,
+                )
 
-            if scif_info.get("filter_mask"):
-                filter_masks.append(scif_info.pop("filter_mask"))
+                if scif_info.get("filter_mask"):
+                    filter_masks.append(scif_info.pop("filter_mask"))
 
-            ckpt_path_k = os.path.join(ckpt_dir, f"unlearned_{k}.ckpt")
-            if k in ckpt_request_indices:
-                save_unlearned_checkpoint(
-                    model=model,
-                    out_path=ckpt_path_k,
-                    source_ckpt=source_ckpt,
-                    extra_metadata={
-                        "scif_info": scif_info,
+                ckpt_path_k = os.path.join(ckpt_dir, f"unlearned_{k}.ckpt")
+                if save_ckpts and k in ckpt_request_indices:
+                    save_unlearned_checkpoint(
+                        model=model,
+                        out_path=ckpt_path_k,
+                        source_ckpt=source_ckpt,
+                        extra_metadata={
+                            "scif_info": scif_info,
+                            "request_idx": k,
+                            "forget_uids": list(forget_uids),
+                            "n_total_requests": len(request_batches),
+                            "request_batch_size": request_batch_size,
+                            "request_user_order": request_user_order,
+                            "request_seed": request_seed,
+                            "source_ckpt_path": os.path.abspath(ckpt_path),
+                            "data_dir": os.path.abspath(data_dir),
+                            "forget_subdir": forget_subdir,
+                            "retain_subdir": retain_subdir,
+                            "request_dir": split_info["request_dir"],
+                            "unlearning_cfg": unlearning_cfg,
+                            "semantic_id_path": (
+                                os.path.abspath(semantic_id_path)
+                                if semantic_id_path
+                                else None
+                            ),
+                            "num_hierarchies": cfg.get("num_hierarchies", None),
+                            "previous_ckpt_path": prev_ckpt_path,
+                            **run_meta,
+                        },
+                    )
+                    prev_ckpt_path = ckpt_path_k
+
+                per_request.append(
+                    {
                         "request_idx": k,
                         "forget_uids": list(forget_uids),
-                        "n_total_requests": len(request_batches),
-                        "request_batch_size": request_batch_size,
-                        "request_user_order": request_user_order,
-                        "request_seed": request_seed,
-                        "source_ckpt_path": os.path.abspath(ckpt_path),
-                        "data_dir": os.path.abspath(data_dir),
-                        "forget_subdir": forget_subdir,
-                        "retain_subdir": retain_subdir,
-                        "request_dir": split_info["request_dir"],
-                        "unlearning_cfg": unlearning_cfg,
-                        "semantic_id_path": (
-                            os.path.abspath(semantic_id_path)
-                            if semantic_id_path
+                        "split_info": split_info,
+                        "scif_info": scif_info,
+                        "ckpt_path": (
+                            os.path.abspath(ckpt_path_k)
+                            if save_ckpts and k in ckpt_request_indices
                             else None
                         ),
-                        "num_hierarchies": cfg.get("num_hierarchies", None),
-                        "previous_ckpt_path": prev_ckpt_path,
-                        **run_meta,
-                    },
+                    }
                 )
-                prev_ckpt_path = ckpt_path_k
 
-            per_request.append(
-                {
-                    "request_idx": k,
-                    "forget_uids": list(forget_uids),
-                    "split_info": split_info,
-                    "scif_info": scif_info,
-                    "ckpt_path": (
-                        os.path.abspath(ckpt_path_k)
-                        if k in ckpt_request_indices
-                        else None
-                    ),
-                }
-            )
+                n_removed = pass_retain_index.remove(forget_uids)
+                if n_removed:
+                    command_line_logger.info(
+                        f"[seq] {batch_label}: removed {n_removed} uids from the "
+                        f"retain index for the next batch."
+                    )
 
-            n_removed = retain_index.remove(forget_uids)
-            if n_removed:
+                if cleanup_request_dirs and os.path.isdir(request_dir):
+                    shutil.rmtree(request_dir)
+
+                pct = int(round(100.0 * (k + 1) / n_batches))
                 command_line_logger.info(
-                    f"[seq] {batch_label}: removed {n_removed} uids from the "
-                    f"retain index for the next batch."
+                    f"[seq] {batch_label} done ({pct}% complete)"
                 )
+            return per_request, filter_masks
 
-            if cleanup_request_dirs and os.path.isdir(request_dir):
-                shutil.rmtree(request_dir)
-
-            pct = int(round(100.0 * (k + 1) / n_batches))
-            command_line_logger.info(
-                f"[seq] {batch_label} done ({pct}% complete)"
+        val_sel_cfg = unlearning_cfg.get("val_selection") or {}
+        run_level = bool(val_sel_cfg.get("enabled", False)) and (
+            str(val_sel_cfg.get("mode", "run")).strip().lower() == "run"
+        )
+        val_selection_info: Optional[Dict[str, Any]] = None
+        if run_level:
+            # One n_epochs for the whole sequence, chosen by re-running it
+            # from the starting weights for E = 1, 2, ... and scoring each
+            # FINAL model on the validation split (val_selection.run_level_selection).
+            vs_batches = build_val_batches(
+                train_dl_cfg, str(val_sel_cfg["data_folder"]), device,
+                batch_size=int(val_sel_cfg.get("batch_size", 64)),
+                max_rows=val_sel_cfg.get("max_rows"),
             )
+
+            def _run_once(n_epochs: int) -> tuple:
+                pass_cfg = copy.deepcopy(unlearning_cfg)
+                pass_cfg["n_epochs"] = int(n_epochs)
+                # Prepare each request's batches once (first pass) and reuse
+                # them, with the RNG state after preparation, in later passes.
+                pass_cfg["_cache_request_context"] = True
+                return run_requests(pass_cfg, save_ckpts=False)
+
+            (per_request, filter_masks), val_selection_info = run_level_selection(
+                model=model,
+                batches=vs_batches,
+                run_once=_run_once,
+                seed=int(cfg.get("seed", 2)),
+                lambda_ndcg=float(val_sel_cfg.get("lambda_ndcg", 1.0)),
+                tau_floor=float(val_sel_cfg.get("tau_floor", 0.95)),
+                sh_floor=float(val_sel_cfg.get("sh_floor", 0.005)),
+                patience=int(val_sel_cfg.get("patience", 2)),
+                min_epochs=int(val_sel_cfg.get("min_epochs", 1)),
+                max_epochs=int(val_sel_cfg.get("max_epochs", 10)),
+                score_tol=float(val_sel_cfg.get("score_tol", 0.0)),
+            )
+            if hasattr(model, "clear_request_cache"):
+                model.clear_request_cache()
+        else:
+            per_request, filter_masks = run_requests(unlearning_cfg)
 
         # Union of the per-request masks, at a path the post-unlearn eval can find.
         merged_filter_mask_path: Optional[str] = None
@@ -479,6 +541,7 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
             "source_ckpt_path": os.path.abspath(ckpt_path),
             "final_ckpt_path": os.path.abspath(final_ckpt),
             "requests": per_request,
+            "val_selection": val_selection_info,
         }
         info_path = os.path.join(out_root, "scif_info.json")
         with open(info_path, "w") as f:

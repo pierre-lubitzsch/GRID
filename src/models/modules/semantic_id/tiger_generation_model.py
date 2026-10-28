@@ -5,6 +5,7 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
+import torch.utils.checkpoint
 import transformers
 from torch import nn
 from torchmetrics.aggregation import BaseAggregator
@@ -1378,6 +1379,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         neighbor_mask: torch.Tensor,
         loss_type: str = "nll",
         mass_cap: float = 0.999,
+        checkpoint: bool = False,
     ) -> torch.Tensor:
         """Coherence loss ``L_n``, prefix-neighbour variant. Two forms.
 
@@ -1463,7 +1465,16 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             slot_mask = neighbor_mask[:, c]
             if float(slot_mask.sum()) == 0.0:
                 continue
-            lp = self._teacher_forced_log_prob(model_input, neighbor_sids[:, c])
+            if checkpoint:
+                # Keep only this slot's log-prob and recompute its forward pass in
+                # backward (same RNG state), so memory no longer grows with the
+                # number of neighbour slots. Gradients are unchanged.
+                lp = torch.utils.checkpoint.checkpoint(
+                    self._teacher_forced_log_prob, model_input, neighbor_sids[:, c],
+                    use_reentrant=False,
+                )
+            else:
+                lp = self._teacher_forced_log_prob(model_input, neighbor_sids[:, c])
             log_probs = log_probs.clone()
             log_probs[:, c] = torch.where(
                 slot_mask > 0, lp, torch.full_like(lp, float("-inf"))
@@ -1624,6 +1635,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         *,
         neg_ids: List[int],
         temperature: float = 1.0,
+        checkpoint: bool = False,
     ) -> torch.Tensor:
         """``L_sep`` with sequence log-probabilities as the InfoNCE logits.
 
@@ -1634,6 +1646,11 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         Positive = the batch label; negatives = ``neg_ids`` scored against the
         SAME retain histories. See :meth:`compute_sep_loss` for why the negative
         set must stay small. Costs ``1 + len(neg_ids)`` teacher-forced passes.
+
+        ``checkpoint=True`` recomputes each negative's pass in the backward pass
+        instead of keeping its activations, so peak memory no longer grows with
+        the number of negatives (a takedown of 95 items or ten spam targets ran
+        out of memory on 80 GB without it). Loss and gradients are unchanged.
         """
         model_input, label_data = retain_batch
         device = next(self.parameters()).device
@@ -1654,12 +1671,22 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
 
         # log p(s_i_f | h_u) for each negative, same histories.
         neg_sids = self.codebooks[torch.tensor(neg_ids)].to(device).long()  # [N, H]
-        neg_lps = [
-            self._teacher_forced_log_prob(
-                model_input, neg_sids[j].unsqueeze(0).expand(bsz, n_hier)
-            )
-            for j in range(neg_sids.size(0))
-        ]  # each [B]
+        if checkpoint:
+            neg_lps = [
+                torch.utils.checkpoint.checkpoint(
+                    self._teacher_forced_log_prob, model_input,
+                    neg_sids[j].unsqueeze(0).expand(bsz, n_hier),
+                    use_reentrant=False,
+                )
+                for j in range(neg_sids.size(0))
+            ]  # each [B]
+        else:
+            neg_lps = [
+                self._teacher_forced_log_prob(
+                    model_input, neg_sids[j].unsqueeze(0).expand(bsz, n_hier)
+                )
+                for j in range(neg_sids.size(0))
+            ]  # each [B]
 
         tau = float(temperature)
         if tau <= 0:
@@ -1677,6 +1704,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         positives: str = "history",
         loss_type: str = "cosine",
         gen_temperature: float = 1.0,
+        checkpoint: bool = False,
     ) -> torch.Tensor:
         """Separation loss ``L_sep'`` (per-user, all-positives form).
 
@@ -1773,7 +1801,8 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
 
         if loss_type == "generative":
             return self._sep_loss_generative(
-                retain_batch, neg_ids=neg_ids, temperature=float(gen_temperature)
+                retain_batch, neg_ids=neg_ids, temperature=float(gen_temperature),
+                checkpoint=checkpoint,
             )
 
         # --- history item SID rows: [B, n_items, H] (raw codes) ---

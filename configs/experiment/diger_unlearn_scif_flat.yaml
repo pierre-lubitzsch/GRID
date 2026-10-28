@@ -109,6 +109,7 @@ unlearning:
   cg_solution_max_norm: null
   max_norm: null
   update_max_norm: 1.0
+  scif_tau_scale: 1.0   # SCIF step multiplier: tau = scif_tau_scale / |retain|; 1.0 = original influence step
   batch_size_per_device: 256
   target_params: tiger
   eval_mode: true
@@ -333,7 +334,7 @@ unlearning:
   # length >= neighborhood_prefix_length, forget items excluded), conditioned on
   # the forget history, boosting coherent nearby items. (algorithm=unified only.)
   lambda_n: 0.0
-  neighborhood_count: 4
+  neighborhood_count: 8
   neighborhood_prefix_length: 2
   # Which forget rows L_n scores.
   #   target_only (default) rows whose LABEL is a deletion target — the
@@ -456,6 +457,10 @@ unlearning:
   # guards the log against float error pushing the log-mass above 0.
   # Inert unless coherence_loss_type=suppress.
   coherence_mass_cap: 0.999
+  # Recompute each neighbour slot's forward pass in backward (gradient checkpointing):
+  # memory no longer grows with neighborhood_count; gradients are unchanged.
+  coherence_checkpoint: false
+  sep_checkpoint: false   # recompute each generative L_sep negative in backward (memory flat in #negatives; same gradients)
   # InfoNCE temperature for L_sep. 0.07 is what EVERY recorded run used --
   # no sweep has ever overridden it. The Jun-2026 slides quote 0.007; that
   # value was never run, and since r_u/z_i are L2-normalised (cosine in
@@ -519,6 +524,42 @@ unlearning:
   #   seif:    number of repair epochs (overrides seif_repair_epochs).
   # null → each algorithm uses its own per-algorithm default.
   n_epochs: null
+  # Validation-based selection of n_epochs (unified only; replaces n_epochs).
+  # mode=run (default): re-run the WHOLE request sequence from the starting
+  #   weights for n_epochs = min_epochs, min_epochs+1, ... and score each FINAL
+  #   model on the validation split once:
+  #     score = (SH_P - SH_U)/max(SH_P, sh_floor) + lambda_ndcg*(NDCG_U/NDCG_P - 1)
+  #   with P = the starting (poisoned) model, measured in-process; models with
+  #   NDCG_U/NDCG_P < tau_floor rank below all others. Stops after `patience`
+  #   values without improvement (or at max_epochs) and keeps the best model;
+  #   a larger n_epochs must win by more than score_tol.
+  # mode=request: stop inside EACH request after `patience` epochs without
+  #   improvement under the paper's rule (tau_P >= tau_floor, then smallest
+  #   |SH@10 - SH_ref|, then higher tau_P on an SH tie within sh_tie_tol), with
+  #   SH_ref/NDCG_ref from `reference` (retrained: reference_metrics_csv or
+  #   ref_sh/ref_ndcg; original: starting model's NDCG, ref_sh default 0).
+  #   Greedy: early requests over-forget (2026-10-07, beauty/mid seed 2).
+  val_selection:
+    enabled: false
+    mode: run
+    lambda_ndcg: 1.0
+    sh_floor: 0.005
+    # mode=run: a larger n_epochs must beat the best score by MORE than this
+    # to replace it, so near-ties go to fewer epochs (one rerun of n_epochs=4
+    # from a different RNG state moved val NDCG by 2.6% on beauty/mid seed 2).
+    score_tol: 0.01
+    data_folder: ${data_dir}/evaluation
+    reference: retrained
+    reference_metrics_csv: null
+    ref_sh: null
+    ref_ndcg: null
+    tau_floor: 0.95
+    sh_tie_tol: 0.0
+    patience: 2
+    max_epochs: 10
+    min_epochs: 1
+    batch_size: 64
+    max_rows: null
   unified_lr: 1.0e-4
   # Stable-Adaptive Semantic IDs (unlearning-aware ID design; wired for
   # algorithm=unified). When adaptive_codes=true, the update is confined to the

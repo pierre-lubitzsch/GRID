@@ -103,6 +103,7 @@ def scif_unlearn(
     grad_masks: Optional[Dict[int, torch.Tensor]] = None,
     cg_solution_max_norm: Optional[float] = None,
     update_max_norm: Optional[float] = 1.0,
+    tau_scale: float = 1.0,
     eval_mode: bool = True,
     device: Optional[torch.device] = None,
 ) -> Dict[str, object]:
@@ -151,6 +152,11 @@ def scif_unlearn(
     update_max_norm
         Joint L2 cap on the actual parameter update ``-tau * x``. ``None``
         disables clipping. Default ``1.0``.
+    tau_scale
+        Multiplier on the step ``tau = tau_scale / retain_size``. Default ``1.0``
+        is the original influence step. On Beauty that step moves the model by
+        ~3e-5 in L2, so the norm cap never binds and damping barely matters;
+        this is the knob that actually sets how far SCIF moves.
     eval_mode
         If True (default), ``model.eval()`` is invoked before any forward
         pass. ERASE itself uses ``train()``; we deviate because TIGER applies
@@ -254,7 +260,7 @@ def scif_unlearn(
     )
 
     # --- 4. Build parameter update delta = -tau * x, clip joint norm, apply
-    tau = 1.0 / float(retain_size)
+    tau = float(tau_scale) / float(retain_size)
     update_before: List[torch.Tensor] = []
     n_param_skipped = 0
     n_param_masked = 0

@@ -832,7 +832,10 @@ def _default_out_dir(
 ) -> str:
     parent = os.path.dirname(os.path.abspath(data_dir.rstrip("/"))) or "."
     base = os.path.basename(os.path.abspath(data_dir.rstrip("/")))
-    pct = int(round(ratio * 100))
+    # Integer percentages keep their historical label (pct1, pct10); fractional ones get a
+    # distinct one (0.1% -> pct0p1, 0.01% -> pct0p01) instead of all rounding to pct0.
+    r = ratio * 100
+    pct = int(round(r)) if abs(r - round(r)) < 1e-9 else ("%g" % r).replace(".", "p")
     mtok = method_suffix(method)
     # clone_inject with >1 injection gets a distinct name (e.g. _clone_injectx3)
     # so different injection counts don't overwrite each other; count=1 keeps the

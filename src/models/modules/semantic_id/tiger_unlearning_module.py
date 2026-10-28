@@ -10,7 +10,7 @@ import re
 import time
 from copy import deepcopy
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -310,6 +310,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             grad_masks=scif_grad_masks,
             cg_solution_max_norm=cg_solution_max_norm,
             update_max_norm=update_max_norm,
+            tau_scale=float(unlearning_cfg.get("scif_tau_scale", 1.0)),
             eval_mode=bool(unlearning_cfg.get("eval_mode", True)),
             device=device,
         )
@@ -468,55 +469,32 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         return info
 
     def _run_unified(self, **kwargs: Any) -> Dict[str, Any]:
-        ctx = self._prepare_unlearning_context(**kwargs)
         device = kwargs.get("device") or next(self.parameters()).device
         cfg = kwargs["unlearning_cfg"]
         t0 = time.time()
         local_repair = cfg.get("local_repair") or {}
         n_epochs_cfg = cfg.get("n_epochs")
-
-        # Coherence loss L_n (TRACER Eq. 9): precompute, per forget batch, the
-        # prefix-neighbour semantic ids of each sample's target item.
         lambda_neighborhood = float(cfg.get("lambda_n", 0.0))
-        coherence_neighbors = None
-        if lambda_neighborhood != 0.0:
-            coherence_neighbors = self._build_coherence_neighbors(
-                forget_batches=ctx["forget_batches"],
-                semantic_id_path=kwargs.get("semantic_id_path"),
-                num_hierarchies=kwargs.get("num_hierarchies"),
-                neighborhood_count=int(cfg.get("neighborhood_count", 4)),
-                neighborhood_prefix_length=int(
-                    cfg.get("neighborhood_prefix_length", 2)
-                ),
-                exclude_items=ctx["visible_forget_items"],
-                # 'target_only' (default) restricts L_n to forget rows whose
-                # label IS a deletion target. 'all' reproduces the pre-2026-08-05
-                # behaviour, where >=92% of the term boosted neighbours of
-                # popular filler items instead (see _build_coherence_neighbors).
-                coherence_rows=str(cfg.get("coherence_rows", "target_only")),
-                target_items=set(ctx["meta"].get("target_items") or []),
-                # 'embedding' defines P(i_T) as a fixed-size top-k in the
-                # pre-quantization space: never empty, independent of codebook
-                # width, and the ground truth that a prefix bucket only
-                # approximates (0.24-0.68 overlap, sid_fidelity.json).
-                neighbor_method=str(
-                    cfg.get("coherence_neighbor_method", "prefix")
-                ),
-                embedding_path=cfg.get("embedding_path"),
-                embedding_metric=str(cfg.get("coherence_embedding_metric", "cosine")),
-                latent_path=cfg.get("coherence_latent_path"),
-                union_size=str(cfg.get("coherence_union_size", "full")),
-            )
+        ctx, coherence_neighbors, code_row_keep = self._unified_request_inputs(
+            cfg, lambda_neighborhood, **kwargs)
+
+        # Validation-based epoch selection: n_epochs becomes the epoch at which
+        # the selector stops at the latest; it may stop earlier and restores the
+        # best epoch's weights (see val_selection.EpochSelector).
+        selector = self._build_epoch_selector(cfg, **kwargs)
+        if selector is not None:
+            n_epochs_cfg = selector.max_epochs
 
         info = unified_unlearn(
             self,
             ctx["forget_batches"],
             ctx["retain_batches"],
-            code_row_keep=self._resolve_code_row_keep(ctx, cfg, **kwargs),
+            code_row_keep=code_row_keep,
             steps=int(cfg.get("unified_steps", 500)),
             n_epochs=(
                 int(n_epochs_cfg) if n_epochs_cfg is not None else None
             ),
+            epoch_end_callback=selector,
             lr=float(cfg.get("unified_lr", 1e-4)),
             # lambda_r weights the retain term. 1.0 = current behaviour.
             # 0.0 turns repair off, which with lambda_f > 0 is pure gradient
@@ -532,6 +510,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             # needs every neighbour at probability 1 (see compute_coherence_loss).
             coherence_loss_type=str(cfg.get("coherence_loss_type", "nll")),
             coherence_mass_cap=float(cfg.get("coherence_mass_cap", 0.999)),
+            coherence_checkpoint=bool(cfg.get("coherence_checkpoint", False)),
+            sep_checkpoint=bool(cfg.get("sep_checkpoint", False)),
             forget_loss_level=str(cfg.get("forget_loss_level", "token")),
             # None (the default) keeps the uniform w = 1 behaviour.
             # position_weights is the paper's w: one vector over SID levels,
@@ -589,11 +569,172 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             stable_code_lr_scale=float(cfg.get("stable_code_lr_scale", 1.0)),
             device=device,
         )
+        if selector is not None:
+            info["val_selection"] = selector.finalize()
         info["wall_seconds"] = time.time() - t0
         info["update_scope"] = str(cfg.get("update_scope", "all"))
         info["optimizer"] = str(cfg.get("unified_optimizer", "adam"))
         info.update(ctx["meta"])
         return info
+
+    def _unified_request_inputs(
+        self, cfg: Any, lambda_neighborhood: float, **kwargs: Any
+    ) -> Tuple[Dict[str, Any], Any, Optional[torch.Tensor]]:
+        """Batches, L_n neighbours and code-row mask for one unified request.
+
+        With ``cfg["_cache_request_context"]`` (set by the sequential driver
+        when it re-runs the whole request sequence for validation-based
+        n_epochs selection) the result is computed once per request directory
+        (``data_dir``)
+        and reused by later passes, together with the RNG state right after
+        preparation. Building the retain subset (a full TFRecord scan, ~20 s
+        per request on Beauty) is >90% of a pass and identical in every pass:
+        the same earlier requests have been removed and the sampling is seeded.
+        Restoring the RNG makes every pass see the same data and random draws,
+        so passes differ only in n_epochs. Each call gets a deep copy, so
+        nothing a pass does to its batches leaks into the next pass.
+        """
+        import random as _random
+        # The request directory (<run>/requests/<k>) is the same path in every
+        # pass, so it identifies the request.
+        key = None
+        if cfg.get("_cache_request_context"):
+            key = kwargs.get("data_dir")
+            if not key:
+                raise ValueError("_cache_request_context needs data_dir (the request dir)")
+        cache = self.__dict__.setdefault("_request_ctx_cache", {})
+        if key is not None and key in cache:
+            entry = cache[key]
+            torch.set_rng_state(entry["rng_cpu"])
+            if entry["rng_cuda"] is not None:
+                torch.cuda.set_rng_state_all(entry["rng_cuda"])
+            _random.setstate(entry["rng_py"])
+            log.info("[unified] request inputs reused from the first pass (%s)", key)
+            return deepcopy((entry["ctx"], entry["coh"], entry["crk"]))
+
+        ctx = self._prepare_unlearning_context(**kwargs)
+        # Coherence loss L_n (TRACER Eq. 9): precompute, per forget batch, the
+        # prefix-neighbour semantic ids of each sample's target item.
+        coherence_neighbors = None
+        if lambda_neighborhood != 0.0:
+            coherence_neighbors = self._build_coherence_neighbors(
+                forget_batches=ctx["forget_batches"],
+                semantic_id_path=kwargs.get("semantic_id_path"),
+                num_hierarchies=kwargs.get("num_hierarchies"),
+                neighborhood_count=int(cfg.get("neighborhood_count", 4)),
+                neighborhood_prefix_length=int(
+                    cfg.get("neighborhood_prefix_length", 2)
+                ),
+                exclude_items=ctx["visible_forget_items"],
+                # 'target_only' (default) restricts L_n to forget rows whose
+                # label IS a deletion target. 'all' reproduces the pre-2026-08-05
+                # behaviour, where >=92% of the term boosted neighbours of
+                # popular filler items instead (see _build_coherence_neighbors).
+                coherence_rows=str(cfg.get("coherence_rows", "target_only")),
+                target_items=set(ctx["meta"].get("target_items") or []),
+                # 'embedding' defines P(i_T) as a fixed-size top-k in the
+                # pre-quantization space: never empty, independent of codebook
+                # width, and the ground truth that a prefix bucket only
+                # approximates (0.24-0.68 overlap, sid_fidelity.json).
+                neighbor_method=str(
+                    cfg.get("coherence_neighbor_method", "prefix")
+                ),
+                embedding_path=cfg.get("embedding_path"),
+                embedding_metric=str(cfg.get("coherence_embedding_metric", "cosine")),
+                latent_path=cfg.get("coherence_latent_path"),
+                union_size=str(cfg.get("coherence_union_size", "full")),
+            )
+        code_row_keep = self._resolve_code_row_keep(ctx, cfg, **kwargs)
+        if key is not None:
+            cache[key] = {
+                "ctx": deepcopy(ctx), "coh": deepcopy(coherence_neighbors),
+                "crk": deepcopy(code_row_keep),
+                "rng_cpu": torch.get_rng_state(),
+                "rng_cuda": (torch.cuda.get_rng_state_all()
+                             if torch.cuda.is_available() else None),
+                "rng_py": _random.getstate(),
+            }
+        return ctx, coherence_neighbors, code_row_keep
+
+    def clear_request_cache(self) -> None:
+        self.__dict__.pop("_request_ctx_cache", None)
+
+    def _build_epoch_selector(self, cfg: Any, **kwargs: Any):
+        """EpochSelector for this request, or None when val_selection is off.
+
+        The validation batches (and, for reference=original, the starting
+        model's validation NDCG) are computed once per run and cached on the
+        module, since sequential unlearning calls this once per request.
+        """
+        from src.components.unlearning.val_selection import (
+            EpochSelector,
+            build_val_batches,
+            evaluate_batches,
+            read_reference_metrics,
+        )
+
+        vs = cfg.get("val_selection") or {}
+        # mode=run is handled by the sequential driver (one n_epochs for the
+        # whole sequence); only mode=request stops inside each request.
+        if not vs.get("enabled", False) or str(vs.get("mode", "run")).lower() != "request":
+            return None
+        folder = vs.get("data_folder")
+        if not folder or not os.path.isdir(folder):
+            raise FileNotFoundError(
+                f"unlearning.val_selection.data_folder={folder!r} is not a "
+                "directory; it must be the VALIDATION split (<data_dir>/evaluation)."
+            )
+        device = kwargs.get("device") or next(self.parameters()).device
+        key = (os.path.abspath(folder), int(vs.get("batch_size", 64)),
+               vs.get("max_rows"))
+        cache = getattr(self, "_val_selection_cache", None)
+        if cache is None or cache["key"] != key:
+            t0 = time.time()
+            batches = build_val_batches(
+                kwargs["train_dataloader_config"], folder, device,
+                batch_size=key[1], max_rows=key[2])
+            cache = {"key": key, "batches": batches, "origin": None}
+            self._val_selection_cache = cache
+            log.info("[val_select] %d validation rows in %d batches from %s "
+                     "(%.1fs)", sum(int(b[0].mask.shape[0]) for b in batches),
+                     len(batches), folder, time.time() - t0)
+
+        reference = str(vs.get("reference", "retrained")).strip().lower()
+        ref_sh = vs.get("ref_sh")
+        ref_ndcg = vs.get("ref_ndcg")
+        if reference == "retrained":
+            if vs.get("reference_metrics_csv"):
+                csv_sh, csv_ndcg = read_reference_metrics(
+                    str(vs["reference_metrics_csv"]))
+                ref_sh = csv_sh if ref_sh is None else ref_sh
+                ref_ndcg = csv_ndcg if ref_ndcg is None else ref_ndcg
+            if ref_sh is None or ref_ndcg is None:
+                raise ValueError(
+                    "val_selection.reference=retrained needs the retrained "
+                    "model's validation SH@10 and NDCG@10: set "
+                    "reference_metrics_csv or ref_sh/ref_ndcg.")
+        elif reference == "original":
+            # Measured on the model as it is BEFORE the first request's update.
+            if cache["origin"] is None:
+                cache["origin"] = evaluate_batches(self, cache["batches"])
+                log.info("[val_select] starting model: %s", cache["origin"])
+            ref_ndcg = cache["origin"]["ndcg@10"] if ref_ndcg is None else ref_ndcg
+            ref_sh = 0.0 if ref_sh is None else ref_sh
+        else:
+            raise ValueError(
+                f"val_selection.reference must be retrained|original, got {reference!r}")
+
+        return EpochSelector(
+            model=self,
+            batches=cache["batches"],
+            ref_sh=float(ref_sh),
+            ref_ndcg=float(ref_ndcg),
+            tau_floor=float(vs.get("tau_floor", 0.95)),
+            sh_tie_tol=float(vs.get("sh_tie_tol", 0.0)),
+            patience=int(vs.get("patience", 2)),
+            max_epochs=int(vs.get("max_epochs", 10)),
+            min_epochs=int(vs.get("min_epochs", 1)),
+        )
 
     def _resolve_code_row_keep(
         self, ctx: Dict[str, Any], cfg: Any, **kwargs: Any

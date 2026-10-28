@@ -133,7 +133,7 @@ TS="$(date +%Y-%m-%d/%H-%M-%S)"
 # GRID_MODEL_TAG is EMPTY for tiger, so every existing run-dir name is unchanged.
 RUN_LABEL="${GRID_MODEL_TAG}${DATASET}_${VARIANT}"
 if [ "${VARIANT}" = "poison" ]; then
-  PCT_LABEL="$(python3 -c "r=${POISONING_RATIO}; print(f'pct{int(round(r*100))}')")"
+  PCT_LABEL="pct$(python3 -c "r=float(${POISONING_RATIO})*100; print(int(round(r)) if abs(r-round(r))<1e-9 else (\"%g\"%r).replace(\".\",\"p\"))")"
   # Tag the poison method (empty for bandwagon) so runs are self-describing.
   POISON_METHOD="${POISON_METHOD:-bandwagon}"
   if [ "${POISON_METHOD}" = "bandwagon" ]; then MTOK=""; else MTOK="_${POISON_METHOD}"; fi

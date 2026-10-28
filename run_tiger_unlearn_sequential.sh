@@ -192,7 +192,7 @@ source "${GRID_DIR}/scripts/unlearn_run_dir.sh"
 
 # Build a descriptive, unique run tag: dataset_pctX_nY_algo
 _DATASET_SLUG="${DATASET:-${DATASET_OR_DIR##*/}}"
-_PCT_LABEL="$(python3 -c "r=${POISONING_RATIO}; print(f'pct{int(round(r*100))}')")"
+_PCT_LABEL="pct$(python3 -c "r=float(${POISONING_RATIO})*100; print(int(round(r)) if abs(r-round(r))<1e-9 else (\"%g\"%r).replace(\".\",\"p\"))")"
 # Tag the poison method (empty for bandwagon) so unlearn runs are self-describing.
 POISON_METHOD="${POISON_METHOD:-bandwagon}"
 if [ "${POISON_METHOD}" = "bandwagon" ]; then _MTOK=""; else _MTOK="_${POISON_METHOD}"; fi
