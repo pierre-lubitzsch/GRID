@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import re
+import contextlib
 import time
 from copy import deepcopy
 from functools import partial
@@ -31,6 +32,7 @@ from src.components.unlearning.neighborhood_sampler import (
     build_sorted_sid_index,
     closest_prefix_neighbors,
     collect_items_in_shards,
+    count_items_in_shards,
     load_codebook,
     load_dense_embeddings,
     topk_embedding_neighbors,
@@ -42,7 +44,12 @@ from src.components.unlearning.target_params import (
     select_code_position_params,
     select_target_params,
 )
-from src.components.unlearning.unified import unified_unlearn
+from src.components.unlearning.unified import (
+    batch_to_device as _unified_batch_to_device,
+    item_log_probs,
+    label_sids,
+    unified_unlearn,
+)
 from src.data.loading.utils import assign_files_to_workers
 from src.data.unlearning.deletion_spec import (
     load_forget_manifest,
@@ -471,12 +478,33 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
     def _run_unified(self, **kwargs: Any) -> Dict[str, Any]:
         device = kwargs.get("device") or next(self.parameters()).device
         cfg = kwargs["unlearning_cfg"]
-        t0 = time.time()
         local_repair = cfg.get("local_repair") or {}
         n_epochs_cfg = cfg.get("n_epochs")
         lambda_neighborhood = float(cfg.get("lambda_n", 0.0))
+        # Reference cap / anchor (rebuttal variants; both OFF by default). The
+        # original weights are captured before anything else touches them.
+        cap_forget_on = bool(cfg.get("ref_cap_forget", False))
+        cap_sep_on = bool(cfg.get("ref_cap_sep", False))
+        lambda_anchor = float(cfg.get("lambda_a", 0.0) or 0.0)
+        ref_needed = cap_forget_on or cap_sep_on or lambda_anchor != 0.0
+        if ref_needed:
+            self._snapshot_reference_weights(cfg)
+        if lambda_anchor != 0.0 and lambda_neighborhood == 0.0:
+            raise ValueError("lambda_a (retain-side anchor) uses the L_nbr "
+                             "neighbourhood, so it needs lambda_n != 0")
         ctx, coherence_neighbors, code_row_keep = self._unified_request_inputs(
             cfg, lambda_neighborhood, **kwargs)
+        cap_peers = None
+        if cap_forget_on or cap_sep_on:
+            # Data statistics (a TFRecord scan, once per run): before t0, like
+            # the rest of the request's data preparation.
+            cap_peers = self._ref_cap_peers(cfg, ctx, **kwargs)
+        # Timer starts AFTER the request's data (and L_n neighbours) are prepared,
+        # as for every other algorithm and as in the recorded runs up to
+        # 2026-09: wall_seconds is unlearning time, not data loading. The
+        # request-cache refactor (val_selection) had moved t0 before
+        # _unified_request_inputs, inflating unified-family E ~60x (fixed 2026-11-07).
+        t0 = time.time()
 
         # Validation-based epoch selection: n_epochs becomes the epoch at which
         # the selector stops at the latest; it may stop earlier and restores the
@@ -484,6 +512,14 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         selector = self._build_epoch_selector(cfg, **kwargs)
         if selector is not None:
             n_epochs_cfg = selector.max_epochs
+
+        ref_extra: Dict[str, Any] = {}
+        ref_meta: Dict[str, Any] = {}
+        if ref_needed:
+            ref_extra, ref_meta = self._precompute_reference_terms(
+                cfg, ctx, coherence_neighbors, cap_peers,
+                cap_forget_on=cap_forget_on, cap_sep_on=cap_sep_on,
+                lambda_anchor=lambda_anchor, device=device)
 
         info = unified_unlearn(
             self,
@@ -512,6 +548,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             coherence_mass_cap=float(cfg.get("coherence_mass_cap", 0.999)),
             coherence_checkpoint=bool(cfg.get("coherence_checkpoint", False)),
             sep_checkpoint=bool(cfg.get("sep_checkpoint", False)),
+            sep_encode_once_chunk=int(cfg.get("sep_encode_once_chunk", 0) or 0),
             forget_loss_level=str(cfg.get("forget_loss_level", "token")),
             # None (the default) keeps the uniform w = 1 behaviour.
             # position_weights is the paper's w: one vector over SID levels,
@@ -568,7 +605,10 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             adaptive_code_lr_scale=float(cfg.get("adaptive_code_lr_scale", 1.0)),
             stable_code_lr_scale=float(cfg.get("stable_code_lr_scale", 1.0)),
             device=device,
+            **ref_extra,
         )
+        if ref_meta:
+            info["reference_terms"] = ref_meta
         if selector is not None:
             info["val_selection"] = selector.finalize()
         info["wall_seconds"] = time.time() - t0
@@ -576,6 +616,183 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         info["optimizer"] = str(cfg.get("unified_optimizer", "adam"))
         info.update(ctx["meta"])
         return info
+
+    # ------------------------------------------------------------------
+    # Reference-capped forgetting / retain-side anchor helpers
+    # ------------------------------------------------------------------
+    def _snapshot_reference_weights(self, cfg: Any) -> None:
+        """Keep a CPU copy of the weights the first request starts from
+        (ref_weights=original). Taken once per module; later requests and passes
+        reuse it."""
+        mode = str(cfg.get("ref_weights", "original")).strip().lower()
+        if mode not in ("original", "request"):
+            raise ValueError(f"unlearning.ref_weights must be original|request, got {mode!r}")
+        if mode == "original" and "_ref_original_state" not in self.__dict__:
+            self.__dict__["_ref_original_state"] = {
+                k: v.detach().to("cpu", copy=True) for k, v in self.state_dict().items()
+            }
+            log.info("[ref] original weights captured (%d tensors, CPU copy)",
+                     len(self.__dict__["_ref_original_state"]))
+
+    @contextlib.contextmanager
+    def _reference_scoring(self, cfg: Any):
+        """Eval mode + no grad, with the reference weights loaded for the
+        duration (ref_weights=original) and the current weights restored after."""
+        mode = str(cfg.get("ref_weights", "original")).strip().lower()
+        was_training = self.training
+        current = None
+        if mode == "original":
+            current = {k: v.detach().clone() for k, v in self.state_dict().items()}
+            self.load_state_dict(self.__dict__["_ref_original_state"], strict=True)
+        self.eval()
+        try:
+            with torch.no_grad():
+                yield
+        finally:
+            if current is not None:
+                self.load_state_dict(current, strict=True)
+            self.train(was_training)
+
+    def _ref_cap_peers(self, cfg: Any, ctx: Dict[str, Any], **kwargs: Any
+                       ) -> Dict[int, List[int]]:
+        """Popularity peers of every deletion target: the ref_cap_peer_count
+        catalog items whose legitimate interaction count (over the request's
+        retain split, which excludes the deleted accounts) is closest to the
+        target's own; targets and forget items excluded, ties by item id."""
+        targets = sorted(int(t) for t in (ctx["meta"].get("target_items") or []))
+        if not targets:
+            raise ValueError("ref_cap_* needs target_items in the forget manifest")
+        k = int(cfg.get("ref_cap_peer_count", 32))
+        if k < 1:
+            raise ValueError("ref_cap_peer_count must be >= 1")
+        key = (str(kwargs.get("forget_manifest_path") or ""), tuple(targets), k)
+        cache = self.__dict__.setdefault("_ref_cap_peer_cache", {})
+        if key in cache:
+            return cache[key]
+        retain_dir = os.path.join(kwargs["data_dir"], kwargs["retain_subdir"])
+        t0 = time.time()
+        counts = count_items_in_shards(_list_shards_safe(retain_dir))
+        n_items = int(self.codebooks.shape[0])
+        exclude = set(targets) | {int(x) for x in (ctx.get("visible_forget_items") or [])}
+        pool = [j for j in range(n_items) if j not in exclude]
+        peers: Dict[int, List[int]] = {}
+        for t in targets:
+            c_t = int(counts.get(t, 0))
+            ranked = sorted(pool, key=lambda j: (abs(int(counts.get(j, 0)) - c_t), j))
+            peers[t] = ranked[:k]
+            pc = [int(counts.get(j, 0)) for j in peers[t]]
+            log.info("[ref_cap] target %d: legitimate count %d (retain split %s); "
+                     "%d peers with counts %d..%d (median %d)", t, c_t, retain_dir,
+                     len(pc), min(pc), max(pc), sorted(pc)[len(pc) // 2])
+        log.info("[ref_cap] popularity scan %.1fs", time.time() - t0)
+        cache[key] = peers
+        self.__dict__["_ref_cap_counts_meta"] = {
+            int(t): {"count": int(counts.get(t, 0)),
+                     "peer_counts": [int(counts.get(j, 0)) for j in peers[t]]}
+            for t in targets}
+        return peers
+
+    def _precompute_reference_terms(
+        self, cfg: Any, ctx: Dict[str, Any], coherence_neighbors: Any,
+        cap_peers: Optional[Dict[int, List[int]]], *, cap_forget_on: bool,
+        cap_sep_on: bool, lambda_anchor: float, device: Any,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Per-request caps (ref_cap_forget / ref_cap_sep) and anchor reference
+        log-masses (lambda_a), scored once with the reference weights."""
+        n_h = int(self.num_hierarchies)
+        extra: Dict[str, Any] = {}
+        meta: Dict[str, Any] = {"ref_weights": str(cfg.get("ref_weights", "original"))}
+        t0 = time.time()
+        forget_batches = ctx["forget_batches"]
+        retain_batches = ctx["retain_batches"]
+        with self._reference_scoring(cfg):
+            if cap_peers is not None:
+                q = float(cfg.get("ref_cap_quantile", 0.5))
+                if not 0.0 <= q <= 1.0:
+                    raise ValueError("ref_cap_quantile must be in [0, 1]")
+                targets = sorted(cap_peers)
+                union = sorted({j for t in targets for j in cap_peers[t]})
+                col = {j: i for i, j in enumerate(union)}
+                union_sids = self.codebooks[torch.tensor(union)].long()
+                tgt_sids = self.codebooks[torch.tensor(targets)].long()
+
+                def _caps(model_input) -> Dict[int, torch.Tensor]:
+                    lps = item_log_probs(self, model_input, union_sids)  # [B, U]
+                    return {t: torch.quantile(
+                        lps[:, [col[j] for j in cap_peers[t]]], q, dim=1)
+                        for t in targets}
+
+                meta.update(ref_cap_quantile=q, ref_cap_targets=targets,
+                            ref_cap_peers={int(t): cap_peers[t] for t in targets},
+                            ref_cap_counts=self.__dict__.get("_ref_cap_counts_meta"))
+                if cap_forget_on:
+                    caps_f: List[Optional[torch.Tensor]] = []
+                    n_rows = 0
+                    cap_vals: List[float] = []
+                    for b in forget_batches:
+                        b = _unified_batch_to_device(b, device)
+                        lab = label_sids(b, n_h)
+                        match = (lab.unsqueeze(1) == tgt_sids.to(lab.device).unsqueeze(0)
+                                 ).all(dim=-1)  # [B, T]
+                        is_t = match.any(dim=1)
+                        if not bool(is_t.any()):
+                            caps_f.append(None)
+                            continue
+                        caps = _caps(b[0])
+                        cap = torch.full((lab.size(0),), float("nan"), device=lab.device)
+                        for ti, t in enumerate(targets):
+                            m = match[:, ti]
+                            cap = torch.where(m, caps[t].to(cap.dtype), cap)
+                        caps_f.append(cap)
+                        n_rows += int(is_t.sum())
+                        cap_vals.extend(cap[is_t].tolist())
+                    extra["forget_cap"] = caps_f
+                    meta["forget_cap_rows"] = n_rows
+                    meta["forget_cap_mean"] = (sum(cap_vals) / len(cap_vals)
+                                               if cap_vals else None)
+                if cap_sep_on:
+                    sep_neg = ctx.get("sep_negative_items")
+                    caps_r: List[Optional[Dict[int, torch.Tensor]]] = []
+                    vals: List[float] = []
+                    for b in retain_batches:
+                        b = _unified_batch_to_device(b, device)
+                        caps = _caps(b[0])
+                        if sep_neg is not None:
+                            caps = {t: v for t, v in caps.items() if t in set(sep_neg)}
+                        caps_r.append(caps or None)
+                        for v in caps.values():
+                            vals.extend(v.tolist())
+                    extra["sep_cap"] = caps_r
+                    meta["sep_cap_mean"] = sum(vals) / len(vals) if vals else None
+            if lambda_anchor != 0.0:
+                rows = set()
+                if coherence_neighbors is not None:
+                    for cn in coherence_neighbors:
+                        if cn is None:
+                            continue
+                        sids, mask = cn
+                        for r in sids[mask > 0].tolist():
+                            rows.add(tuple(int(x) for x in r))
+                meta["anchor_n_items"] = len(rows)
+                if rows:
+                    a_sids = torch.tensor(sorted(rows), dtype=torch.long)
+                    refs = []
+                    for b in retain_batches:
+                        b = _unified_batch_to_device(b, device)
+                        refs.append(torch.logsumexp(
+                            item_log_probs(self, b[0], a_sids), dim=1))
+                    extra.update(lambda_anchor=lambda_anchor, anchor_sids=a_sids,
+                                 anchor_ref=refs,
+                                 anchor_checkpoint=bool(cfg.get("anchor_checkpoint", True)))
+                    meta["anchor_ref_mean_logmass"] = float(
+                        torch.cat(refs).mean()) if refs else None
+                else:
+                    extra.update(lambda_anchor=lambda_anchor)
+        meta["precompute_seconds"] = time.time() - t0
+        log.info("[ref] precomputed reference terms in %.1fs: %s",
+                 meta["precompute_seconds"],
+                 {k: v for k, v in meta.items() if k not in ("ref_cap_peers", "ref_cap_counts")})
+        return extra, meta
 
     def _unified_request_inputs(
         self, cfg: Any, lambda_neighborhood: float, **kwargs: Any
@@ -613,6 +830,12 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             return deepcopy((entry["ctx"], entry["coh"], entry["crk"]))
 
         ctx = self._prepare_unlearning_context(**kwargs)
+        # Neighborhood rehearsal (reviewer baseline, OFF by default): replace a
+        # share of every retain batch's rows with retain rows whose next item is
+        # one of NAU's L_n neighbours. Same batches, rows per batch and steps.
+        _reh_rate = float(cfg.get("nbr_rehearsal_rate", 0.0) or 0.0)
+        if _reh_rate > 0.0:
+            self._apply_nbr_rehearsal(ctx, cfg, _reh_rate, **kwargs)
         # Coherence loss L_n (TRACER Eq. 9): precompute, per forget batch, the
         # prefix-neighbour semantic ids of each sample's target item.
         coherence_neighbors = None
@@ -643,6 +866,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 embedding_metric=str(cfg.get("coherence_embedding_metric", "cosine")),
                 latent_path=cfg.get("coherence_latent_path"),
                 union_size=str(cfg.get("coherence_union_size", "full")),
+                random_seed=int(cfg.get("coherence_random_seed", 0)),
             )
         code_row_keep = self._resolve_code_row_keep(ctx, cfg, **kwargs)
         if key is not None:
@@ -658,6 +882,203 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
 
     def clear_request_cache(self) -> None:
         self.__dict__.pop("_request_ctx_cache", None)
+
+    def _apply_nbr_rehearsal(
+        self, ctx: Dict[str, Any], cfg: Any, rate: float, **kwargs: Any
+    ) -> None:
+        """Neighborhood rehearsal: enrich retain batches with neighbor-labeled rows.
+
+        Reviewer baseline for "a simpler neighborhood regularizer at equal
+        neighborhood size and budget" (``unlearning.nbr_rehearsal_rate`` > 0;
+        default 0 = off, nothing here runs).
+
+        1. Neighbours: for every deletion target, the ``nbr_rehearsal_count``
+           nearest catalog items in the pre-quantization embedding space
+           (``embedding_path``, ``coherence_embedding_metric``), excluding this
+           request's forget items. This is the exact call NAU's L_n makes in
+           ``_build_coherence_neighbors`` (``coherence_neighbor_method=embedding``,
+           ``coherence_rows=target_only``), so with the same count and
+           embeddings the sets are identical.
+        2. Pool: every retain session of this request (``training_retain``, the
+           full retain split, not the sampled subset) that mentions a neighbour
+           at position >= 1 and no forget item (the retain-subset eligibility
+           rule), truncated after its last neighbour occurrence, run through the
+           SAME retain loader with the collate cap lifted, keeping only the
+           expanded rows whose label is a neighbour. These are ordinary retain
+           examples (same history windows, same augmentation) whose next item
+           is in the neighbourhood.
+        3. Mixing: in every retain batch of n rows, round(rate * n) randomly
+           chosen rows are replaced by pool rows (drawn from a reshuffled pool,
+           cycling when the pool is smaller than the demand). The number of
+           retain batches, rows per batch, forget batches and optimizer steps are
+           unchanged, so the training budget equals Forget+Repair's.
+        Statistics go to ``ctx["meta"]["nbr_rehearsal"]`` (hence scif_info.json).
+        """
+        import shutil
+
+        import tensorflow as tf
+
+        from src.components.unlearning.neighborhood_sampler import (
+            SEQUENCE_FIELD,
+            _ShardWriter,
+        )
+
+        method = str(cfg.get("nbr_rehearsal_neighbor_method", "embedding")).lower()
+        if method != "embedding":
+            raise ValueError(
+                f"nbr_rehearsal_neighbor_method must be 'embedding', got {method!r}"
+            )
+        count = int(cfg.get("nbr_rehearsal_count", 8))
+        embedding_path = cfg.get("embedding_path")
+        if not embedding_path:
+            raise ValueError(
+                "nbr_rehearsal_rate > 0 requires unlearning.embedding_path "
+                "(the pre-quantization item embeddings NAU's neighbours use)"
+            )
+        metric = str(cfg.get("coherence_embedding_metric", "cosine"))
+        targets = sorted(int(x) for x in (ctx["meta"].get("target_items") or []))
+        if not targets:
+            raise ValueError("nbr_rehearsal_rate > 0 needs target_items in the manifest")
+        exclude = {int(x) for x in ctx["visible_forget_items"]}
+        semantic_id_path = kwargs.get("semantic_id_path")
+        codebook = load_codebook(
+            semantic_id_path, num_hierarchies=kwargs.get("num_hierarchies")
+        )
+        n_items, H = int(codebook.shape[0]), int(codebook.shape[1])
+        embeddings = load_dense_embeddings(embedding_path)
+        if len(embeddings) != n_items:
+            raise ValueError(
+                f"embedding_path has {len(embeddings)} items, codebook {n_items}"
+            )
+        nbr_items: List[int] = []
+        for t in targets:
+            for n in topk_embedding_neighbors(
+                t, embeddings, count, metric=metric, exclude_ids=exclude, by_row=True
+            ):
+                if int(n) not in nbr_items:
+                    nbr_items.append(int(n))
+        nbr_set = set(nbr_items)
+        nbr_sids = {tuple(int(x) for x in codebook[n].tolist()) for n in nbr_items}
+
+        data_dir = kwargs["data_dir"]
+        retain_dir = os.path.join(data_dir, kwargs["retain_subdir"])
+        pool_dir = os.path.join(data_dir, "retain_nbr_rehearsal")
+        if os.path.exists(pool_dir):
+            shutil.rmtree(pool_dir)
+        writer = _ShardWriter(pool_dir, "data", int(cfg.get("rows_per_shard", 4096)))
+        n_mention = n_forbidden = n_written = 0
+        shards = _list_shards_safe(retain_dir)
+        for raw_t in tf.data.TFRecordDataset(shards, compression_type="GZIP"):
+            ex = tf.train.Example()
+            ex.ParseFromString(raw_t.numpy())
+            feats = ex.features.feature
+            seq = list(feats[SEQUENCE_FIELD].int64_list.value)
+            hits = [i for i, x in enumerate(seq) if int(x) in nbr_set and i >= 1]
+            if not hits:
+                continue
+            n_mention += 1
+            if exclude & {int(x) for x in seq}:
+                n_forbidden += 1
+                continue
+            last = hits[-1]
+            L = len(seq)
+            # truncate every per-position feature of the session alike
+            for key in list(feats.keys()):
+                f = feats[key]
+                for lst in (f.int64_list, f.float_list, f.bytes_list):
+                    if len(lst.value) == L:
+                        del lst.value[last + 1:]
+            writer.write(ex.SerializeToString())
+            n_written += 1
+        writer.close()
+
+        stats: Dict[str, Any] = {
+            "rate": float(rate),
+            "count": count,
+            "neighbor_method": method,
+            "embedding_path": str(embedding_path),
+            "metric": metric,
+            "target_items": targets,
+            "neighbor_items": nbr_items,
+            "n_sessions_mentioning": n_mention,
+            "n_sessions_forbidden": n_forbidden,
+            "n_pool_sessions": n_written,
+        }
+        pool: List[Tuple[int, int]] = []
+        pool_batches: List[Any] = []
+        if n_written > 0:
+            loader = _build_finite_loader(
+                base_train_cfg=kwargs["train_dataloader_config"],
+                data_folder=pool_dir,
+                batch_size_per_device_override=cfg.get("batch_size_per_device"),
+                max_batch_size_override=10 ** 9,
+            )
+            device = ctx["retain_batches"][0][0].mask.device
+            for b in _drain_loader(loader, device=device):
+                lab = label_sids(b, H).cpu().tolist()
+                keep = [r for r, s in enumerate(lab) if tuple(int(x) for x in s) in nbr_sids]
+                if keep:
+                    pool_batches.append(_gather_batch_rows([b], [(0, r) for r in keep]))
+            pool = [
+                (j, r) for j, b in enumerate(pool_batches)
+                for r in range(tiger_batch_size(b))
+            ]
+        stats["n_pool_rows"] = len(pool)
+        if not pool:
+            log.warning(
+                "[nbr_rehearsal] no retain row has a neighbour label; retain batches "
+                "left unchanged (neighbours %s)", nbr_items,
+            )
+            stats.update(n_rows_replaced=0, n_retain_rows=sum(
+                tiger_batch_size(b) for b in ctx["retain_batches"]))
+            ctx["meta"]["nbr_rehearsal"] = stats
+            return
+
+        rng = random.Random(int(kwargs.get("seed", 2)) * 1_000_003 + len(pool))
+        order: List[Tuple[int, int]] = []
+
+        def _draw() -> Tuple[int, int]:
+            if not order:
+                order.extend(pool)
+                rng.shuffle(order)
+            return order.pop()
+
+        new_batches = []
+        n_replaced = n_total = 0
+        for b in ctx["retain_batches"]:
+            n = tiger_batch_size(b)
+            m = int(round(rate * n))
+            n_total += n
+            if m <= 0:
+                new_batches.append(b)
+                continue
+            replace = set(rng.sample(range(n), m))
+            picks: List[Tuple[int, int]] = []
+            for r in range(n):
+                if r in replace:
+                    j, rr = _draw()
+                    picks.append((1 + j, rr))
+                else:
+                    picks.append((0, r))
+            new_batches.append(_gather_batch_rows([b] + pool_batches, picks))
+            n_replaced += m
+        ctx["retain_batches"] = new_batches
+        stats.update(
+            n_rows_replaced=n_replaced,
+            n_retain_rows=n_total,
+            share_replaced=n_replaced / max(n_total, 1),
+            mean_uses_per_pool_row=n_replaced / max(len(pool), 1),
+        )
+        ctx["meta"]["nbr_rehearsal"] = stats
+        ctx["meta"]["retain_size_augmented"] = sum(
+            tiger_batch_size(b) for b in new_batches
+        )
+        log.info(
+            "[nbr_rehearsal] rate=%.2f neighbours=%s: %d pool sessions -> %d "
+            "neighbour-labeled rows; replaced %d of %d retain rows (%.1f uses/row)",
+            rate, nbr_items, n_written, len(pool), n_replaced, n_total,
+            n_replaced / max(len(pool), 1),
+        )
 
     def _build_epoch_selector(self, cfg: Any, **kwargs: Any):
         """EpochSelector for this request, or None when val_selection is off.
@@ -1102,6 +1523,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         embedding_metric: str = "cosine",
         latent_path: Optional[str] = None,
         union_size: str = "full",
+        random_seed: int = 0,
     ) -> List[Optional[Any]]:
         """Per-forget-batch neighbour semantic ids for the coherence loss.
 
@@ -1141,10 +1563,12 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 f"coherence_rows must be 'target_only'|'all', got {coherence_rows!r}"
             )
         nbr_method = str(neighbor_method).lower()
-        if nbr_method not in ("prefix", "embedding", "latent", "embedding+latent"):
+        if nbr_method not in (
+            "prefix", "embedding", "latent", "embedding+latent", "random"
+        ):
             raise ValueError(
                 "coherence_neighbor_method must be "
-                "'prefix'|'embedding'|'latent'|'embedding+latent', got "
+                "'prefix'|'embedding'|'latent'|'embedding+latent'|'random', got "
                 f"{neighbor_method!r}"
             )
         needs_embedding = nbr_method in ("embedding", "embedding+latent")
@@ -1298,7 +1722,18 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                             by_row=True,
                         )
                     )
-                if not (k_emb or k_lat):
+                if nbr_method == "random":
+                    # Control arm (reviewer request): `count` catalog items drawn
+                    # uniformly at random, fixed per target and seed, forget items
+                    # excluded. Same size as the embedding/prefix neighbourhoods,
+                    # so a gap to them is due to WHICH items, not how many.
+                    rng = random.Random(int(random_seed) * 1_000_003 + int(item_id))
+                    pool = [
+                        j for j in range(num_items)
+                        if j != int(item_id) and j not in exclude
+                    ]
+                    nbr_ids = rng.sample(pool, min(count, len(pool)))
+                elif not (k_emb or k_lat):
                     nbr_ids = list(
                         closest_prefix_neighbors(
                             codebook,
@@ -1847,6 +2282,29 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 )
             forget_dir = filtered_dir
 
+        # unlearning.split_mode=retrain_matched (opt-in; default by_user keeps
+        # every recorded run): forget rows = only the rows whose LABEL is a
+        # deleted interaction. The prefixes seq[:j+1] (seq[j] deleted) are
+        # materialised below with include_context_rows off, and the forget
+        # collate keeps only the subsequences ending at seq[j]. The retain dir
+        # (retrained reference's training data) is chosen by the driver.
+        split_mode = str(unlearning_cfg.get("split_mode", "by_user") or "by_user").strip().lower()
+        if split_mode not in ("by_user", "retrain_matched"):
+            raise ValueError(
+                f"unlearning.split_mode must be 'by_user' or 'retrain_matched', got {split_mode!r}"
+            )
+        retrain_matched = split_mode == "retrain_matched"
+        if retrain_matched:
+            if deletion_spec != "item_pairs" or not target_items:
+                raise ValueError("split_mode=retrain_matched needs deletion_spec=item_pairs "
+                                 "and non-empty target items")
+            if bool(unlearning_cfg.get("include_context_rows", False)):
+                raise ValueError("split_mode=retrain_matched needs include_context_rows=false")
+            if bool(unlearning_cfg.get("unlearn_whole_items", False)):
+                raise ValueError("split_mode=retrain_matched is incompatible with unlearn_whole_items")
+            if bool(unlearning_cfg.get("forget_full_coverage", False)):
+                raise ValueError("split_mode=retrain_matched does not support forget_full_coverage")
+
         if deletion_spec == "item_pairs" and target_items:
             item_pairs_subdir = default_item_pairs_forget_subdir(forget_subdir)
             item_pairs_dir = os.path.join(data_dir, item_pairs_subdir)
@@ -1937,7 +2395,11 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             max_batch_size_override=(
                 10 ** 9 if forget_full_coverage else None
             ),
+            **({"collate_extra": {"last_label_only": True}} if retrain_matched else {}),
         )
+        if retrain_matched:
+            log.info("[split_mode=retrain_matched] forget rows = subsequences ending "
+                     "at a deleted item only (last_label_only collate) from %s", forget_dir)
         # Where the retain batches come from.
         #   subset (DEFAULT) -> retain_subset_dir, the sampled subset of size
         #       retain_samples_used_for_update * |D_f|. This is what every
@@ -2188,6 +2650,7 @@ def _build_finite_loader(
     data_folder: str,
     batch_size_per_device_override: Optional[int] = None,
     max_batch_size_override: Optional[int] = None,
+    collate_extra: Optional[Dict[str, Any]] = None,
 ) -> DataLoader:
     cfg = deepcopy(base_train_cfg)
     cfg.data_folder = data_folder
@@ -2234,6 +2697,8 @@ def _build_finite_loader(
     # the result into full-coverage batches instead.
     if max_batch_size_override is not None:
         _collate_kw["max_batch_size"] = int(max_batch_size_override)
+    if collate_extra:
+        _collate_kw.update(collate_extra)
     collate_fn_partial = partial(cfg.collate_fn, **_collate_kw)
 
     return DataLoader(
@@ -2309,6 +2774,61 @@ def _split_batch_rows(batch: Any, max_rows: int) -> List[Any]:
         )
         out.append((mi, ld))
     return out
+
+
+def _gather_batch_rows(sources: List[Any], picks: List[Tuple[int, int]]) -> Any:
+    """Build one TigerBatch from rows of several (``picks`` = (source, row)).
+
+    Same field rules as :func:`_split_batch_rows` (row-major and flattened
+    per-row groups are gathered, everything else is taken from ``sources[0]``),
+    plus one fix-up: ``label_location`` stores (row, column) coordinates, so its
+    row column is renumbered to the new row order. Used only by the
+    neighborhood-rehearsal opt-in (``unlearning.nbr_rehearsal_rate``).
+    """
+    import dataclasses
+
+    ns = [tiger_batch_size(b) for b in sources]
+    m = len(picks)
+
+    def _take(vals, is_loc=False):
+        v0 = vals[0]
+        if isinstance(v0, torch.Tensor):
+            if v0.dim() >= 1 and v0.shape[0] >= ns[0] and v0.shape[0] % ns[0] == 0:
+                k = v0.shape[0] // ns[0]
+                views = []
+                for v, n in zip(vals, ns):
+                    if not isinstance(v, torch.Tensor) or v.shape[0] != n * k:
+                        raise ValueError("incompatible batch field for row gather")
+                    views.append(v.reshape(n, k, *v.shape[1:]))
+                out = torch.stack([views[s][r] for s, r in picks], 0)
+                if is_loc:
+                    out = out.clone()
+                    out[..., 0] = torch.arange(m, device=out.device).view(m, 1)
+                return out.reshape(m * k, *v0.shape[1:])
+            return v0
+        if isinstance(v0, dict):
+            return {key: _take([v[key] for v in vals], is_loc) for key in v0}
+        if isinstance(v0, list):
+            if len(v0) >= ns[0] and len(v0) % ns[0] == 0:
+                k = len(v0) // ns[0]
+                return [x for s, r in picks for x in vals[s][r * k:(r + 1) * k]]
+            return v0
+        return v0
+
+    mis = [b[0] for b in sources]
+    lds = [b[1] for b in sources]
+    mi = dataclasses.replace(
+        mis[0],
+        **{f.name: _take([getattr(x, f.name) for x in mis])
+           for f in dataclasses.fields(mis[0])},
+    )
+    ld = dataclasses.replace(
+        lds[0],
+        **{f.name: _take([getattr(x, f.name) for x in lds],
+                         is_loc=(f.name == "label_location"))
+           for f in dataclasses.fields(lds[0])},
+    )
+    return (mi, ld)
 
 
 def _drain_loader(loader: DataLoader, device: torch.device) -> List[Any]:

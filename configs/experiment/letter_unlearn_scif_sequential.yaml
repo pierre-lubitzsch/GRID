@@ -1,0 +1,28 @@
+# @package _global_
+# Generated as the LETTER counterpart of tiger_unlearn_scif_sequential.yaml: same everything, except the
+# model target and LETTER's generation-loss temperature. Keep the two in
+# step -- an option added to the tiger config and not here is an option the
+# LETTER arm of a sweep silently does not have.
+
+defaults:
+  - letter_unlearn_scif_flat
+  - _self_
+
+unlearning:
+  request_batch_size: 8
+  n_unlearning_chunks: null  # alternative to request_batch_size: fix number of chunks, not chunk size
+  max_requests: null
+  request_user_order: manifest
+  request_seed: ${seed}
+  save_intermediate_checkpoints: false
+  # Keep ONLY the final checkpoint — it is the one `unlearned.ckpt` points at and
+  # the only one the post-unlearn eval and every downstream table read. The old
+  # [0.01, 0.10, 1.0] progression snapshots wrote a second full checkpoint per
+  # run (1.9-3.6 GiB each) that nothing ever consumed, doubling the on-disk cost
+  # of every sweep. Restore them via CKPT_FRACTIONS in
+  # run_tiger_unlearn_sequential.sh if a request-progression analysis needs them.
+  checkpoint_fractions: [1.0]
+  # Drop per-request scratch TFRecords after each SCIF step (eval uses ckpts only).
+  cleanup_request_dirs: true
+  # Post-unlearn eval is run by run_tiger_unlearn_sequential.sh (not this Python entry).
+  # Defaults: UNLEARN_RUN_POST_EVAL=true, UNLEARN_EVAL_DATA_DIR=src/data/amazon_data/beauty

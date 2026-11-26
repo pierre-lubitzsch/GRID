@@ -134,6 +134,9 @@ def unlearn(cfg: DictConfig) -> Dict[str, Any]:
         train_dl_cfg = _resolve_train_dl_cfg(pipeline_modules, cfg)
 
         unlearning_cfg = OmegaConf.to_container(cfg.unlearning, resolve=True)
+        if str(unlearning_cfg.get("split_mode", "by_user") or "by_user") != "by_user":
+            raise ValueError("unlearning.split_mode != by_user is implemented only in "
+                             "the sequential driver (src/unlearn_sequential.py)")
         data_dir = cfg.paths.data_dir
         forget_subdir = cfg.get("forget_subdir", "training_forget")
         retain_subdir = cfg.get("retain_subdir", "training_retain")

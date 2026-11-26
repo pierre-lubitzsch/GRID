@@ -1,0 +1,15 @@
+# @package _global_
+# Generated as the LETTER counterpart of tiger_unlearn_unified_flat.yaml: same everything, except the
+# model target and LETTER's generation-loss temperature. Keep the two in
+# step -- an option added to the tiger config and not here is an option the
+# LETTER arm of a sweep silently does not have.
+
+defaults:
+  - letter_unlearn_scif_flat
+  - _self_
+
+unlearning:
+  algorithm: unified
+
+tags:
+  - amazon-p5-gr-unlearn-unified

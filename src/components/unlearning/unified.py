@@ -27,6 +27,88 @@ log = logging.getLogger(__name__)
 TigerBatch = Any
 
 
+# ---------------------------------------------------------------------------
+# Reference-capped forgetting and the retain-side neighbourhood anchor
+# (unlearning.ref_cap_forget / ref_cap_sep / lambda_a; all OFF by default).
+# ---------------------------------------------------------------------------
+
+
+def label_sids(batch: TigerBatch, num_hierarchies: int) -> torch.Tensor:
+    """``[B, H]`` raw per-hierarchy codes of each row's label item."""
+    model_input, label_data = batch
+    bsz = int(model_input.mask.size(0))
+    fut_ids = None
+    for key in label_data.labels:
+        fut_ids = label_data.labels[key].reshape(bsz, -1)
+    if fut_ids is None:
+        raise ValueError("batch has no labels")
+    return fut_ids[:, :num_hierarchies].long()
+
+
+def item_log_probs(
+    model: nn.Module,
+    model_input: Any,
+    item_sids: torch.Tensor,
+    *,
+    checkpoint: bool = False,
+) -> torch.Tensor:
+    """``[B, M]``: ``log P(item_m | x_b)`` (teacher-forced, summed over levels)
+    for every history of ``model_input`` and every row of ``item_sids`` ``[M, H]``.
+
+    One decoder pass per item, in whatever train/eval mode the model is in.
+    ``checkpoint=True`` keeps only each item's ``[B]`` output and recomputes the
+    pass in backward (call backward before changing the model's mode).
+    """
+    bsz = int(model_input.mask.size(0))
+    sids = item_sids.to(model_input.mask.device).long()
+    n_h = int(sids.size(1))
+    cols = []
+    for m in range(int(sids.size(0))):
+        fut = sids[m].unsqueeze(0).expand(bsz, n_h)
+        if checkpoint and torch.is_grad_enabled():
+            lp = torch.utils.checkpoint.checkpoint(
+                model._teacher_forced_log_prob, model_input, fut,
+                use_reentrant=False,
+            )
+        else:
+            lp = model._teacher_forced_log_prob(model_input, fut)
+        cols.append(lp)
+    return torch.stack(cols, dim=1)
+
+
+def capped_forget_log_prob(
+    lp: torch.Tensor, cap: Optional[torch.Tensor]
+) -> "tuple[torch.Tensor, int, int]":
+    """Hinge form of the forget term's ``mean_r log P(y_r | x_r)``.
+
+    ``cap`` is ``[B]`` with NaN for rows that are not capped (their label is not
+    a deletion target). A capped row contributes only while its log-probability
+    is above the cap, i.e. ``sum_r lp_r * 1[lp_r > cap_r] / B``: identical to the
+    plain ``lp.mean()`` while every target row is above its cap, and no gradient
+    from a row once it is below. The normaliser stays B so the scale of L_for
+    does not change when rows drop out. Returns (value, n_capped_rows,
+    n_capped_rows_still_active).
+    """
+    if cap is None:
+        return lp.mean(), 0, 0
+    cap = cap.to(lp.device, lp.dtype)
+    is_capped = ~torch.isnan(cap)
+    above = lp.detach() > torch.nan_to_num(cap, nan=float("-inf"))
+    active = (~is_capped) | above
+    val = (lp * active.to(lp.dtype)).sum() / float(lp.numel())
+    return val, int(is_capped.sum()), int((is_capped & above).sum())
+
+
+def anchor_loss(log_mass: torch.Tensor, ref_log_mass: torch.Tensor) -> torch.Tensor:
+    """``mean_r (log M_theta(x_r) - log M_theta_o(x_r))^2`` over finite references."""
+    ref = ref_log_mass.to(log_mass.device, log_mass.dtype)
+    ok = torch.isfinite(ref) & torch.isfinite(log_mass.detach())
+    if not bool(ok.any()):
+        return log_mass.sum() * 0.0
+    d = torch.where(ok, log_mass - ref, torch.zeros_like(log_mass))
+    return (d * d).sum() / ok.sum().to(d.dtype)
+
+
 def unified_unlearn(
     model: nn.Module,
     forget_batches: Sequence[TigerBatch],
@@ -44,6 +126,7 @@ def unified_unlearn(
     coherence_mass_cap: float = 0.999,
     coherence_checkpoint: bool = False,
     sep_checkpoint: bool = False,
+    sep_encode_once_chunk: int = 0,
     forget_loss_level: str = "token",
     # Per-SID-level weights w on the ITEM-LEVEL loss (eq. sid-aware-item-loss).
     # The paper defines one vector and uses it in BOTH the retain and the forget
@@ -91,6 +174,19 @@ def unified_unlearn(
     # Used by validation-based epoch selection (val_selection.EpochSelector),
     # which also restores the best epoch's weights afterwards.
     epoch_end_callback: Optional[Callable[[int], bool]] = None,
+    # Reference-capped forgetting (unlearning.ref_cap_forget / ref_cap_sep).
+    # forget_cap: per forget batch, a [B] tensor of log-prob caps (NaN = row not
+    # capped) or None; sep_cap: per retain batch, {target item id: [B] caps} or
+    # None. None everywhere (default) = the uncapped objective, bit for bit.
+    forget_cap: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    sep_cap: Optional[Sequence[Optional[Dict[int, torch.Tensor]]]] = None,
+    # Retain-side neighbourhood anchor (unlearning.lambda_a). anchor_sids [M, H]
+    # are the neighbourhood's codes, anchor_ref per retain batch the reference
+    # log-mass [B] (precomputed with the reference weights).
+    lambda_anchor: float = 0.0,
+    anchor_sids: Optional[torch.Tensor] = None,
+    anchor_ref: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    anchor_checkpoint: bool = True,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Optimize unified objective.
@@ -590,6 +686,41 @@ def unified_unlearn(
         log.info("[unified] SID-level weights: w_forget=%s w_retain=%s",
                  w_f, w_r)
 
+    # --- reference cap / anchor set-up (all inert unless explicitly given) ---
+    use_forget_cap = forget_cap is not None and float(lambda_forget) != 0.0
+    if use_forget_cap:
+        if len(forget_cap) != n_forget:
+            raise ValueError(f"forget_cap has {len(forget_cap)} entries for "
+                             f"{n_forget} forget batches")
+        if sequence_forget or w_f is not None:
+            raise ValueError("ref_cap_forget needs forget_loss_level=token and no "
+                             "SID-level forget weights")
+    use_sep_cap = sep_cap is not None and float(lambda_sep) != 0.0
+    if use_sep_cap:
+        if len(sep_cap) != n_retain:
+            raise ValueError(f"sep_cap has {len(sep_cap)} entries for "
+                             f"{n_retain} retain batches")
+        if str(sep_loss_type).lower() != "generative":
+            raise ValueError("ref_cap_sep needs sep_loss_type=generative")
+    if float(lambda_anchor) < 0.0:
+        raise ValueError(f"lambda_a must be >= 0, got {lambda_anchor!r}")
+    use_anchor = (float(lambda_anchor) != 0.0 and anchor_sids is not None
+                  and anchor_ref is not None and int(anchor_sids.numel()) > 0)
+    if float(lambda_anchor) != 0.0 and not use_anchor:
+        log.warning("[unified] lambda_a=%s but no anchor neighbourhood for this "
+                    "request: the anchor term is off here", lambda_anchor)
+    if use_anchor and len(anchor_ref) != n_retain:
+        raise ValueError(f"anchor_ref has {len(anchor_ref)} entries for "
+                         f"{n_retain} retain batches")
+    n_hier_model = int(getattr(model, "num_hierarchies", 4))
+    cap_stats = {"forget_capped_rows": 0, "forget_capped_active": 0,
+                 "sep_capped_pairs": 0, "sep_capped_active": 0}
+    if use_forget_cap or use_sep_cap or use_anchor:
+        log.info("[unified] reference cap: forget=%s sep=%s | anchor: lambda_a=%s "
+                 "|N|=%s", use_forget_cap, use_sep_cap, float(lambda_anchor),
+                 int(anchor_sids.size(0)) if use_anchor else 0)
+    totals["anchor"] = []
+
     steps_run = 0
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
@@ -608,7 +739,16 @@ def unified_unlearn(
             # diagnostic is then 0 rather than the unweighted forget
             # log-probability; the term is off, so there is nothing to report.
             if float(lambda_forget) != 0.0:
-                if sequence_forget:
+                if use_forget_cap:
+                    # Hinge on target rows (ref_cap_forget). Same value as
+                    # -_batch_loss_from_model_step while no row is below its cap.
+                    lp_rows = model._teacher_forced_log_prob(
+                        forget_batch[0], label_sids(forget_batch, n_hier_model))
+                    l_forget, n_c, n_a = capped_forget_log_prob(
+                        lp_rows, forget_cap[idx])
+                    cap_stats["forget_capped_rows"] += n_c
+                    cap_stats["forget_capped_active"] += n_a
+                elif sequence_forget:
                     l_forget = model._sequence_log_prob(*forget_batch)
                 elif w_f is not None:
                     # sum_h w_h * L_h. At w_f = 1 this is identical to
@@ -642,6 +782,7 @@ def unified_unlearn(
         # --- Retain side: q_retain mini-batches, each scaled by 1/q_retain ---
         l_retain_avg = 0.0
         l_sep_avg = 0.0
+        l_anchor_avg = 0.0
         last_retain_batch = None
         for j in range(q_retain):
             idx = (step * q_retain + j) % n_retain
@@ -676,6 +817,12 @@ def unified_unlearn(
             if float(lambda_sep) == 0.0:
                 l_sep = torch.zeros((), device=device)
             else:
+                sep_kwargs: Dict[str, Any] = {}
+                if use_sep_cap and sep_cap[idx]:
+                    # Only passed when the cap is on, so the uncapped call is
+                    # exactly the recorded one.
+                    sep_kwargs["neg_log_prob_floor"] = sep_cap[idx]
+                    sep_kwargs["floor_stats"] = cap_stats
                 l_sep = model.compute_sep_loss(
                     retain_batch,
                     negative_item_ids=sep_negatives_set,
@@ -684,6 +831,10 @@ def unified_unlearn(
                     loss_type=sep_loss_type,
                     gen_temperature=float(sep_gen_temperature),
                     checkpoint=sep_checkpoint,
+                    **sep_kwargs,
+                    # only passed when on, so the default call is exactly the recorded one
+                    **({"encode_once_chunk": int(sep_encode_once_chunk)}
+                       if int(sep_encode_once_chunk) > 0 else {}),
                 )
             # lambda_retain weights the retain (repair) term. It exists so the
             # ascent/descent baselines are EXACT special cases of this objective
@@ -720,6 +871,26 @@ def unified_unlearn(
             l_retain_avg += float(l_retain.detach().cpu()) / float(q_retain)
             l_sep_avg += float(l_sep.detach().cpu()) / float(q_retain)
 
+            # --- Retain-side neighbourhood anchor (lambda_a) ---
+            # Scored in eval mode (no dropout), like its precomputed reference,
+            # so it is exactly 0 with zero gradient at the reference weights and
+            # draws no dropout randomness (the other terms see the same masks as
+            # without it). Backward runs inside the eval block because the
+            # checkpointed passes are recomputed there.
+            if use_anchor and anchor_ref[idx] is not None:
+                was_training = model.training
+                model.eval()
+                try:
+                    lps = item_log_probs(model, retain_batch[0], anchor_sids,
+                                         checkpoint=bool(anchor_checkpoint))
+                    l_anchor = anchor_loss(torch.logsumexp(lps, dim=1),
+                                           anchor_ref[idx])
+                    if l_anchor.requires_grad:
+                        ((float(lambda_anchor) * l_anchor) / float(q_retain)).backward()
+                finally:
+                    model.train(was_training)
+                l_anchor_avg += float(l_anchor.detach().cpu()) / float(q_retain)
+
         # Mask stable-code rows out of the embedding gradient before stepping.
         if grad_masks:
             for p in params:
@@ -754,6 +925,9 @@ def unified_unlearn(
             + float(lambda_sep) * l_sep_avg
             + float(lambda_neighborhood) * l_coh_avg
         )
+        if use_anchor:
+            total_avg += float(lambda_anchor) * l_anchor_avg
+        totals["anchor"].append(l_anchor_avg)
         totals["total"].append(total_avg)
         totals["retain"].append(l_retain_avg)
         totals["forget"].append(l_forget_avg)
@@ -772,6 +946,9 @@ def unified_unlearn(
                 l_sep_avg,
                 l_coh_avg,
             )
+            if use_anchor or use_forget_cap or use_sep_cap:
+                log.info("[unified] step=%d anchor=%.5f cap_stats=%s", step,
+                         l_anchor_avg, cap_stats)
 
         del last_retain_batch  # free reference
 
@@ -844,6 +1021,15 @@ def unified_unlearn(
         # the nll form was ported from TRACER (its L_Coh, Eq. 9), but in OUR
         # objective it is the NEIGHBORHOOD term weighted by lambda_n.
         "mean_coh_loss": _mean(totals["coh"]),
+        "ref_cap_forget": bool(use_forget_cap),
+        "ref_cap_sep": bool(use_sep_cap),
+        # Row-steps (forget) and (row, negative)-steps (sep) that were capped,
+        # and how many of them were still above the cap (i.e. still pushed).
+        "ref_cap_stats": dict(cap_stats) if (use_forget_cap or use_sep_cap) else None,
+        "lambda_anchor": float(lambda_anchor),
+        "anchor_enabled": bool(use_anchor),
+        "anchor_n_items": int(anchor_sids.size(0)) if use_anchor else 0,
+        "mean_anchor_loss": _mean(totals["anchor"]) if use_anchor else None,
         "n_forget_batches": n_forget,
         "n_retain_batches": n_retain,
         "n_forget_rows": sum(batch_size(b) for b in forget_batches),

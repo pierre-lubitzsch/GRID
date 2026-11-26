@@ -63,6 +63,8 @@ class MockTigerModel(nn.Module):
         positives: str = "history",
         loss_type: str = "cosine",
         gen_temperature: float = 1.0,
+        checkpoint: bool = False,
+        **_unused: Any,  # newer opt-in keywords (e.g. neg_log_prob_floor) the mock ignores
     ) -> torch.Tensor:
         x, _ = batch
         return (self.lin(x) ** 2).mean() / max(float(temperature), 1e-3)

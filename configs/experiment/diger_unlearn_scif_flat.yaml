@@ -78,6 +78,20 @@ unlearning:
   # every recorded spam result must keep its exact forget set. Turn it on for
   # the sensitive-category scenario.
   include_context_rows: false
+  # Forget/retain split for sensitive-item deletion (sequential driver only).
+  #   by_user (DEFAULT, every recorded run): the requesting users' whole
+  #       sequences leave the retain set; the forget set is built from them by
+  #       deletion_spec / include_context_rows.
+  #   retrain_matched: the split the retrained reference implies. Forget set =
+  #       only the training rows whose LABEL is a deleted interaction, with their
+  #       original histories (needs deletion_spec=item_pairs and
+  #       include_context_rows=false; the forget collate keeps only the
+  #       subsequences that end at a deleted item). Retain set = every user incl.
+  #       the requesting users, read from split_retain_dir, which must be the
+  #       retrained reference's training/ dir (scripts/build_retrain_dataset.py:
+  #       exactly the deleted items removed), and is never reduced by requests.
+  split_mode: by_user
+  split_retain_dir: null
   forget_size: null
   retain_samples_used_for_update: 16
   # Where retain batches come from.
@@ -98,6 +112,16 @@ unlearning:
   neighborhood_method: prefix
   neighborhood_aware_sample_rate: 1.0
   neighbor_aware_factor: 8.0
+  # Neighborhood rehearsal (unified only; reviewer baseline "simpler neighborhood
+  # regularizer"). OFF at 0.0. With rate r > 0, round(r * n) rows of every retain
+  # batch (n rows) are replaced by retain rows whose NEXT item is one of the
+  # nbr_rehearsal_count nearest items to the deletion target in embedding_path
+  # (the same top-k call as NAU's L_n with coherence_neighbor_method=embedding).
+  # Batches, rows per batch and optimizer steps are unchanged (equal budget).
+  # See TigerUnlearningModule._apply_nbr_rehearsal.
+  nbr_rehearsal_rate: 0.0
+  nbr_rehearsal_count: 8
+  nbr_rehearsal_neighbor_method: embedding
   sid_prefix_length: 2
   progressive_sid_prefix: true
   embedding_path: null
@@ -393,6 +417,54 @@ unlearning:
   # better PER NEIGHBOUR" — a full-only win is confounded with teacher-forcing
   # more items.
   coherence_union_size: full
+  # Seed of the fixed per-target sample for coherence_neighbor_method=random.
+  coherence_random_seed: 0
+  # --- Reference-capped forgetting (algorithm=unified; rebuttal R1 W1a / R2 W3).
+  # OFF by default: with both flags false nothing below is read and every recorded
+  # run reproduces. Stops pushing a deletion target down once it is no more likely
+  # than a REFERENCE level estimated WITHOUT retraining:
+  #   reference = popularity peers. The ref_cap_peer_count catalog items whose
+  #     LEGITIMATE training popularity (interaction count over the request's retain
+  #     split, i.e. without the deleted accounts/interactions) is closest to the
+  #     target's own legitimate count (targets and forget items excluded). On each
+  #     history x the cap is the ref_cap_quantile-quantile of log P(peer | x) under
+  #     the model weights named by ref_weights (default: the ORIGINAL model before
+  #     the first request, kept as a CPU copy, no second model on the GPU). Reading:
+  #     "a target is suppressed enough on x once it is no more likely than the
+  #     median item that has its legitimate popularity". Peers were not attacked, so
+  #     their scores estimate what the target would get without the attack: high
+  #     for a popular target, near zero for an unpopular one (where the cap then
+  #     never binds).
+  #   ref_cap_forget: forget term becomes a hinge on rows whose label is a deletion
+  #     target: the row's log P(i_f | x_f) contributes (same 1/B scale as L_for)
+  #     only while it is above the cap; no gradient once below. Non-target forget
+  #     rows are unchanged. Needs forget_loss_level=token and no position weights.
+  #   ref_cap_sep: in the generative separation term a target negative leaves the
+  #     contrast on a retain history once log P(i_f | x_r) <= cap(x_r), i.e. the
+  #     margin is only enforced down to the reference (needs sep_loss_type=generative).
+  # Caps are precomputed once per request (eval mode, no grad) and counted in the
+  # request's wall time.
+  ref_cap_forget: false
+  ref_cap_sep: false
+  ref_cap_peer_count: 32
+  ref_cap_quantile: 0.5
+  # --- Retain-side neighbourhood anchor (algorithm=unified; rebuttal R2 Q4).
+  # lambda_a = 0 (default) is off. With lambda_a > 0 adds
+  #   lambda_a * mean_{x_r} ( log sum_{j in N} P_theta(j | x_r)
+  #                           - log sum_{j in N} P_theta_o(j | x_r) )^2
+  # over the retain (non-requesting users') histories, where N is the union of the
+  # L_n neighbourhoods of the request's eligible forget rows (same N as L_nbr, so
+  # it needs lambda_n != 0) and theta_o are the ref_weights (original model by
+  # default). The theta_o log-masses are precomputed once per request; both sides
+  # are scored in eval mode (no dropout), so the term and its gradient are exactly
+  # 0 at theta = theta_o. anchor_checkpoint recomputes each item's pass in backward
+  # (memory does not grow with |N|).
+  lambda_a: 0.0
+  anchor_checkpoint: true
+  # Weights the cap and the anchor reference are computed with:
+  #   original (default) the model before the first request (CPU copy)
+  #   request            the model at the start of the current request
+  ref_weights: original
   # Form of L_n.
   #   mass (recommended) -log sum_{p in P(i_T)} p(s_p | H_f). Aggregates the
   #        neighbourhood with logsumexp first: a real log-probability, bounded
@@ -461,6 +533,7 @@ unlearning:
   # memory no longer grows with neighborhood_count; gradients are unchanged.
   coherence_checkpoint: false
   sep_checkpoint: false   # recompute each generative L_sep negative in backward (memory flat in #negatives; same gradients)
+  sep_encode_once_chunk: 0   # >0: generative L_sep encodes each history once, scores this many negatives per decoder pass (same objective, ~30x faster); 0 = recorded per-item path
   # InfoNCE temperature for L_sep. 0.07 is what EVERY recorded run used --
   # no sweep has ever overridden it. The Jun-2026 slides quote 0.007; that
   # value was never run, and since r_u/z_i are L2-normalised (cosine in

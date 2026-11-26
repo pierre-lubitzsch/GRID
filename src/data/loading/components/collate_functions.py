@@ -31,6 +31,7 @@ def collate_with_sid_causal_duplicate(
         int
     ] = None,  # If oov_token is passed, we remove it from the sequence
     max_batch_size: int = 128,
+    last_label_only: bool = False,
 ) -> Tuple[SequentialModelInputData, SequentialModuleLabelData]:
     """
         this collate fn is used to create the generate contiguous sequences as data augmentation to improve the performance.
@@ -59,23 +60,33 @@ def collate_with_sid_causal_duplicate(
         If oov_token is passed, we remove it from the sequence. (not used in this function, passed to collate_fn_train)
     max_batch_size : int
         The maximum batch size to be used after the data augmentation.
+    last_label_only : bool
+        Default False (every recorded run). If True, only the contiguous
+        sub-sequences that END at the row's last item are generated (all start
+        positions), i.e. every training row whose label is that last item.
+        Used for the retrain-matched forget set (unlearning.split_mode=
+        retrain_matched), whose rows are prefixes ending at a deleted item.
     """
 
     if isinstance(batch, list):
         batch = combine_list_of_tensor_dicts(batch)  # type: ignore
 
     # calculating the total number of contiguous sub-sequences in the batch
-    total_num_seqs = torch.sum(
-        (
+    if last_label_only:
+        k = torch.tensor([s.shape[0] for s in batch[sequence_field_name]]) // sid_hierarchy
+        total_num_seqs = torch.sum(torch.clamp(k - 1, min=0))
+    else:
+        total_num_seqs = torch.sum(
             (
-                k := torch.tensor([s.shape[0] for s in batch[sequence_field_name]])
-                // sid_hierarchy
+                (
+                    k := torch.tensor([s.shape[0] for s in batch[sequence_field_name]])
+                    // sid_hierarchy
+                )
+                - 1
             )
-            - 1
+            * k
+            // 2
         )
-        * k
-        // 2
-    )
 
     if total_num_seqs > max_batch_size:
         select_seqs = torch.randint(
@@ -92,6 +103,8 @@ def collate_with_sid_causal_duplicate(
         end_indices = torch.arange(
             2 * sid_hierarchy, sequence.shape[0] + 1, sid_hierarchy
         )
+        if last_label_only:
+            end_indices = end_indices[-1:]
         for end_index in end_indices:
             start_indices = torch.arange(
                 0, end_index - 2 * sid_hierarchy + 1, sid_hierarchy

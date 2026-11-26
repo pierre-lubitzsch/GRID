@@ -23,6 +23,7 @@ from src.data.unlearning.sequential_split import (  # noqa: E402
     TRAINING_FORGET_SUBDIR,
     TRAINING_RETAIN_SUBDIR,
     build_request_batches,
+    count_target_label_rows,
     index_tfrecord_dir_by_user_id,
     materialize_request_dirs,
     order_forget_uids,
@@ -215,6 +216,24 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
 
         full_forget_dir = os.path.join(data_dir, forget_subdir)
         full_retain_dir = os.path.join(data_dir, retain_subdir)
+        # unlearning.split_mode=retrain_matched (opt-in): the retain pool is the
+        # retrained reference's training data (every user, the requesting users
+        # with exactly their deleted items removed) and requests never shrink it.
+        split_mode = str(unlearning_cfg.get("split_mode", "by_user") or "by_user").strip().lower()
+        if split_mode not in ("by_user", "retrain_matched"):
+            raise ValueError(f"unlearning.split_mode must be 'by_user' or 'retrain_matched', got {split_mode!r}")
+        retrain_matched = split_mode == "retrain_matched"
+        if retrain_matched:
+            split_retain_dir = unlearning_cfg.get("split_retain_dir")
+            if not split_retain_dir or not os.path.isdir(str(split_retain_dir)):
+                raise ValueError(
+                    "split_mode=retrain_matched needs unlearning.split_retain_dir = the "
+                    f"retrained reference's training dir (got {split_retain_dir!r})")
+            full_retain_dir = str(split_retain_dir)
+            command_line_logger.info(
+                f"[seq] split_mode=retrain_matched: retain pool = {full_retain_dir} "
+                "(requesting users kept with deleted items removed; never reduced)."
+            )
 
         command_line_logger.info(
             f"[seq] Indexing forget shards under {full_forget_dir} ..."
@@ -242,6 +261,14 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
         )
         if not os.path.isfile(manifest_path):
             manifest_path = None
+        rm_target_items: Set[int] = set()
+        if retrain_matched:
+            if manifest_path is None:
+                raise ValueError("split_mode=retrain_matched needs the forget manifest")
+            from src.data.unlearning.deletion_spec import load_forget_manifest, load_target_items
+            rm_target_items = {int(i) for i in load_target_items(load_forget_manifest(manifest_path))}
+            if not rm_target_items:
+                raise ValueError("split_mode=retrain_matched: manifest has no target items")
         ordered_forget_uids = order_forget_uids(
             forget_index,
             request_user_order=request_user_order,
@@ -338,6 +365,7 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
                     rows_per_shard=rows_per_shard,
                     forget_subdir=TRAINING_FORGET_SUBDIR,
                     retain_subdir=TRAINING_RETAIN_SUBDIR,
+                    **({"exclude_forget_from_retain": False} if retrain_matched else {}),
                 )
 
                 retain_subset_dir = os.path.join(request_dir, "retain_subset")
@@ -347,21 +375,38 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
                     f"(neighborhood_aware="
                     f"{unlearning_cfg.get('neighborhood_aware')}) ..."
                 )
-                scif_info = model.run_unlearning(
-                    unlearning_cfg=pass_cfg,
-                    train_dataloader_config=train_dl_cfg,
-                    data_dir=request_dir,
-                    forget_subdir=TRAINING_FORGET_SUBDIR,
-                    retain_subdir=TRAINING_RETAIN_SUBDIR,
-                    retain_subset_dir=retain_subset_dir,
-                    semantic_id_path=semantic_id_path,
-                    forget_size_hint=int(split_info["n_forget_rows_written"]),
-                    seed=int(cfg.get("seed", 2)),
-                    num_hierarchies=int(cfg.get("num_hierarchies", 4)),
-                    device=device,
-                    output_dir=request_dir,
-                    forget_manifest_path=manifest_path,
-                )
+                n_label_rows = None
+                if retrain_matched:
+                    n_label_rows = count_target_label_rows(
+                        forget_index, forget_uids, rm_target_items)
+                if retrain_matched and n_label_rows == 0:
+                    # retrain_matched: the forget set is the rows whose label is a
+                    # deleted interaction. These users' deleted items sit only at
+                    # position 0 (history, never a label), so there is nothing to
+                    # forget and the retain set is unchanged: no update.
+                    command_line_logger.info(
+                        f"[seq] {batch_label}: split_mode=retrain_matched and no "
+                        "deleted interaction is a training label for these users; "
+                        "no update for this request."
+                    )
+                    scif_info = {"skipped": "retrain_matched: no deleted-label rows",
+                                 "n_deleted_label_rows": 0}
+                else:
+                    scif_info = model.run_unlearning(
+                        unlearning_cfg=pass_cfg,
+                        train_dataloader_config=train_dl_cfg,
+                        data_dir=request_dir,
+                        forget_subdir=TRAINING_FORGET_SUBDIR,
+                        retain_subdir=TRAINING_RETAIN_SUBDIR,
+                        retain_subset_dir=retain_subset_dir,
+                        semantic_id_path=semantic_id_path,
+                        forget_size_hint=int(split_info["n_forget_rows_written"]),
+                        seed=int(cfg.get("seed", 2)),
+                        num_hierarchies=int(cfg.get("num_hierarchies", 4)),
+                        device=device,
+                        output_dir=request_dir,
+                        forget_manifest_path=manifest_path,
+                    )
 
                 if scif_info.get("filter_mask"):
                     filter_masks.append(scif_info.pop("filter_mask"))
@@ -412,7 +457,8 @@ def unlearn_sequential(cfg: DictConfig) -> Dict[str, Any]:
                     }
                 )
 
-                n_removed = pass_retain_index.remove(forget_uids)
+                n_removed = (0 if retrain_matched
+                             else pass_retain_index.remove(forget_uids))
                 if n_removed:
                     command_line_logger.info(
                         f"[seq] {batch_label}: removed {n_removed} uids from the "

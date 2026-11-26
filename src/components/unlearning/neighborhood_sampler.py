@@ -118,6 +118,27 @@ def collect_items_in_shards(shard_paths: List[str]) -> Set[int]:
     return items
 
 
+def count_items_in_shards(shard_paths: List[str]) -> Dict[int, int]:
+    """Occurrences of every item id in the ``sequence_data`` fields (one row per
+    user sequence, so this is the item's interaction count over those users)."""
+    counts: Dict[int, int] = defaultdict(int)
+    if not shard_paths:
+        return dict(counts)
+    raw = tf.data.TFRecordDataset(shard_paths, compression_type="GZIP")
+    sample = next(iter(raw))
+    feat_desc = _infer_feature_description(sample)
+    if SEQUENCE_FIELD not in feat_desc:
+        raise ValueError(
+            f"shards {shard_paths[0]!r}... lack {SEQUENCE_FIELD!r} feature"
+        )
+    parsed = raw.map(lambda x: tf.io.parse_single_example(x, feat_desc))
+    for example in parsed:
+        seq = tf.sparse.to_dense(example[SEQUENCE_FIELD]).numpy()
+        for x in seq.tolist():
+            counts[int(x)] += 1
+    return dict(counts)
+
+
 def _scan_retain_rows_with_item_index(
     retain_dir: str,
     *,

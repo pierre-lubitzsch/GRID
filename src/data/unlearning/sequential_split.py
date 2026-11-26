@@ -245,8 +245,14 @@ def materialize_request_dirs(
     rows_per_shard: int = 4096,
     forget_subdir: str = TRAINING_FORGET_SUBDIR,
     retain_subdir: str = TRAINING_RETAIN_SUBDIR,
+    exclude_forget_from_retain: bool = True,
 ) -> Dict[str, object]:
     """Write per-request ``training_forget/`` and ``training_retain/`` dirs.
+
+    ``exclude_forget_from_retain=False`` (unlearning.split_mode=retrain_matched)
+    keeps the request's own uids in the retain pool: there the pool is the
+    retrained reference's training data, whose rows for the requesting users
+    are their sequences with the deleted items removed.
 
     Side effects on the in-memory indices: nothing here. Mutating the retain
     index (``retain_{k+1} = retain_k \\ forget_k``) is the driver's job, done
@@ -281,7 +287,9 @@ def materialize_request_dirs(
     )
 
     # ---- retain shards: current retain pool minus this request's forget ----
-    forget_uid_set: Set[int] = set(forget_uids_resolved)
+    forget_uid_set: Set[int] = (
+        set(forget_uids_resolved) if exclude_forget_from_retain else set()
+    )
     retain_uid_order = [
         u for u in retain_index.uid_order if u not in forget_uid_set
     ]
@@ -331,6 +339,22 @@ def materialize_request_dirs(
     with open(info_path, "w") as f:
         json.dump(info, f, indent=2)
     return info
+
+
+def count_target_label_rows(
+    forget_index: UserIdIndex, uids: Sequence[int], target_items: Set[int]
+) -> int:
+    """Number of positions j >= 1 with seq[j] in ``target_items`` over the given users,
+    i.e. the deleted interactions that are a training LABEL (a target at position 0 is only
+    ever history). Used by unlearning.split_mode=retrain_matched, whose forget set is exactly
+    these rows: a request without any has nothing to forget."""
+    n = 0
+    for u in uids:
+        ex = tf.train.Example()
+        ex.ParseFromString(forget_index.bytes_by_uid[int(u)])
+        seq = ex.features.feature[SEQUENCE_FIELD].int64_list.value
+        n += sum(1 for j, i in enumerate(seq) if j >= 1 and int(i) in target_items)
+    return n
 
 
 # ---------------------------------------------------------------------------

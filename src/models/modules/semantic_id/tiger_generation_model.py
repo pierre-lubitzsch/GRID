@@ -1629,6 +1629,60 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         mask = enc_mask.unsqueeze(-1).float()
         return (enc_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
 
+    def _decode_log_prob_from_encoded(
+        self, enc: torch.Tensor, enc_mask: torch.Tensor, future_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """``[B']``: like :meth:`_teacher_forced_log_prob` on an already encoded history."""
+        out = self.decoder_forward_pass(
+            future_ids=future_ids, attention_mask=None, encoder_output=enc,
+            attention_mask_for_encoder=enc_mask, use_cache=False, past_key_values=None,
+        )[:, :-1]
+        log_prob = out.new_zeros(future_ids.size(0))
+        for hierarchy in range(self.num_hierarchies):
+            log_p = torch.nn.functional.log_softmax(
+                self.decoder.decoder_mlp[hierarchy](out[:, hierarchy]), dim=-1)
+            log_prob = log_prob + log_p.gather(
+                1, future_ids[:, hierarchy].long().unsqueeze(1)).squeeze(1)
+        return log_prob
+
+    def _sep_log_probs_encode_once(
+        self,
+        model_input: SequentialModelInputData,
+        pos_ids: torch.Tensor,
+        neg_sids: torch.Tensor,
+        *,
+        chunk: int,
+        checkpoint: bool,
+    ) -> "Tuple[torch.Tensor, List[torch.Tensor]]":
+        """(``[B]`` positive log-prob, list of ``[B]`` per-negative log-probs) with ONE encoder pass."""
+        kw = {
+            self.feature_to_model_input_map.get(k, k): v
+            for k, v in model_input.transformed_sequences.items()
+        }
+        enc, enc_mask = self.encoder_forward_pass(
+            attention_mask=model_input.mask, input_ids=kw["input_ids"],
+            user_id=kw.get("user_id"),
+        )
+        bsz = int(enc.size(0))
+        pos_lp = self._decode_log_prob_from_encoded(enc, enc_mask, pos_ids)
+
+        def score(e: torch.Tensor, m: torch.Tensor, sids: torch.Tensor) -> torch.Tensor:
+            k = int(sids.size(0))
+            e_r = e.unsqueeze(0).expand(k, *e.shape).reshape(k * bsz, *e.shape[1:])
+            m_r = m.unsqueeze(0).expand(k, *m.shape).reshape(k * bsz, *m.shape[1:])
+            f_r = sids.repeat_interleave(bsz, dim=0)  # item-major: rows j*B .. j*B+B-1
+            return self._decode_log_prob_from_encoded(e_r, m_r, f_r).view(k, bsz).t()
+
+        cols: List[torch.Tensor] = []
+        for j in range(0, int(neg_sids.size(0)), int(chunk)):
+            s = neg_sids[j:j + int(chunk)]
+            if checkpoint and torch.is_grad_enabled():
+                c = torch.utils.checkpoint.checkpoint(score, enc, enc_mask, s, use_reentrant=False)
+            else:
+                c = score(enc, enc_mask, s)
+            cols.extend(c.unbind(dim=1))
+        return pos_lp, cols
+
     def _sep_loss_generative(
         self,
         retain_batch: Tuple[SequentialModelInputData, SequentialModuleLabelData],
@@ -1636,8 +1690,21 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         neg_ids: List[int],
         temperature: float = 1.0,
         checkpoint: bool = False,
+        neg_log_prob_floor: Optional[Dict[int, torch.Tensor]] = None,
+        floor_stats: Optional[Dict[str, int]] = None,
+        encode_once_chunk: int = 0,
     ) -> torch.Tensor:
         """``L_sep`` with sequence log-probabilities as the InfoNCE logits.
+
+        ``encode_once_chunk`` > 0 (unlearning.sep_encode_once_chunk; 0 = off, the
+        recorded behaviour): encode each history ONCE and score the positive and
+        the negatives with decoder passes only, ``encode_once_chunk`` negatives per
+        pass (encoder output repeated), each chunk checkpointed if ``checkpoint``.
+        Same objective; loss and gradients agree with the per-item path up to
+        float rounding (scripts/bench_sep_encode_once.py: max |grad diff| 6e-6 at
+        106 and 202 negatives), about 30x faster at chunk 32. Under dropout the
+        random masks differ from the per-item path (one encoder pass instead of
+        1 + N), so runs are not bit-identical.
 
             L = -log [ exp(log p(s_i+ | h_u)/T)
                        / ( exp(log p(s_i+ | h_u)/T)
@@ -1651,6 +1718,14 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         instead of keeping its activations, so peak memory no longer grows with
         the number of negatives (a takedown of 95 items or ten spam targets ran
         out of memory on 80 GB without it). Loss and gradients are unchanged.
+
+        ``neg_log_prob_floor`` (reference-capped separation, unlearning.ref_cap_sep;
+        None = off) maps a negative item id to a ``[B]`` per-history cap: on a row
+        where ``log p(s_i_f | h_u) <= cap`` that negative leaves the denominator
+        (its logit becomes -inf), so the target is pushed down only to the
+        reference level and receives no gradient below it. Negatives without an
+        entry are not capped. ``floor_stats`` (optional) accumulates
+        ``sep_capped_pairs`` / ``sep_capped_active`` counts.
         """
         model_input, label_data = retain_batch
         device = next(self.parameters()).device
@@ -1664,14 +1739,24 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             raise ValueError(
                 "sep loss_type='generative' needs batch labels for the positive"
             )
+        neg_sids = self.codebooks[torch.tensor(neg_ids)].to(device).long()  # [N, H]
+        if int(encode_once_chunk) > 0:
+            pos_lp, neg_lps = self._sep_log_probs_encode_once(
+                model_input, fut_ids[:, :n_hier].long(), neg_sids,
+                chunk=int(encode_once_chunk), checkpoint=checkpoint)
+        else:
+            pos_lp, neg_lps = None, None
+
         # log p(s_i+ | h_u): the true next item, scored against its own history.
-        pos_lp = self._teacher_forced_log_prob(
-            model_input, fut_ids[:, :n_hier].long()
-        )  # [B]
+        if pos_lp is None:
+            pos_lp = self._teacher_forced_log_prob(
+                model_input, fut_ids[:, :n_hier].long()
+            )  # [B]
 
         # log p(s_i_f | h_u) for each negative, same histories.
-        neg_sids = self.codebooks[torch.tensor(neg_ids)].to(device).long()  # [N, H]
-        if checkpoint:
+        if neg_lps is not None:
+            pass
+        elif checkpoint:
             neg_lps = [
                 torch.utils.checkpoint.checkpoint(
                     self._teacher_forced_log_prob, model_input,
@@ -1687,6 +1772,24 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 )
                 for j in range(neg_sids.size(0))
             ]  # each [B]
+
+        if neg_log_prob_floor:
+            capped_lps = []
+            for j, lp in enumerate(neg_lps):
+                floor = neg_log_prob_floor.get(int(neg_ids[j]))
+                if floor is None:
+                    capped_lps.append(lp)
+                    continue
+                floor = floor.to(lp.device, lp.dtype)
+                above = lp.detach() > floor
+                if floor_stats is not None:
+                    floor_stats["sep_capped_pairs"] = (
+                        floor_stats.get("sep_capped_pairs", 0) + int(above.numel()))
+                    floor_stats["sep_capped_active"] = (
+                        floor_stats.get("sep_capped_active", 0) + int(above.sum()))
+                capped_lps.append(
+                    torch.where(above, lp, torch.full_like(lp, float("-inf"))))
+            neg_lps = capped_lps
 
         tau = float(temperature)
         if tau <= 0:
@@ -1705,6 +1808,9 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         loss_type: str = "cosine",
         gen_temperature: float = 1.0,
         checkpoint: bool = False,
+        neg_log_prob_floor: Optional[Dict[int, torch.Tensor]] = None,
+        floor_stats: Optional[Dict[str, int]] = None,
+        encode_once_chunk: int = 0,
     ) -> torch.Tensor:
         """Separation loss ``L_sep'`` (per-user, all-positives form).
 
@@ -1802,8 +1908,11 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         if loss_type == "generative":
             return self._sep_loss_generative(
                 retain_batch, neg_ids=neg_ids, temperature=float(gen_temperature),
-                checkpoint=checkpoint,
+                checkpoint=checkpoint, neg_log_prob_floor=neg_log_prob_floor,
+                floor_stats=floor_stats, encode_once_chunk=encode_once_chunk,
             )
+        if neg_log_prob_floor:
+            raise ValueError("neg_log_prob_floor (ref_cap_sep) needs loss_type='generative'")
 
         # --- history item SID rows: [B, n_items, H] (raw codes) ---
         # transformed_sequences uses the original feature name ("sequence_data"),
