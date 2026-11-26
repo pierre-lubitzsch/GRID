@@ -1,0 +1,2385 @@
+
+\documentclass{beamer}
+
+\usetheme{metropolis}
+
+% NOTE: deliberately NOT using booktabs -- all tables are plain tabular + \hline
+\usepackage{xcolor}
+\usepackage{array}
+
+\hypersetup{
+    colorlinks=true,
+    urlcolor=blue
+}
+
+\title{Product-Key Memory as a Modular Unlearning Module}
+\subtitle{Spam unlearning for generative recommendation}
+\date{\today}
+
+% ---------------------------------------------------------------------------
+% Macros (extend here)
+% ---------------------------------------------------------------------------
+\newcommand{\pierre}[1]{\textcolor{cyan}{#1}}
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{TODO:} #1}}
+\newcommand{\done}[1]{\textcolor{green!50!black}{#1}}
+\newcommand{\open}[1]{\textcolor{orange!80!black}{#1}}
+
+\newcommand{\If}{\ensuremath{I_t}}      % target (spam) item set
+\newcommand{\Df}{\ensuremath{D_f}}      % forget set
+\newcommand{\Dr}{\ensuremath{D_r}}      % retain set
+\newcommand{\lf}{\ensuremath{\lambda_{\text{forget}}}}
+\newcommand{\ls}{\ensuremath{\lambda_{\text{sep}}}}
+\newcommand{\gf}{\ensuremath{g_f}}
+\newcommand{\gr}{\ensuremath{g_r}}
+% per-slot variants: \gf already carries a subscript, so \gf_{,i} would be a
+% double subscript -- use these instead.
+\newcommand{\gfi}{\ensuremath{g_{f,i}}}
+\newcommand{\gri}{\ensuremath{g_{r,i}}}
+
+% status markers for the plan tables
+\newcommand{\stdone}{\textcolor{green!50!black}{done}}
+\newcommand{\strun}{\textcolor{blue}{running}}
+\newcommand{\sttodo}{\textcolor{red}{todo}}
+\newcommand{\stdrop}{\textcolor{gray}{dropped}}
+
+\begin{document}
+
+\maketitle
+
+% ===========================================================================
+% \begin{frame}{TL;DR}
+% \begin{itemize}
+%   \item We can remove $\sim$99\% of spam exposure at \emph{clean-level utility}
+%         by replacing two decoder FFNs with a PKM and rebuilding them from
+%         retain data only.
+%   \item The spam is \textbf{decoder-localised} for removal, but an
+%         \textbf{encoder} PKM prevents the attack from being learned in the
+%         first place ($30\times$ less pickup).
+%   \item \alert{The memory collapses when trained jointly}: 32 of 262{,}144 slots. Post-hoc PKMs (trained in isolation) do not collapse.
+%   \item Top-$t$ slot selection is implemented but only testable on the non-collapsed (post-hoc) models.
+% \end{itemize}
+% \end{frame}
+
+% ===========================================================================
+\section{Setup}
+
+\begin{frame}{Setup: model, attack}
+\textbf{Model.} TIGER: small encoder--decoder trained from
+scratch on semantic-ID sequences ($d_{\text{model}}=128$, 4 encoder and 4 decoder blocks, $d_{ff}=1024$, RQ semantic IDs $L=4$, codebook width 256).
+
+\textbf{Attack.} Bandwagon: fake users click one target item among popular
+fillers. Beauty, $1\%$ poisoning, $n_{\text{target}}=1$, target strategy
+\texttt{mid} unless stated.
+
+\end{frame}
+
+\begin{frame}{Setup: metrics, reference points}
+    
+\textbf{Metrics.}
+\begin{itemize}
+  \item \textbf{SH@$k$} spam hit rate --- fraction of test users seeing \If{}
+  \item \textbf{ASI@$k$}, \textbf{TPM@$k$} --- related exposure measures
+  \item \textbf{N@10} nDCG (utility), \textbf{UR} $=$ N@10 / clean N@10
+  \item \textbf{removal} $= 1 - \text{SH}_{\text{unlearned}}/\text{SH}_{\text{poison}}$
+\end{itemize}
+
+\textbf{Reference points (non-PKM), dataset beauty.}
+\begin{center}
+\begin{tabular}{|l|c|c|}
+\hline
+model & SH@10 & N@10 \\
+\hline
+clean            & 0.00000 & 0.03763 \\
+poisoned         & 0.01274 & 0.03619 \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Why memory? (Geva et al., 2021)}
+FFNs behave like \textbf{key--value memories}:
+\begin{itemize}
+  \item \textbf{keys} capture input patterns
+  \item \textbf{values} encode what to output (a distribution over the vocab)
+  \item each FFN output is a composition of values; layers refine step by step
+\end{itemize}
+
+\medskip
+\textbf{Takeaway.} Forgetting by fine-tuning overwrites internal memory
+$\Rightarrow$ we want a \emph{modular stabilizer} instead of more backbone edits.
+
+% \medskip
+% Our data supports this in a specific way: spam removal only works when
+% we touch \emph{decoder} FFNs --- consistent with values encoding the output
+% distribution, and generation being decoder-side.
+\end{frame}
+
+% ===========================================================================
+\section{Design space}
+
+\begin{frame}{Design space: the knobs}
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{axis} & \textbf{options} \\
+\hline
+When       & trained-in $\;|\;$ post-hoc (insert into trained model) \\
+Mode       & \texttt{replace} FFN $\;|\;$ \texttt{add} alongside FFN \\
+Where      & encoder / decoder $\times$ block $\{0,1,2,3\}$, or sets \\
+Update scope & all params $\;|\;$ \texttt{pkm\_only} $\;|\;$ values only \\
+Selection  & none $\;|\;$ AF $\;|\;$ AF-IHF $\;|\;$ grad $\;|\;$ grad+dot \\
+$t$        & $1 \ldots 10^4$ (bounded by \emph{live} slots) \\
+Optimizer  & Adam $\;|\;$ SGD $\;|\;$ AdamW \\
+Init       & \texttt{normal}$\times s$ $\;|\;$ \texttt{zeros} \\
+Retain data & sampled subset $\;|\;$ full retain split \\
+\hline
+\end{tabular}
+\end{center}
+
+\pierre{All of these are implemented as config knobs; defaults reproduce the
+PKM-free behavior.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Two variants of the idea}
+\textbf{A. Trained-in (``pretrained-memory'').}
+PKM is part of the model during training, so it \emph{learns} spam into memory
+slots; unlearning edits those slots.
+
+\medskip
+\textbf{B. Post-hoc (``correction module'').}
+PKM is inserted into an already-trained model, then adapted on clean data as a
+sparse corrective layer against a frozen backbone.
+
+\medskip
+If PKM is added after training, it has no target information to remove? $\to$ removal is the forgetting, fine-tuning on the retain set repairs this
+
+\end{frame}
+
+% ===========================================================================
+\section{Experiments done}
+
+\begin{frame}{Headline comparison (beauty, bandwagon \texttt{mid})}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+method & SH@10 & removal & UR \\
+\hline
+poison baseline                & 0.01274 & ---    & 0.962 \\
+\texttt{seif}                  & $\sim$0 & $\sim$full & 0.67--0.74 \\
+\texttt{unified} ac0 (full model) & 0.00411 & 67\% & 1.013 \\
+\hline
+trained-in PKM, \texttt{pkm\_only} & 0.00385 & 69\% & 1.004 \\
+\textbf{post-hoc d01 + rebuild}    & \textbf{0.00013} & \textbf{99\%} & \textbf{0.995} \\
+\quad \emph{control:} fresh FFN, no PKM & 0.00022 & 98\% & 0.995 \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\begin{itemize}
+  \item Post-hoc \textbf{dominates} everything: clean-equivalent on \emph{both}
+        axes (clean is SH 0.00000 / N@10 0.03763).
+  \item Trained-in \texttt{pkm\_only} matches full-model unlearning with the
+        \textbf{backbone frozen} --- 0.2\% utility cost vs.\ its own clean model.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Placement, post-hoc: spam is decoder-localised}
+Insert PKM at \emph{one} layer, rebuild on retain data:
+\begin{center}
+\begin{tabular}{|l|c|c|c||l|c|c|c|}
+\hline
+layer & SH@10 & rem. & UR & layer & SH@10 & rem. & UR \\
+\hline
+d0 & 0.00139 & 89\% & 0.978 & e0 & 0.01306 & $-3\%$  & 0.978 \\
+d1 & 0.00031 & 98\% & 0.958 & e1 & 0.01413 & $-11\%$ & 0.978 \\
+d2 & 0.00009 & 99\% & 0.904 & e2 & 0.01288 & $-1\%$  & 0.960 \\
+d3 & 0.00054 & 96\% & 0.898 & e3 & 0.01400 & $-10\%$ & 0.944 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{Every encoder layer removes nothing.} All decoder layers remove
+        89--99\%.
+  \item Deeper decoder $\Rightarrow$ more removal, less utility.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Placement, post-hoc: spam is decoder-localised (cont.)}
+\begin{itemize}
+  \item \texttt{d01} (both) beats every single layer: 99\% at UR 0.995
+        $\Rightarrow$ optimum is the \emph{first two} decoder FFNs.
+  \item \texttt{dall} (4 layers) does \emph{not} converge $\Rightarrow$
+        a destruction threshold.
+  \item Need comparison with FFN reinit instead of PKM replace
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Placement, trained-in: encoder PKM is prophylactic}
+PKM present \emph{during} training (poisoned run), spam$\times$ relative to
+non-PKM (SH 0.01274):
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c||l|c|c|c|}
+\hline
+layer & N@10 & SH@10 & spam$\times$ & layer & N@10 & SH@10 & spam$\times$ \\
+\hline
+D0 & 0.03452 & 0.00277 & 0.22 & E0 & 0.03511 & 0.00072 & 0.06 \\
+D1 & 0.03607 & 0.02111 & \alert{1.66} & E1 & 0.03507 & 0.00036 & \textbf{0.03} \\
+D2 & 0.03508 & 0.00648 & 0.51 & E2 & 0.03596 & 0.00778 & 0.61 \\
+D3 & 0.03480 & 0.01011 & 0.79 & E3 & 0.03508 & 0.00040 & \textbf{0.03} \\
+\hline
+\end{tabular}
+\end{center}
+
+\end{frame}
+
+\begin{frame}{Placement, trained-in: encoder PKM is prophylactic (cont.)}
+\textbf{Encoder PKM suppresses the attack $\sim 30\times$} (E1/E3) for $\sim$3\%
+utility. Exactly the opposite of the post-hoc screen --- and consistent:
+
+\begin{center}
+\emph{encoder PKM = prophylactic (prevents learning spam)}\\
+\emph{decoder PKM = therapeutic (enables removing spam)}
+\end{center}
+
+% \pierre{Utility spread (0.954--0.997) is inside seed noise; the spam spread
+% ($55\times$) is not.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{\alert{Problem: the memory collapses}}
+Slot-access diagnostic, $n_{\text{keys}}=512 \Rightarrow 262{,}144$ slots/memory:
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+model & slots & touched & Jaccard & forget-excl. \\
+\hline
+trained-in E23D01 & 262144 & \alert{32} & \alert{1.000} & \alert{0} \\
+trained-in D1only & 262144 & \alert{32} & \alert{1.000} & \alert{0} \\
+trained-in D2only & 262144 & \alert{32} & \alert{1.000} & \alert{0} \\
+post-hoc \texttt{replace} & 262144 & 64052 & 0.386 & 3051 \\
+post-hoc \texttt{add}     & 262144 & 71547 & 0.411 & 3194 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item Jointly-trained PKMs use \textbf{0.012\%} of the memory; every token and
+        every head picks the \emph{same} 32 slots (routing is input-independent).
+  \item \textbf{Post-hoc PKMs are healthy} --- 59\% coverage, forget/retain route
+        differently, $\sim$3000 forget-exclusive slots.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{\alert{Problem: the memory collapses} (cont.)}
+\begin{itemize}
+  \item \pierre{Hypothesis: trained in isolation on a frozen backbone, the query
+        net \emph{must} learn routing; in joint training the model routes
+        \emph{around} the memory.}
+  \item Consequence: every trained-in PKM number describes a \emph{low-rank
+        layer}, not a large sparse memory.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Top-$t$ slot selection: criteria}
+Adapt Sparse Memory Finetuning to unlearning --- score slots, update only top $t$.
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+criterion & score \\
+\hline
+AF      & forget access frequency (baseline) \\
+AF-IHF  & $\text{AF}(s)\cdot\log\frac{T_r+1}{\text{HF}(s)+1}$, history $=$ retain \\
+grad    & $\|\gf\| - \lambda\|\gr\|$ \\
+grad+dot & $\hat{g}_f - \lambda\hat{g}_r - \mu\,\widehat{\langle \gf,\gr\rangle}$ \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Why the dot term.} The update moves along $+\gf$, so the first-order
+change in the \emph{retain} loss from editing slot $i$ is
+$\langle \gfi, \gri \rangle$ --- \emph{not} $\|\gri\|$. It is signed:
+negative means forgetting also \emph{helps} retain.
+
+\end{frame}
+
+\begin{frame}{Top-$t$ slot selection: criteria}
+\textbf{Verified.} Two slots with identical $\|\gf\|=\|\gr\|=12$ but dot $0$
+vs.\ $+144$: ranked 1007 vs.\ 1006 by $\gf-\gr$ (indistinguishable), 1007
+vs.\ 1999 (last) by grad+dot.
+
+\medskip
+\pierre{Objective is additively separable over slots $\Rightarrow$ exact top-$t$
+is plain \texttt{topk}, no greedy needed.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Selection: gradient signal separates, access counts do not}
+Mean per-slot forget/retain gradient cosine:
+\begin{center}
+\begin{tabular}{|l|c|l|}
+\hline
+memory & mean cos & reading \\
+\hline
+E23D01 enc block 2 & $+0.52$ & strongly aligned (conflict) \\
+E23D01 enc block 3 & $+0.53$ & strongly aligned \\
+trained-in D1only  & $+0.21$ & aligned \\
+post-hoc \texttt{d01} & $-0.03$ & \textbf{near-orthogonal} \\
+\hline
+\end{tabular}
+\end{center}
+
+\end{frame}
+
+\begin{frame}{Selection: gradient signal separates (cont.)}
+On the healthy post-hoc memory, at $t=25$:
+\begin{center}
+\begin{tabular}{|c|c|c|c|}
+\hline
+$\lambda$ & mean $\|\gf\|$ sel. & mean $\|\gr\|$ sel. & overlap with AF \\
+\hline
+0.0 & 5.06e--3 & 1.88e--2 & 0.36 \\
+1.0 & 3.79e--3 & \textbf{1.52e--3} & \textbf{0.00} \\
+\hline
+\end{tabular}
+\end{center}
+
+$\lambda{=}1$ gives up 25\% of forget signal to cut retain exposure
+$12\times$, and selects \emph{entirely different} slots than access frequency.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Ablations that came out negative (worth reporting)}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+post-hoc \texttt{d01} init & SH@10 & removal & UR \\
+\hline
+\texttt{normal} $\times 1.0$ (default) & 0.00013 & 99.0\% & \textbf{0.995} \\
+\texttt{zeros}                          & 0.00009 & 99.3\% & 0.977 \\
+\texttt{normal} $\times 0.01$           & 0.00004 & 99.6\% & 0.976 \\
+\texttt{add} + \texttt{zeros}           & 0.00018 & 98.6\% & 0.920 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item ``Smarter'' (identity-like) init is \textbf{worse}: full random init
+        rebuilds best. Init \emph{scale} matters, not routing gradients.
+  \item Initialising values from the FFN would \emph{re-import the spam} ---
+        the removal comes precisely from discarding those weights.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Ablations that came out negative (cont.)}
+\begin{itemize}
+  \item \textbf{Adam beat SGD} in the \texttt{pkm\_only} sweep --- but that
+        updated \emph{all} slots, which is not the regime SMF's argument covers.
+        Re-test under selection.
+  \item \texttt{add}+\texttt{zeros} \emph{also} removes spam (98.6\%): any
+        retain-only adaptation suppresses it. \alert{So we cannot easily build
+        ``healthy memory $+$ spam still present''.}
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Encoder placements: suppression does \emph{not} stack}
+Trained-in, poisoned, decoder untouched. spam$\times$ relative to non-PKM:
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c||l|c|c|c|}
+\hline
+layers & N@10 & util$\times$ & spam$\times$ & layers & N@10 & util$\times$ & spam$\times$ \\
+\hline
+E0   & 0.03511 & 0.970 & 0.06 & E01   & 0.03511 & 0.970 & \textbf{0.04} \\
+E1   & 0.03507 & 0.969 & \textbf{0.03} & E012  & 0.03315 & 0.916 & 0.24 \\
+E2   & 0.03596 & 0.994 & 0.61 & E12   & 0.03717 & 1.027 & \alert{1.03} \\
+E3   & 0.03508 & 0.969 & \textbf{0.03} & E23   & 0.03435 & 0.949 & \alert{2.29} \\
+     &         &       &      & E0123 & 0.03739 & \textbf{1.033} & 0.26 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{No combination beats the best single layer} (E1/E3 at 0.03$\times$;
+        best combo E01 at 0.04$\times$). Extra blocks buy nothing.
+\end{itemize}
+\end{frame}
+
+
+\begin{frame}{Encoder placements: suppression does \emph{not} stack (cont.)}
+\begin{itemize}
+  \item \alert{Combining protective layers can destroy the protection.} E12 gives
+        \emph{zero} suppression despite containing E1 (30$\times$ alone); E23
+        \emph{amplifies} the attack (2.29$\times$) despite containing E3.
+    \item \pierre{Pattern: E2 disrupts, E0 stabilises --- every combo with E2 but
+        without E0 loses suppression; every combo with E0 keeps it. Mechanism
+        unexplained.}
+  \item Utility does not track layer count: E0123 (4 blocks) best (1.033),
+        E012 (3 blocks) worst (0.916).
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{PKM vs.\ fresh FFN, out of saturation: the regimes disagree}
+The tie was measured where both arms hit the clean floor. Pushed out of
+saturation they separate --- in \emph{opposite} directions.
+
+\medskip
+\textbf{(A) More destruction --- \texttt{dall}, 4 decoder layers:}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+arm & SH@10 & removal & UR \\
+\hline
+PKM \texttt{dall} @2000   & 0.00000 & 100\%  & 0.891 \\
+PKM \texttt{dall} @10000  & 0.00000 & 100\%  & 0.686 \\
+\textbf{FFN \texttt{dall} @2000}  & 0.00009 & 99.3\% & \textbf{0.964} \\
+FFN \texttt{dall} @10000  & 0.00004 & 99.6\% & 0.877 \\
+\hline
+\end{tabular}
+\end{center}
+\alert{FFN wins by 7 points} and degrades less with extra steps. Where capacity
+should have helped most, it \emph{hurt}.
+
+\end{frame}
+
+\begin{frame}{PKM vs.\ fresh FFN, out of saturation (cont.)}
+\textbf{(B) Smaller budget --- \texttt{d01}, same destruction:}
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+steps & PKM SH@10 & PKM UR & FFN SH@10 & FFN UR \\
+\hline
+200        & \textbf{0.00555} & 0.977 & 0.00863 & 0.966 \\
+600        & \textbf{0.00148} & 0.989 & 0.00523 & 0.979 \\
+converged  & 0.00013 & 0.995 & 0.00022 & 0.995 \\
+\hline
+\end{tabular}
+\end{center}
+\alert{PKM removes $\sim$1.75$\times$ more at every budget} and converges in
+$<$half the steps (1560 vs.\ 3320).
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Sequential unlearning: no drift, for either method}
+Same \emph{total} budget in every arm (chunks $\times$ steps $=$ 3000), same
+forget set --- only the number of sequential requests varies:
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+mode & chunks & steps/chunk & SH@10 & UR \\
+\hline
+PKM & 1  & 3000 & 0.00031 & 0.981 \\
+PKM & 5  & 600  & 0.00031 & 0.992 \\
+PKM & 10 & 300  & 0.00022 & 0.992 \\
+FFN & 1  & 3000 & 0.00031 & \textbf{1.005} \\
+FFN & 5  & 600  & 0.00022 & 0.992 \\
+FFN & 10 & 300  & 0.00027 & \textbf{1.005} \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Nothing degrades.} 10 sequential requests cost the same as 1:
+97.5--98.2\% removal, UR 0.981--1.005 everywhere.
+
+\end{frame}
+
+\begin{frame}{Sequential unlearning: no drift (cont.)}
+\alert{The modular-memory hypothesis fails on its \emph{premise}:} there is no
+accumulated damage for a sparse memory to protect against. A repeatedly
+retrained FFN does not drift either (UR 1.005, \emph{above} clean).
+
+\medskip
+\pierre{Practical upside: deletion requests can be processed incrementally at no
+cost.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Collapse is universal in trained-in PKMs}
+Slot diagnostic on all five \emph{encoder-only} trained-in models:
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+model & memories & slots used & Jaccard & forget-excl. \\
+\hline
+E01   & 2 & 128 / 128         & 1.000 & 0 \\
+E012  & 3 & 128 / 95 / 32     & 1.000 & 0 \\
+E12   & 2 & 125 / 32          & 1.000 & 0 \\
+E23   & 2 & 32 / 32           & 1.000 & 0 \\
+E0123 & 4 & 96 / 32 / 32 / 32 & 1.000 & 0 \\
+\hline
+\end{tabular}
+\end{center}
+
+Utilisation 0.012--0.049\% of 262{,}144 slots. \textbf{The hypothesis that the
+encoder might escape collapse is refuted} --- collapse is independent of
+encoder/decoder placement, layer count and depth. ($32 = knn$ exactly: those
+memories return the \emph{same} 32 slots for every token.)
+
+\end{frame}
+
+\begin{frame}{Collapse is universal in trained-in PKMs (cont.)}
+\alert{So the E2/E0 pattern cannot be a memory-content effect} --- there is no
+meaningful memory in any of them. Those layers act as low-rank layers.
+
+
+\end{frame}
+
+\begin{frame}{Collapse is universal in trained-in PKMs}
+\small
+Slot diagnostic on all five \emph{encoder-only} trained-in models:
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+model & memories & slots used & Jaccard & forget-excl. \\
+\hline
+E01   & 2 & 128 / 128         & 1.000 & 0 \\
+E012  & 3 & 128 / 95 / 32     & 1.000 & 0 \\
+E12   & 2 & 125 / 32          & 1.000 & 0 \\
+E23   & 2 & 32 / 32           & 1.000 & 0 \\
+E0123 & 4 & 96 / 32 / 32 / 32 & 1.000 & 0 \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\pierre{Only the post-hoc memories are healthy (59\% coverage, Jaccard 0.38,
+$\sim$3000 forget-exclusive slots) $\Rightarrow$ it is not \emph{where} the memory
+sits but \emph{how} it was trained: alone, against a frozen backbone.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Scorecard: PKM vs.\ a fresh FFN}
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+regime & winner \\
+\hline
+Converged, single edit       & tie (saturated) \\
+Heavy damage (\texttt{dall}) & \textbf{FFN} (UR 0.964 vs.\ 0.891) \\
+Small budget                 & \textbf{PKM} (1.75$\times$ removal, $\sim$2$\times$ faster) \\
+Sequential edits             & tie (no drift either way) \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\textbf{PKM's only measured advantage is convergence speed at constrained
+budgets.} The post-hoc contribution is therefore the \emph{localised retrain}
+itself --- re-initialise the first two decoder FFNs, retrain on retain data,
+backbone frozen --- with PKM a speed optimisation on top, not the mechanism.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Fixing collapse: what the literature actually says}
+\textbf{Neither paper offers a recipe --- and the reason matters.}
+
+\medskip
+\textbf{Sparse Memory Finetuning} (\url{https://arxiv.org/abs/2510.15103}) never
+faced collapse: it \emph{inherits} a memory pretrained at scale.
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+their setup & 1.3B base, 1M slots, $k{=}32$, 4 heads, $d_v{=}1024$ \\
+placement & ONE layer, middle of the model (12 of 22) \\
+optimizer & \textbf{SGD, lr 0.1--2} (AdamW for baselines) \\
+selection & TF-IDF over 1000 background batches, $t \in \{25..1000\}$ \\
+\hline
+\end{tabular}
+\end{center}
+No initialisation scheme, no warm-up, no query normalisation, \alert{no slot
+utilisation diagnostics at all}.
+
+\end{frame}
+
+\begin{frame}{Fixing collapse: what the literature says (cont.)}
+\textbf{Memory Layers at Scale} (2412.09764), the source of that layer, mentions
+only \textbf{qk-normalisation} ``when needed'' for instability, plus silu gating
+and a \emph{shared} pool across 3 layers. No load-balancing loss.
+
+\medskip
+\pierre{So the collapse measurement --- and any fix --- is ours. Our lr is
+$10^{-3}$; SMF uses 0.1--2, i.e.\ $100\text{--}1000\times$ larger.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Two candidate fixes, and why collapse self-reinforces}
+\textbf{The trap.} At init the values are random, so \emph{which} slots the router
+picks barely changes the loss $\Rightarrow$ almost no gradient pressure on the
+query net $\Rightarrow$ it collapses to a near-constant. After that only the
+surviving slots ever train, which reinforces the collapse.
+
+\end{frame}
+
+\begin{frame}{Candidate fix 1: batchnorm on the query}
+\textbf{(1) \texttt{query\_norm=batchnorm}} (\texttt{track\_running\_stats=False},
+so the padding-corrupted running stats that motivated disabling it never exist):
+\begin{center}
+\begin{tabular}{|l|c|c|}
+\hline
+query\_norm & token-shared $\|\mu\|^2$ & distinct top-$k$ patterns \\
+\hline
+none      & 144.45 & 59 / 2048 \\
+layernorm & 12.56  & 51 / 2048 \quad(\emph{worse}) \\
+\textbf{batchnorm} & \textbf{0.000} & \textbf{118 / 2048} \\
+\hline
+\end{tabular}
+\end{center}
+Zeroes the token-shared component exactly and doubles diversity ---
+\alert{but still concentrated, so only a PARTIAL fix.}
+
+\end{frame}
+
+\begin{frame}{Candidate fix 2: warm-up noise}
+\textbf{(2) \texttt{warmup\_noise}} --- noisy top-$k$ gating: perturb routing
+scores for the first $N$ steps so selection varies and gradient spreads, at
+\emph{identical} cost. On a toy that reproduces collapse:
+\begin{center}
+\begin{tabular}{|l|c|}
+\hline
+config & slots touched / 4096 \\
+\hline
+baseline  & \alert{33} \quad(0.8\%, collapse reproduced) \\
+noise 0.5 & 1776 \\
+\textbf{noise 2.0} & \textbf{4082} \quad(99.7\%) \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Collapse fix: status --- \alert{verdict NOT in yet}}
+\textbf{What is measured:} only the two synthetic checks on the previous slide
+(query geometry; slot spread \emph{during} the warm-up window on a toy module).
+
+\medskip
+\alert{What is NOT measured:} whether either knob raises slot utilisation in an
+actually-trained TIGER model above the 0.012--0.049\% seen in all 8 layouts ---
+and critically, \textbf{whether utilisation survives after the noise switches
+off.} The router may re-collapse once selection becomes deterministic again. The
+toy cannot answer this.
+
+\end{frame}
+
+\begin{frame}{Collapse fix: status (cont.)}
+In flight: 4 capped runs on E1 (\texttt{max\_steps=4000}), then the slot
+diagnostic on each.
+\begin{center}
+\begin{tabular}{|l|l|c|}
+\hline
+arm & config & status \\
+\hline
+base  & ---                                 & \strun \\
+bn    & \texttt{query\_norm=batchnorm}       & \strun \\
+wu    & \texttt{warmup\_noise=2.0}, 2000 st. & \sttodo \\
+bnwu  & both                                 & \sttodo \\
+\hline
+\end{tabular}
+\end{center}
+
+\end{frame}
+
+\begin{frame}{Collapse fix: status (cont.)}
+\pierre{The first warm-up attempt raised \texttt{knn} instead of adding noise.
+Lookup cost scales as $knn^2$, so $knn{=}256$ built a $(\text{rows},65536)$
+tensor, overflowed int32 indexing in \texttt{topk} and aborted with ``CUDA error:
+illegal memory access''. \texttt{warmup\_knn} is now hard-capped at 64.}
+\end{frame}
+
+% ===========================================================================
+\section{Plan}
+
+\begin{frame}{What is done}
+\begin{center}
+\begin{tabular}{|l|c|}
+\hline
+item & status \\
+\hline
+PKM in training / post-hoc insertion            & \stdone \\
+Memory-only update (\texttt{pkm\_only})          & \stdone \\
+Full retain stream (\texttt{retain\_source})     & \stdone \\
+Slot access counters + diagnostics               & \stdone \\
+Top-$t$ selection (AF / AF-IHF / grad / grad+dot)& \stdone \\
+Optimizer + init knobs                           & \stdone \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+\begin{frame}{What is done (cont.)}
+\begin{center}
+\begin{tabular}{|l|c|}
+\hline
+item & status \\
+\hline
+Anti-collapse knobs (\texttt{query\_norm}, \texttt{warmup\_noise}) & \stdone \\
+FFN-reinit control (\texttt{ffn\_reinit\_layers})  & \stdone \\
+Sequential-unlearning comparison                  & \stdone \\
+Placement screen (post-hoc, 8 layers)            & \stdone \\
+Placement screen (trained-in, 8 layers)          & \stdone \\
+Architecture study + 168-run unlearning sweeps   & \stdone \\
+Clean-baseline audit (seed noise)                & \stdone \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{What needs to be done}
+\begin{center}
+\begin{tabular}{|l|l|c|}
+\hline
+\# & item & status \\
+\hline
+1 & \textbf{FFN-reinit control} instead of PKM replace   & \stdone \\
+2 & Other unlearning algorithms under \texttt{pkm\_only} & \sttodo \\
+3 & Fix memory collapse (routing, not capacity)          & \stdone \\
+4 & Top-$t$ sweep on healthy (trained-in) memory         & \stdone \\
+5 & AF-IHF vs.\ grad vs.\ access baseline ablation       & \stdone \\
+6 & Adam vs.\ SGD \emph{under} selection                 & \sttodo \\
+7 & Why does trained-in plateau at SH $\approx$ 0.004?   & \sttodo \\
+8 & Multi-seed (clean baselines \emph{and} runs)         & \strun \\
+9 & Other strategies $+$ other (Amazon) datasets         & \sttodo \\
+\hline
+\end{tabular}
+\end{center}
+
+\end{frame}
+
+\begin{frame}{What needs to be done (cont.)}
+\alert{(1) is the sanity check the post-hoc story rests on:} re-initialise the
+same two decoder FFNs as \emph{ordinary FFNs} and fine-tune them identically.
+If that matches PKM, the mechanism is ``reinit-and-retrain-this-layer'' and the
+PKM is an implementation detail.
+
+\medskip
+\textbf{(3) is blocking (4)--(6).} Candidate causes:
+\texttt{query\_batchnorm=false} (padding-unsafe), \texttt{query\_proj} collapsing
+to a constant, keys never leaving their init.
+\pierre{Cheapest lead: post-hoc PKMs do not collapse --- isolate the memory
+during training.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Item 1: the FFN-reinit control (does PKM actually help?)}
+The post-hoc recipe is: \emph{discard} a trained FFN, put a fresh high-capacity
+module there, fine-tune it on retain data only.
+
+\medskip
+\textbf{Control:} do exactly the same, but re-initialise the layer as an
+\emph{ordinary FFN} --- same two decoder blocks, same discovery code, same
+optimiser, same steps, same full retain split.
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+arm & SH@10 & removal & UR \\
+\hline
+poison baseline               & 0.01274 & ---    & 0.962 \\
+PKM \texttt{d01} $+$ rebuild  & 0.00013 & 99.0\% & 0.995 \\
+\textbf{fresh FFN \texttt{d01} (control)} & \textbf{0.00022} & \textbf{98.2\%} & \textbf{0.995} \\
+\hline
+\end{tabular}
+\end{center}
+
+\end{frame}
+
+\begin{frame}{Item 1: the FFN-reinit control (cont.)}
+\alert{Why this decides the framing:} the removal already appears to come from
+the \emph{retain-only rebuild}, not from the memory --- ablation alone removes
+only 12\%, and \texttt{add} mode (FFN left intact) still removes 98.6\%.
+\alert{Result: tied.} Utility identical to 4 decimals (0.03745 vs.\ 0.03746),
+removal 99.0\% vs.\ 98.2\%. A plain FFN at \textbf{1/25th} the parameter budget
+(2.6M vs.\ 67M) does it just as well.
+
+\end{frame}
+
+\begin{frame}{Item 1: the FFN-reinit control (cont.)}
+\textbf{So the headline post-hoc result is a \emph{localised retrain}, not a
+memory method} --- and it needs no PKM machinery at all.
+
+\medskip
+\pierre{But the test is SATURATED: both arms sit at the clean floor. A tie under
+saturation shows this task cannot separate them, not that they are equivalent.}
+\pierre{Implemented as \texttt{model.ffn\_reinit\_layers} $+$
+\texttt{unlearning.update\_scope=ffn\_only}; the reinit runs AFTER the ckpt load
+(FFN weights are in the ckpt, PKM's are not).}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Item 7: what is the ``SH $\approx$ 0.004 plateau''?}
+On the trained-in E23D01 model \emph{every} gradient-based route stops at the
+same residual, regardless of parameter scope or budget:
+\begin{center}
+\begin{tabular}{|l|c|c|}
+\hline
+route & SH@10 & UR \\
+\hline
+\texttt{unified}, full model   & 0.00411 & 1.013 \\
+\texttt{pkm\_only}, 40 epochs  & 0.00452 & 1.017 \\
+\texttt{pkm\_only}, 100 epochs & 0.00385 & 1.004 \\
+\texttt{pkm\_only}, 200 epochs & 0.00496 & 1.011 \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Not a measurement floor:} this model's \emph{clean} SH@10 is 0.00004 ---
+the plateau sits $\sim$85$\times$ above it, so real spam remains.
+\textbf{Not irreducible:} post-hoc reaches 0.00013 on the same attack.
+
+\end{frame}
+
+\begin{frame}{Item 7: the plateau (cont.)}
+Three candidate explanations, each with a different implication:
+\begin{enumerate}
+  \item \textbf{Optimisation} --- more/better steps would get there.
+        \pierre{Weakened: 40$\to$100$\to$200 epochs is non-monotone.}
+  \item \textbf{Redundancy} --- spam spread over parameters the objective cannot
+        move simultaneously.
+  \item \textbf{It is the utility-preserving frontier}, not a ceiling: pushing SH
+        lower costs utility. \pierre{\texttt{seif} reaches SH$\approx$0 at
+        UR 0.67--0.74, consistent with this.}
+\end{enumerate}
+
+\medskip
+\alert{If (3), ``ceiling'' is the wrong word} --- the question becomes why the
+post-hoc rebuild escapes the frontier entirely.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Open design question}
+The selection experiment needs a model with
+\textbf{(a)} healthy memory \emph{and} \textbf{(b)} spam still present.
+
+\medskip
+But every route to (a) currently destroys (b):
+\begin{itemize}
+  \item \texttt{replace} + rebuild $\Rightarrow$ healthy, spam gone (99\%)
+  \item \texttt{add} + warmup $\Rightarrow$ healthy, spam gone (98.6\%)
+  \item trained-in $\Rightarrow$ spam present, memory collapsed
+\end{itemize}
+
+\end{frame}
+
+\begin{frame}{Open design question (cont.)}
+\textbf{Options:}
+\begin{enumerate}
+  \item Fix collapse in trained-in models (then (a) and (b) coexist naturally)
+  \item Two-stage: warm \emph{briefly} (routing forms, spam survives)
+        $\rightarrow$ select $\rightarrow$ train selected slots only
+  \item Reframe: selection as a way to make the \emph{rebuild} cheaper/safer
+        rather than to target spam
+\end{enumerate}
+
+\medskip
+\todo{decide which framing the paper takes}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Threats to validity}
+\begin{itemize}
+  \item \textbf{Single seed everywhere.} Three identical-config clean runs span
+        \textbf{7.5\%} (sd 3.6\%) --- larger than most architecture effects.
+        Utility claims below $\sim$5\% are not currently supportable.
+  \item \textbf{One attack, one dataset, one target strategy}
+        (beauty / bandwagon / \texttt{mid}).
+  \item \textbf{Denominators.} UR must be taken against each model's \emph{own}
+        clean baseline; mixing them conflates architecture cost with unlearning
+        cost.
+  \item \textbf{One cell has no attack} (ALLv2/popular: poison 0.00018 vs.\
+        clean 0.00013) --- must be excluded from removal claims.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Resources}
+\begin{itemize}
+  \item ERASE: \url{https://arxiv.org/abs/2603.08341}
+  \item FFNs are key--value memories: \url{https://aclanthology.org/2021.emnlp-main.446/}
+  \item Product-key memory (Lample et al.\ 2019): \url{https://arxiv.org/abs/1907.05242}
+  \item Memory layers at scale: \url{https://github.com/facebookresearch/memory}
+  \item GRID: \url{https://github.com/snap-research/GRID}
+\end{itemize}
+
+\medskip
+\textbf{Internal.} \texttt{WORKFLOW.md} sections F--J (full experiment record,
+job ids); \texttt{tables/pkm\_update.md} (extended notes).
+
+\medskip
+\textbf{Deadline.} ICLR 2027 --- Sep 25, 2026 AOE.
+\end{frame}
+
+
+
+
+\begin{frame}{PKM as adapter}
+\begin{itemize}
+    \item Remember: 4 encoder, 4 decoder layers in TIGER
+    \item PKM as adapter after training is better in the decoder layers than encoder layers empirically from previous experiments
+    \item When replacing FFNs in all decoder layers, FFN replacement performs better then PKM replacement but PKM is faster
+    \item but when replacing only FFNs of the decoders with index 0 and 1 then PKM performs better and faster
+
+
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{PKM vs.\ fresh FFN: PKM buys speed, not final quality}
+
+\textbf{The comparison depends on the available retraining budget.}
+
+\medskip
+\textbf{(A) Small budget: PKM converges substantially faster}
+
+\begin{center}
+\begin{tabular}{|c|c|c|c|c|}
+\hline
+steps & PKM SH@10 & PKM UR & FFN SH@10 & FFN UR \\
+\hline
+200 & \textbf{0.00555} & \textbf{0.977} & 0.00863 & 0.966 \\
+600 & \textbf{0.00148} & \textbf{0.989} & 0.00523 & 0.979 \\
+\hline
+converged &
+0.00013 & 0.995 &
+0.00022 & 0.995 \\
+\hline
+\end{tabular}
+\end{center}
+
+PKM removes $\sim$1.75$\times$ more spam at \emph{both} intermediate
+budgets and reaches convergence in 1560 vs.\ 3320 steps.
+
+
+\end{frame}
+
+
+\begin{frame}{PKM vs.\ fresh FFN: PKM buys speed, not final quality}
+
+\textbf{(B) Heavy damage: FFN is better}
+
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+arm & SH@10 & removal & UR \\
+\hline
+PKM \texttt{dall} @2000 & 0.00000 & 100\% & 0.891 \\
+\textbf{FFN \texttt{dall} @2000} & \textbf{0.00009} & \textbf{99.3\%} & \textbf{0.964} \\
+PKM \texttt{dall} @10000 & 0.00000 & 100\% & 0.686 \\
+FFN \texttt{dall} @10000 & 0.00004 & 99.6\% & 0.877 \\
+\hline
+\end{tabular}
+\end{center}
+
+\alert{PKM's advantage is convergence speed, not final quality.}
+
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{PKM is a better adapter for localized repair}
+
+\textbf{Post-hoc d01:} replace the first two decoder FFNs and retrain on
+retain data only, with the backbone frozen.
+
+\medskip
+
+\begin{center}
+\begin{tabular}{|c|c|c|c|c|}
+\hline
+steps & PKM SH@10 & PKM UR & FFN SH@10 & FFN UR \\
+\hline
+200 &
+\textbf{0.00555} & \textbf{0.977} &
+0.00863 & 0.966 \\
+600 &
+\textbf{0.00148} & \textbf{0.989} &
+0.00523 & 0.979 \\
+\hline
+converged &
+\textbf{0.00013} & 0.995 &
+0.00022 & 0.995 \\
+\hline
+\end{tabular}
+\end{center}
+
+
+\end{frame}
+
+
+\begin{frame}{PKM is a better adapter for localized repair (cont.)}
+\textbf{PKM reaches the same final solution with much less optimization:}
+
+\begin{itemize}
+  \item At 200 steps: \textbf{1.55$\times$ more removal}
+        ($56.5\%$ vs.\ $32.3\%$).
+  \item At 600 steps: \textbf{1.50$\times$ more removal}
+        ($88.4\%$ vs.\ $58.9\%$).
+  \item Convergence: \textbf{1560 vs.\ 3320 steps} --- less than half.
+  \item Final utility is essentially identical: UR $=0.995$.
+\end{itemize}
+
+\medskip
+
+\alert{\textbf{For the localized d01 adapter, PKM is a substantially faster
+way to relearn the destroyed function.}}
+
+\medskip
+
+\textbf{Interpretation:} sparse top-$k$ retrieval updates only the relevant
+memory rows, allowing the adapter to fit the retain distribution rapidly.
+
+\end{frame}
+
+
+\begin{frame}{Collapse for trained-in PKM}
+
+\begin{itemize}
+    \item Problem: Memory collapse when training with PKM from the start
+    \item Batch norm can increase memory utilization from experiments (0.01\% used to 1\% used)
+\end{itemize}
+
+\end{frame}
+
+
+
+
+
+% ===========================================================================
+\section{Trained-in PKM: fixing the collapse (Oct 2026)}
+
+\begin{frame}{New setup for the trained-in experiments}
+\begin{itemize}
+  \item TIGER with a PKM \emph{replacing} the FFN of \textbf{encoder block 1}
+        (E1), trained from scratch on the poisoned data (beauty, bandwagon
+        \texttt{mid}, 1\%), 4000 steps, deterministic, RQ-VAE semantic IDs.
+  \item Collapse is judged with the \textbf{eval-mode slot diagnostic}: slots read
+        by forget / retain data, Jaccard, forget-exclusive slots.
+  \item New training-time logging: live slots per window (a trend only: dropout
+        0.15 makes it overstate eval routing $\sim$10$\times$).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{New setup: own reference points}
+Same setup, test set:
+\begin{center}
+\begin{tabular}{|l|c|c|}
+\hline
+model & N@10 & SH@10 \\
+\hline
+poisoned, no fix (p0)       & 0.0307 & 0.0022 \\
+clean, no fix               & 0.0321 & 0.0001 \\
+clean, with balance fix     & 0.0313 & 0 \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Attempt 1: explore / exploit dense updates}
+With probability $p$ per step every PKM layer reads (and updates)
+\emph{all} $512^2$ slots, otherwise the usual top-$k$. Exact and cheap:
+$\text{softmax}(s_1{+}s_2) = \text{softmax}(s_1)\otimes\text{softmax}(s_2)$.
+Schedules: constant, linear, cosine, adaptive (lower $p$ as utilisation rises).
+
+\medskip
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c|}
+\hline
+E1 arm & live slots @1000 & @2000 & @4000 \\
+\hline
+$p=0$ (baseline)         & 16.9k & 1.3k & \alert{32} \\
+dense $p=0.05$           & 15.8k & 1.7k & 818 \\
+dense $p=0.2$            & 15.7k & 1.5k & \alert{32} \\
+dense $p=0.5$            & 60.8k & 32   & \alert{32} \\
+straight-through $p=0.2$ & 15.5k & 2.1k & 1171 \\
+adaptive / linear        & 45--62k & 32 & \alert{32} \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+\begin{frame}{Attempt 1: explore / exploit --- verdict: negative}
+\begin{itemize}
+  \item \textbf{First measurement of collapse dynamics:} the memory starts fully
+        used and the router narrows over $\sim$2000 steps, in encoder \emph{and}
+        decoder.
+  \item Dense updates do \textbf{not} stop it; high $p$ collapses
+        \emph{faster} (32 slots by step 1500). The dense gradient rewards sub-keys
+        that are good \emph{on average}, a token-independent direction.
+  \item Eval diagnostic: every arm reads 32--160 slots, 0 forget-exclusive.
+\end{itemize}
+
+\medskip
+\pierre{Collapse is a \textbf{routing} problem: giving every value a gradient does
+not change the router's incentive.}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Attempt 2: a routing balance loss}
+Added to the training loss, per head and sub-key half ($n{=}512$ sub-keys):
+
+\medskip
+\textbf{MI form:} $\;\log n - H(\bar p) + \tfrac1B\sum_b H(p_b)$
+\quad ($p_b$ = token $b$'s sub-key softmax)
+\begin{itemize}
+  \item the plain marginal term is fooled by identical flat routing (= collapse)
+  \item measured: \alert{inert} at small coef (flat scores, zero gradient),
+        \alert{sharpens tokens} at large coef. Not scale-invariant.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Attempt 2: a routing balance loss (switch form)}
+\textbf{Switch form} (load balancing on the \emph{hard} assignment):
+\;$n\sum_i f_i P_i$
+\begin{itemize}
+  \item $f_i$ = share of top-$k$ assignments to sub-key $i$ (counted)
+  \item $P_i$ = mean softmax on \textbf{per-token standardised} scores, so it
+        cannot be satisfied by shrinking all scores
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Attempt 2: the switch loss fixes the collapse}
+Eval slot diagnostic, E1, retain subset (6.6k sequences):
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+arm & retain slots & Jaccard & forget-excl. & test N@10 \\
+\hline
+p0 (no fix)              & \alert{32} & 1.00 & 0 & 0.0307 \\
+batchnorm only           & 2.5k  & 0.71 & 107  & 0.0303 \\
+MI, coef 0.1             & 2.4k  & 0.84 & 65   & 0.0328 \\
+MI + bn, coef 0.1        & 5.6k  & 0.81 & 121  & 0.0299 \\
+switch, coef 0.1         & 63k   & 0.68 & 2.6k & 0.0322 \\
+\textbf{switch + bn, coef 0.1} & \textbf{92k} & \textbf{0.43} & 16.7k & 0.0305 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item 2900$\times$ the slots of p0 at \textbf{unchanged utility}.
+  \item \alert{Full retain set (22k seqs):} 165k slots (63\%), Jaccard 0.39, but
+        only \textbf{98} forget-exclusive (the 16.7k was a sampling artefact).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{The fix replicates}
+Eval diagnostic (forget-exclusive on the full retain set where given):
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c|}
+\hline
+run & retain slots & Jaccard & test N@10 (p0) \\
+\hline
+seed 2              & 165k (63\%) & 0.39 & 0.0305 (0.0307) \\
+seed 3              & 147k (56\%) & 0.40 & 0.0320 (0.0318) \\
+seed 4              & 123k (47\%) & 0.39 & 0.0328 (0.0326) \\
+coef 0.3            & 193k (74\%) & 0.41 & 0.0301 \\
+decoder D01         & 21k / 24k\,$^*$ & 0.58 & 0.0299 \\
+sports 1\%          & 56k\,$^*$   & 0.51 & 0.0188 (0.0209) \\
+\hline
+\end{tabular}
+\end{center}
+{\footnotesize $^*$ retain subset.}
+
+\begin{itemize}
+  \item Forget-exclusive slots stay $\approx$0 (49--98) at every seed:
+        selection must use frequency \emph{contrast}, not exclusivity.
+  \item \alert{Sports}: $-10\%$ N@10 (one seed).
+\end{itemize}
+\end{frame}
+
+% ===========================================================================
+\section{Unlearning with a healthy memory}
+
+\begin{frame}{A healthy memory is required for memory-only unlearning}
+\texttt{unified}, memory values only (backbone frozen), recipe of the best
+recorded \texttt{pkm\_only} run, 100 epochs:
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|}
+\hline
+arm & N@10 & SH@10 \\
+\hline
+balanced, before unlearning        & 0.0305 & 0.0052 \\
+balanced, all values               & 0.0286 & 0.00004 \\
+balanced, AF-IHF top $t{=}100$     & 0.0277 & \textbf{0} \\
+balanced, grad+dot top $t{=}1000$  & 0.0283 & 0 \\
+\hline
+collapsed p0, before               & 0.0307 & 0.0022 \\
+collapsed p0, memory only          & 0.0294 & \alert{0.0090} \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+\begin{frame}{A healthy memory is required: takeaways}
+\begin{itemize}
+  \item Editing \textbf{100 of 262k value rows} removes the spam completely.
+  \item On the collapsed memory the same update \alert{increases spam 4$\times$}
+        (2 of 3 seeds).
+  \item At 100 epochs the test is \emph{saturated} (SH 0 everywhere).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Budget sweep: AF-IHF beats grad+dot}
+N@10 / SH@10 after unlearning (before: 0.0305 / 0.0052):
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c|}
+\hline
+arm & 4 epochs & 10 epochs & 40 epochs \\
+\hline
+all values         & .0290 / .0001 & .0280 / 0 & .0283 / 0 \\
+AF-IHF $t{=}100$   & .0303 / .0095 & \textbf{.0291 / .0003} & .0277 / 0 \\
+grad+dot $t{=}100$ & .0305 / .0104 & .0303 / .0049 & \textbf{.0291 / .0002} \\
+AF-IHF $t{=}1000$  & \textbf{.0294 / .0005} & .0280 / 0 & .0277 / 0 \\
+grad+dot $t{=}1000$& .0304 / .0061 & .0296 / .0014 & .0282 / .00004 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item AF-IHF removes much faster than grad+dot at equal budget.
+  \item Best selection arms: 91--96\% removal at $-3.6$ to $-4.6\%$ N@10;
+        editing all values costs $-8\%$ for full removal.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{But the full model still wins on spam}
+Full-model \texttt{unified} with \emph{its own} recorded recipe (4 epochs),
+UR against the own \textbf{clean} model (0.0313):
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c|}
+\hline
+method & seed 2 & seed 3 & seed 4 \\
+\hline
+full model           & \textbf{.0313} (UR 1.00) & \textbf{.0324} & \textbf{.0342} \\
+best memory-only     & .0294 (UR 0.94) & .0311 & .0320 \\
+\hline
+\end{tabular}
+\end{center}
+All arms reach SH@10 $\approx$ 0.
+
+\begin{itemize}
+  \item Gap of \textbf{4--6\% N@10 at every seed}; the full model matches the
+        retrained model exactly.
+  \item \textbf{50 sequential requests} instead of 10: every method loses
+        3--4\%, memory-only does \emph{not} accumulate less damage.
+  \item Memory-only's remaining argument: \emph{locality} (100--1000 value rows,
+        13k--128k parameters change).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Sensitive items: setting too small to decide}
+Beauty, hair-loss products, forget ratio $10^{-4}$ (14 users), per-user deletion.
+SHF / SHR = sensitive hits for requesting / other users.
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c|}
+\hline
+balanced model & N@10 & SHF@10 & SHR@10 \\
+\hline
+retrained (target)   & 0.0316 & 0.357 & 0.0378 \\
+before unlearning    & 0.0301 & 0.214 & 0.0378 \\
+full model           & 0.0294 & 0.071 & \alert{0.0239} \\
+values only          & 0.0303 & 0.143 & 0.0367 \\
+AF-IHF $t{=}100$     & 0.0306 & 0.214 & 0.0379 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item The retrained model \emph{is} the original here: deleting 23
+        interactions changes nothing measurable.
+  \item The full model \alert{over-deletes for everyone} (SHR $-37\%$).
+        Memory-only stays close, but only by changing little.
+  \item \todo{repeat with the $10^{-3}$ forget ratio}
+\end{itemize}
+\end{frame}
+
+% ===========================================================================
+\section{MUNKEY-inspired extensions (in progress)}
+
+\begin{frame}{MUNKEY: models designed to forget}
+\textbf{Laguna et al.\ 2026}, \emph{Machine Unlearning via Key Deletion}
+(\url{https://arxiv.org/abs/2603.15033}). Domain: vision.
+
+\medskip
+\begin{itemize}
+  \item \emph{Unlearning by design}: a memory-augmented ViT separates
+        instance-specific memorisation from the model weights.
+  \item Every training instance $x_i$ gets a key $k_i = g_\phi(x_i)$ from a
+        \textbf{frozen} encoder and a \textbf{learnable} exemplar token $v_i$.
+  \item Forgetting $=$ deleting the pair $(k_f, v_f)$: zero-shot, no weight
+        update, no access to the data. Instance-level unlearning.
+\end{itemize}
+
+\medskip
+\textit{``By repurposing memory-augmented structures for the `inverse' task of
+forgetting, we enable a new class of models that are not only high-performing
+but are natively compliant with the dynamic requirements of data privacy and
+integrity.''}
+\end{frame}
+
+\begin{frame}{MUNKEY: architecture}
+\begin{itemize}
+  \item $g_\phi$: any suitable visual encoder, \textbf{pretrained} (ViT-Base
+        on ImageNet by default).
+  \item Adapter $h_\psi$ (a single linear layer) projects the exemplar token
+        into the ViT latent space: $v_i' = h_\psi(v_i)$, used as an auxiliary
+        input token next to the image patch embeddings $z_i$.
+  \item $v_i$ is \emph{not} derived from $k_i$; the key is only used for
+        retrieval.
+\end{itemize}
+
+\medskip
+\pierre{Pretrained $g_\phi$: what if the forgotten images are in its
+pretraining data?}
+
+\medskip
+\pierre{Memory overhead is linear in dataset size (one key and one token per
+instance). Manageable here, but scalability (retrieval latency, training
+overhead, $K$ forward passes at inference) is unverified.}
+\end{frame}
+
+\begin{frame}{MUNKEY: training with pathway dropout}
+Stochastic mask over the two pathways (image tokens, exemplar token):
+\begin{gather*}
+  m = [\gamma_{img}, \gamma_{tok}] \in \{0,1\}^2 \\
+  \mathbb{P}(m{=}[0,1]) = p_i,\quad
+  \mathbb{P}(m{=}[1,0]) = p_t,\quad
+  \mathbb{P}(m{=}[0,0]) = 0
+\end{gather*}
+and $\mathbb{P}(m{=}[1,1]) = 1 - p_i - p_t$. A dropped pathway is replaced by a
+globally learned null token:
+\[
+  D(u, \emptyset, \gamma) = \gamma u + (1-\gamma)\,\emptyset
+\]
+
+\medskip
+\pierre{A learned null token for a dropped pathway: does it end up holding
+general knowledge?}
+\end{frame}
+
+\begin{frame}{MUNKEY: retrieval-based regularisation}
+At inference the query's own token is unavailable, so this state is simulated in
+training: with probability $p_r = 0.2$, use the similarity-weighted average
+$v_n'$ of $K' \sim U\{2,\ldots,16\}$ retrieved neighbour tokens (self excluded):
+\[
+  z_{in}(x_i, m, r) = \big[\,D(z_i, \emptyset_{img}, \gamma_{img}),\;
+  D\big((1-r)\,v_i' + r\,v_n',\ \emptyset_{tok}, \gamma_{tok}\big)\big]
+\]
+$\theta$, $\psi$ and all $(v_i)_{i=1}^N$ are optimised jointly on the expected
+masked objective.
+
+\medskip
+\begin{itemize}
+  \item Gradients into neighbour tokens are \textbf{clipped to 0} when the
+        retrieval branch is active, so the backbone learns to aggregate context
+        and neighbours do not drift towards one sample's gradients.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: inference and unlearning}
+\textbf{Inference.} For a query $x_q$, $k_q = g_\phi(x_q)$ retrieves the $K$
+nearest keys. The model runs \emph{once per neighbour} on $[z_q, v_j']$, and the
+outputs are ensembled with weights
+$w_j = \text{softmax}_j\big(\cos(k_q, k_j)/\tau\big)$.
+
+\medskip
+\textbf{Unlearning.} Delete $(k_f, v_f)$ for each forget sample.
+
+\medskip
+\pierre{How is it ensured this has unlearned? Could the global null tokens
+retain knowledge?}
+\end{frame}
+
+\begin{frame}{MUNKEY: pathway sensitivity and model selection}
+Guard against \emph{pathway collapse}: the model ignores the memory (poor
+unlearning) or degenerates into a lookup table (poor generalisation).
+
+\medskip
+\begin{itemize}
+  \item Sensitivity score $P_s$: the accuracy with the image pathway only minus
+        the accuracy with the memory pathway only, divided by the accuracy with
+        both (plus a stability term). The other pathway is replaced by its null
+        token.
+  \item Multi-stage hyperparameter selection: choose $(p_i, p_t)$ with
+        $P_s(p_i, p_t) < \xi$ for a threshold $\xi \ge 0$, then the smallest
+        validation gap.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: pathway sensitivity and model selection (cont.)}
+\begin{itemize}
+  \item Null tokens give pathway-specific accuracy without unfamiliar inputs
+        (the model saw them in training).
+\end{itemize}
+
+\medskip
+\pierre{Why should a low $P_s$ imply good forgetting?}
+\end{frame}
+
+\begin{frame}{MUNKEY: experimental setup}
+\begin{itemize}
+  \item \textbf{Natural images:} CIFAR-10, CIFAR-100, Tiny ImageNet.
+  \item \textbf{Medical images:} BloodMNIST, PathMNIST, DermaMNIST (MedMNIST v2).
+  \item \textbf{Utility:} test accuracy and retain accuracy.
+        \textbf{Forgetting:} forget accuracy and MIA.
+  \item MIA: RMIA (\url{https://arxiv.org/abs/2312.03262}) with 64 shadow models.
+  \item Random forget sets of 10\% and 2\%, stratified to keep the label
+        distribution; 3 seeds; component ablations in their appendix D.
+\end{itemize}
+
+\medskip
+\pierre{Why retain accuracy? How does performance compare to the baselines
+\emph{before} unlearning?}
+\end{frame}
+
+\begin{frame}{MUNKEY: results}
+\begin{itemize}
+  \item \textit{``The key encoder does not constitute an unfair advantage as each
+        method's unlearning performance is evaluated against its respective gold
+        standard, i.e.\ Retrain (T) or Retrain (M).''}
+  \item \pierre{Retrain (M) retrains the MUNKEY architecture, Retrain (T) the
+        tiny ViT. MUNKEY uses frozen ViT-Base keys, $>$10$\times$ the parameters.
+        The gain may come from the better key model: if the best model were used
+        everywhere, the key choice would lose that advantage.}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: results (cont.)}
+\begin{itemize}
+  \item \textbf{Memory content:} the ViT CLS token quickly forms class-specific
+        clusters, while exemplar tokens evolve more granularly (\pierre{one token
+        per sample?}).
+  \item Token-level aggregation (softmax / rank, one forward pass) is called
+        competitive when $K$ passes are too expensive.
+        \pierre{Their Table 3 shows a higher average gap.}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: questions and answers (1/3)}
+\begin{itemize}
+  \item \pierre{Ensembling usually adds a lot. Compared to an ensembled ViT?}
+        No. With $K{=}4$ they only compare token-level softmax and rank
+        aggregation, deep prompting and cross-attention.
+  \item \pierre{What are the null tokens for?} An evaluation device: they let
+        $P_s$ be measured. They may capture general knowledge, but are not
+        designed to.
+  \item \pierre{What is $h_\psi$?} A single linear layer mapping the
+        independently learned $v_i$ into the ViT embedding space.
+  \item \pierre{Seeds?} Three per experiment.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: questions and answers (2/3)}
+\begin{itemize}
+  \item \pierre{Why would $\theta$ not contain knowledge about the samples?}
+        It does; the removal is an empirical claim. Possibly it works because
+        the neighbours' signal in embedding space dominates: the model treats
+        the sample as part of its neighbourhood. That is neighbourhood
+        unlearning done by the architecture rather than by an algorithm, in the
+        well-trained space of the frozen encoder.
+  \item This favours random-instance forgetting: a close, heavily weighted
+        neighbour usually survives the deletion.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: questions and answers (3/3)}
+\begin{itemize}
+  \item \pierre{Which MIA, too weak?} RMIA is a strong black-box attack, but
+        no adaptive or white-box attacks are tested, and membership in the
+        frozen key encoder is ignored.
+  \item \pierre{Multiple requests?} None sequentially (deletion makes it
+        trivial); no hard vs.\ easy forget sets.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: criticism (1/3)}
+\begin{itemize}
+  \item \pierre{The main setup does not isolate how much of the utility comes from
+        the extra pretrained representation rather than the learnable memory.}
+        Appendix D.2 uses an encoder trained on a disjoint 20\% split, but the
+        main experiments use the ImageNet-pretrained one.
+  \item \pierre{Compared against Retrain (M) only. It is not shown that deleting
+        entries from a jointly trained memory equals training the whole
+        architecture without them.}
+  \item \pierre{Backbone ViT-Tiny ($\sim$5M parameters), key encoder ViT-Base
+        ($\sim$86M). Fairer: a ViT-Tiny baseline that also gets the frozen
+        ViT-Base features, without the learnable memory.}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: criticism (2/3)}
+\begin{itemize}
+  \item \pierre{Missing simple baselines: frozen encoder plus a trained
+        classifier; a ViT augmented with retrieved neighbour \emph{labels}
+        instead of jointly learned tokens.}
+  \item \pierre{No explicit retraining-equivalence or forgetting objective:
+        $\theta$ likely still holds sample knowledge and may just be less
+        exposed to this MIA.}
+  \item \pierre{The average gap (over test, retain, forget accuracy and MIA AUC)
+        can hide failures on a single metric.}
+  \item \pierre{No distribution-shift tests, as needed for harmful data such as
+        spam.}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: criticism (3/3)}
+\begin{itemize}
+  \item \pierre{Forgetting is likely easier for \emph{redundant} examples: a
+        neighbour then represents the forget sample well, with no visible
+        forgetting cost.}
+  \item \pierre{\textbf{Indirect influence through neighbour tokens.} Gradients
+        into retrieved neighbour values are stopped, but the shared parameters
+        $\theta$ are still updated. A sample $x_f$ influences $\theta$ through
+        its own loss \emph{and} whenever its token is retrieved to train other
+        samples. Deleting its entry undoes neither.}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: what transfers to us, and what does not}
+\begin{itemize}
+  \item Our PKM is \emph{content}-addressed $\Rightarrow$ shared slots, no
+        exclusivity. MUNKEY's guarantee comes from \emph{instance} addressing.
+  \item Spam is a \emph{population} pattern learned by the backbone; deleting
+        instance entries alone would not remove it.
+  \item \pierre{We keep the items: an entry is \emph{updated} by unlearning, with
+        emphasis on it over the backbone, not deleted.}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Extensions implemented (1/4): memory dropout}
+\textbf{Memory dropout on the PKM.} Each sequence's whole PKM read is replaced by
+a learned null vector with probability $p$ during training, so the backbone works
+without a user's memory contribution.
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c|}
+\hline
+run & retain slots (subset) & Jaccard & test N@10 \\
+\hline
+no dropout       & 92k  & 0.43 & 0.0305 \\
+dropout 0.1      & 106k & 0.41 & 0.0318 \\
+dropout 0.3      & 101k & 0.44 & 0.0303 \\
+\hline
+\end{tabular}
+\end{center}
+Memory stays healthy, utility unchanged. \strun: unlearning comparison.
+\end{frame}
+
+\begin{frame}{Extensions implemented (2/4): item-keyed exemplar memory}
+\textbf{Item-keyed exemplar memory} (replacing the PKM, or next to it). One
+entry $v_i$ per item, added to the item's input tokens. Training per occurrence:
+null (prob.\ 0.1), similarity-weighted average of 1--4 \textbf{neighbour items}
+by frozen text embedding (prob.\ 0.2, no gradient), else own entry.
+\end{frame}
+
+\begin{frame}{Extensions implemented (3/4): training side}
+\begin{enumerate}
+  \item \textbf{Output-side item score} $s_i = \langle h_0, W v_i\rangle$
+        ($h_0$ = decoder state after BOS), trained with a sampled softmax,
+        used to rerank the beams. Forgetting can then push down the
+        \emph{target's own} entry.
+  \item \textbf{Item-addressed PKM slots:} every item owns a private block of 16
+        slots next to the shared table $\Rightarrow$ exclusive by construction.
+  \item \textbf{Consistency distillation}
+        KL$(\text{sg}(p_{\text{own}})\,\|\,p_{\text{neighbours}})$: trains the
+        backbone so neighbour substitution stays a good prediction.
+\end{enumerate}
+\end{frame}
+
+\begin{frame}{Extensions implemented (4/4): unlearning side}
+\begin{enumerate}
+  \setcounter{enumi}{3}
+  \item \textbf{Unlearning knobs:} lr emphasis (item entries $\times$10,
+        backbone $\times$0.1 or frozen), rows = forget items / AF-IHF top-$t$ /
+        soft AF-IHF weights, warm start towards the neighbour average.
+  \item \textbf{Local repair as an additional objective term:} CE on retain rows
+        whose history contains an affected item, \emph{next to} the unchanged
+        uniform retain term.
+\end{enumerate}
+\end{frame}
+
+% ===========================================================================
+\section{Meeting notes and action items}
+
+\begin{frame}{Meeting 31.07.2026}
+\begin{itemize}
+  \item Continual-learning critique: replay with old data is bad; rehearsal is
+        a \textbf{privacy concern}.
+  \item Forget-set-only unlearning: use statistics such as access counts;
+        implement top-$t$ selection.
+  \item Think about the connection between LSTMs and unlearning (gates).
+  \item Document \emph{why} we insert memory and \emph{where}; use it as a
+        modular component and show the difference.
+  \item The Google doc describes how memory rows are selected in the
+        continual-learning paper (next slides).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Meeting 31.07.2026: status}
+\begin{center}
+\small
+\begin{tabular}{|l|c|}
+\hline
+item & status \\
+\hline
+Top-$t$ selection from access statistics & \stdone \\
+Why and where the memory goes (placement) & \stdone \\
+Forget-set-only unlearning (no retain data)                          & \sttodo \\
+LSTM gates and unlearning                                            & \sttodo \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\pierre{All current unlearning runs still use a retain term. Forget-only is
+relevant for the privacy argument: no rehearsal of old data.}
+\end{frame}
+
+\begin{frame}{Memory-row selection in the continual-learning paper}
+\textbf{Stage 1: learn $D_1$.} Update the backbone on the new data
+$(q, \text{DocID}) \in D_1$ only; no $D_0$ examples are mixed in.
+
+\medskip
+\textbf{Stage 2: select memory rows.} Run the $D_1$ queries through the adapted
+model and record which rows they access.
+\begin{itemize}
+  \item \textbf{Protect} rows used heavily by $D_0$: the top 10\% most
+        historically used rows cannot change.
+  \item Among the rest, \textbf{prefer} rows the $D_1$ queries access often and
+        that were rarely used before (TF-IDF style).
+  \item Select 10{,}000 rows.
+\end{itemize}
+
+\end{frame}
+
+\begin{frame}{Memory-row selection in the continual-learning paper (cont.)}
+\textbf{Stage 3: update only those rows.} Freeze the backbone, LoRA, keys,
+routing, output embeddings and all unselected rows; train only the selected
+value vectors on the correct $D_1$ DocID tokens. Then add the $D_1$ access
+counts to the history and repeat for $D_2$.
+\end{frame}
+
+\begin{frame}{Their selection vs.\ ours}
+\begin{center}
+\small
+\begin{tabular}{|l|l|l|}
+\hline
+ & continual learning & our unlearning \\
+\hline
+new data      & $D_1$ queries          & forget set \\
+history       & $D_0$ access counts    & retain-set access counts \\
+score         & now frequent, rarely used before & AF-IHF (same idea) \\
+protection    & \textbf{top 10\% rows frozen} & none \\
+rows          & 10{,}000               & $t \in \{100, 1000, 10^4\}$ \\
+updated       & selected values only   & selected values only \\
+\hline
+\end{tabular}
+\end{center}
+
+\medskip
+\begin{itemize}
+  \item Selected rows $=$ useful for the new data $+$ unimportant for old data.
+  \item \pierre{Not yet tried: the hard protection of the most-used retain
+        rows. It directly targets the 4--6\% utility cost of memory-only
+        unlearning.}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Meeting 18.08.2026 (Kidist / Pierre)}
+\begin{itemize}
+  \item PKM is still useful as a fast lookup-based module, but given the FFN
+        control we should \textbf{not overclaim} PKM as the mechanism.
+  \item Safer story: \emph{localized decoder-layer rebuilding} removes the spam
+        (freeze the model, reset only the first two decoder FFNs, retrain them
+        on clean retain data); PKM gives a faster sparse implementation,
+        especially under small update budgets.
+  \item Next question: are the speed gains over a fresh FFN consistent across
+        seeds, attacks and datasets?
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Meeting 18.08.2026 (Kidist / Pierre, cont.)}
+\begin{itemize}
+  \item With that story, top-$t$ selection is not the core method; only the
+        placement result (d01) is needed. Selection matters only for a
+        PKM-specific sparse-memory claim.
+  \item Reference: \url{https://belinkov.com/assets/pdf/sigir2025.pdf}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Meeting 18.08.2026: action items}
+\begin{center}
+\small
+\begin{tabular}{|l|c|}
+\hline
+action item & status \\
+\hline
+Finish the FFN-reinit control                       & \stdone \\
+Fix memory collapse                                 & \stdone \\
+Top-$t$ sweeps on a healthy memory                  & \stdone\,$^{a}$ \\
+AF-IHF vs.\ grad vs.\ grad+dot vs.\ access frequency & partly\,$^{b}$ \\
+Adam vs.\ SGD under selection                       & \sttodo \\
+Multi-seed experiments                              & partly\,$^{c}$ \\
+Other attacks and datasets                          & partly\,$^{d}$ \\
+\hline
+\end{tabular}
+\end{center}
+{\footnotesize
+$^{a}$ on the healthy \emph{trained-in} memory, not post-hoc.
+$^{b}$ AF-IHF vs.\ grad+dot done; AF and grad alone not on the healthy memory.
+$^{c}$ 3 seeds for the trained-in comparison; PKM-vs-FFN speed not yet.
+$^{d}$ collapse fix on sports; unlearning only on beauty bandwagon.}
+\end{frame}
+
+\begin{frame}{Meeting: baselines and datasets}
+\textbf{Trained from the start:}
+\begin{itemize}
+  \item ``Normal'' TIGER $+$ unlearning algorithms \hfill \strun
+  \item Ours: TIGER with PKMs replacing some FFNs during training $+$
+        unlearning \hfill \stdone
+  \item PKM models must be competitive with normal training \hfill partly
+        \pierre{(clean: 0.0313 balanced vs.\ 0.0321 without the fix)}
+\end{itemize}
+
+\end{frame}
+
+\begin{frame}{Meeting: baselines and datasets (cont.)}
+\textbf{PKM as adapter:}
+\begin{itemize}
+  \item ``Normal'' poisoned TIGER, unchanged \hfill \stdone
+  \item TIGER with some FFNs re-initialised and retrained, rest frozen \hfill \stdone
+  \item Ours: FFNs replaced by PKMs, PKMs trained, rest frozen \hfill \stdone
+\end{itemize}
+
+\medskip
+\textbf{Datasets:} Amazon Beauty, Sports \& Outdoors, Toys \& Games.
+\end{frame}
+
+% ===========================================================================
+\section{Plan (updated Oct 16)}
+
+\begin{frame}{Status of the running work}
+\begin{center}
+\small
+\begin{tabular}{|l|c|}
+\hline
+item & status \\
+\hline
+Routing balance loss (switch + batchnorm), replicated & \stdone \\
+Slot-selection unlearning, budget sweep, full-model reference & \stdone \\
+Seeds 3/4, 50 requests, sensitive $10^{-4}$ & \stdone \\
+Memory dropout: training & \stdone \\
+Memory dropout: unlearning comparison & \stdone \\
+Item memory: replacing the PKM / next to the PKM & \stdone \\
+Item memory + output score (+ consistency) & \stdone \\
+Item-addressed PKM slots & \stdone \\
+Unlearning variants: emphasis, soft rows, warm start & \stdone \\
+Local repair (fixed: rows from the full retain split) & \strun \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+\begin{frame}{Exploration plan (Oct 16): switch loss and MUNKEY}
+\begin{center}
+\small
+\begin{tabular}{|l|l|c|}
+\hline
+\# & item & status \\
+\hline
+M1 & user tokens + history-pathway dropout ($p_{hist}$) & \stdone \\
+M3 & whole-user deletion, 2\% of users (MUNKEY's setting) & \stdrop \\
+M2 & pathway-sensitivity $P_s$ model selection & \stdrop \\
+M4 & inference-time neighbour ensemble & \stdrop \\
+S1 & anneal the switch loss to 0 (from step 1k / 2k) & \stdone \\
+S5 & competitiveness: clean PKM vs.\ clean TIGER & \stdone \\
+S2 & raw vs.\ standardised $P$; per-half vs.\ slot balancing & \stdone \\
+S3 & placements: D01, E23D01, all layers & \stdone \\
+S4 & capacity: $n_{keys}$ 256 / 1024 & \stdone \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+\begin{frame}{Exploration plan: the two key tests (outcome)}
+\begin{itemize}
+  \item \textbf{M3, whole-user deletion:} delete 2\% of users. Their tokens are
+        reset to the average of their nearest \emph{remaining} users, with zero
+        gradient steps. Compared with a model retrained without them (served the
+        same way) and with full-model unlearning, on deleted vs.\ other users.
+        \alert{Dropped (Oct 19): user tokens cost 40--45\% utility at every setting.}
+  \item \textbf{S1, annealing:} if the memory stays healthy after the loss is
+        switched off, the switch loss is an initialisation aid, not a permanent
+        component. \alert{Outcome: the router collapses again (128--144 slots), so
+        the loss is needed throughout.}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Results (Oct 19): switch-loss exploration}
+Retain slots at eval (retain subset), E1 unless noted; reference: 92k slots,
+N@10 0.0305.
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c|}
+\hline
+run & retain slots & Jaccard & test N@10 \\
+\hline
+anneal from 1k / 2k & \alert{128 / 144} & 1.00 & .0309 / .0297 \\
+raw $P$ & \alert{128}       & 1.00 & .0304 \\
+$n_{keys}=256$ (65k slots)    & 26k (40\%)        & 0.42 & \textbf{.0328} \\
+$n_{keys}=1024$ (1M slots)    & 81k (8\%)         & 0.62 & .0313 \\
+D01, coef 0.3                 & 20k / 35k          & 0.57 & .0296 \\
+E23D01 / ALL & 6--100k & 0.40--0.83 & .0316 / .0313 \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+\begin{frame}{Results (Oct 19): what the switch exploration shows}
+\begin{itemize}
+  \item The loss is needed \textbf{throughout} training: annealing it away lets
+        the router collapse again.
+  \item Per-token \textbf{standardisation is essential}: raw $P$ collapses, as
+        the scale-loophole argument predicts.
+  \item A \textbf{smaller} memory is used better and gives the best utility.
+  \item Multi-layer layouts are healthy, but far below single-layer E1.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Results (Oct 19): item memory vs.\ user tokens}
+Poisoned beauty, test N@10 / SH@10 (\alert{corrected Oct 23}: zero-step evals):
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|}
+\hline
+model & N@10 & SH@10 \\
+\hline
+plain TIGER                         & .0315 & .0126 \\
+item memory                         & .0352 & .0120 \\
+\quad + output score               & .0364 & .0200 \\
+\quad + score + consistency        & \textbf{.0382} & .0120 \\
+\quad + score + consistency + PKM  & .0375 & .0211 \\
+\hline
+user tokens (any $p_{hist}$, $p_{drop}$) & \alert{.017--.020} & --- \\
+\hline
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item Item memory: \textbf{+12 to +21\% utility}. \alert{Withdrawn (Oct 23):}
+        ``less spam pickup'' came from mis-evaluated before rows.
+  \item User tokens: $-$40 to $-$45\% \pierre{(likely memorisation of past
+        targets)}. \textbf{Decision (Oct 19): user tokens dropped.}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Results (Oct 19): memory dropout has no effect}
+Unlearning on the balanced E1 model, best memory-only arm vs.\ full model (N@10):
+\begin{center}
+\small
+\begin{tabular}{|l|c|c|c|}
+\hline
+memory dropout & full model & best memory-only & gap \\
+\hline
+none   & .0313 & .0294 & $-$6\% \\
+$p=0.1$ & .0330 & .0308 & $-$7\% \\
+$p=0.3$ & .0309 & .0297 & $-$4\% \\
+\hline
+\end{tabular}
+\end{center}
+The gap to full-model unlearning stays (1 seed), and at $p=0.3$ removal drops.
+\end{frame}
+
+\begin{frame}{Results (Oct 20): item-memory unlearning}
+Old recipe ($\lambda_f$ 0.01, $\lambda_s$ 1.0), test N@10 / SH@10; \emph{emph} =
+entries $\times$10, backbone $\times$0.1; before column \alert{corrected Oct 23}:
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+model & before & full model & emph & entries only \\
+\hline
+item memory           & .0352/.0120 & .0354/0 & .0353/.0003 & .0353/.0115 \\
+\quad + score        & .0364/.0200 & .0376/0 & .0365/.0001 & .0364/.0199 \\
+\quad + score + cons. & .0382/.0120 & .0377/0 & \textbf{.0382}/.0001 & .0382/.0120 \\
+\quad + PKM          & .0375/.0211 & .0381/0 & .0373/.0002 & .0375/.0207 \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+\begin{frame}{Results (Oct 20): item-memory unlearning, takeaways}
+\begin{itemize}
+  \item \textbf{Emphasis works with this recipe:} 97--100\% removed at
+        full-model utility. \alert{Oct 23: only because of the strong separation
+        term ($\lambda_s = 1$); with the paper recipes it is slow (see below).}
+  \item \textbf{Entries alone do not:} with the backbone frozen nothing is
+        removed. The small backbone step is required.
+  \item Soft rows = hard rows; the warm-start reset costs 1--3\%.
+  \item Local repair: fixed Oct 21 (rows from the full retain split); no
+        effect, because unlearning already sits above the retrained utility.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Decisions (Oct 20)}
+\begin{itemize}
+  \item Item memory with emphasis is the main unlearning recipe.
+        \alert{(Revisited Oct 23: the gain is the item memory, not emphasis.)}
+  \item Switch loss (0.1) + batchnorm query are now the PKM training default.
+  \item Soft row selection preferred (modelling view; same numbers as hard rows).
+  \item Dropped: warm-start reset (costs utility), top-10\% slot protection
+        (blocks removal), user tokens.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Local repair fix (Oct 20)}
+\begin{itemize}
+  \item Local rows are now drawn from the \emph{full} retain split: up to 256
+        rows whose history has an affected item (seeded), one extra batch per
+        step, same retain CE, weight $\lambda_{local}$.
+  \item The uniform retain term is unchanged; only the 256 rows are forwarded.
+  \item Reruns on all five item-memory models queued.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Results (Oct 20): meeting action items}
+Balanced E1 model, before: .0305 / .0052 (N@10 / SH@10):
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|l|c|c|}
+\hline
+arm & N@10 & SH@10 \\
+\hline
+AF-IHF $t$=1000 (reference)        & .0294 & .0005 \\
+\quad + protect top 10\% slots   & .0303 & \alert{.0061} \\
+forget-only, AF-IHF $t$=1000       & .0287 & .0002 \\
+forget-only, full model            & \alert{.0000} & 0 \\
+SGD lr 0.1 / 1.0 (AF-IHF)          & .0309 / .0299 & \alert{.0146 / .0051} \\
+\hline
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item Protection blocks removal: the spam sits in the most retain-used slots.
+  \item \textbf{Without retain data, memory-only still works; the full model is
+        destroyed} (a privacy argument). Adam beats SGD here.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: what the authors' code actually does}
+\begin{itemize}
+  \item One 128-d token per \emph{training instance} (+ linear adapter, null
+        token); frozen keys from a pretrained ViT-Base, used for retrieval only.
+  \item Training, decided \emph{once per batch}: w.p.\ $p_r$ the token is the
+        softmax$(\mathrm{sim}/0.07)$ mix of $K' \sim U\{2..k\}$ neighbours (the
+        whole batch excluded, neighbours detached); w.p.\ $\alpha$ null token,
+        w.p.\ $\beta$ the image is masked.
+  \item Inference \emph{always} retrieves (top-4); the README's main command
+        mixes tokens in one pass, not the paper's $K$-pass ensemble.
+  \item Unlearning: mask the forget keys at retrieval (zero-shot).
+  \item Code defaults switch all of this off; the paper uses $p_r = 0.2$ and
+        picks $(\alpha, \beta)$ by $P_s$.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY: baseline port and recipe transfer (results Oct 23)}
+\begin{enumerate}
+  \item \textbf{Baseline (faithful):} instances = training users, keys = frozen
+        text-embedding mean of the history, token prepended to the encoder.
+        Eval mixes the nearest \emph{other} users (never the own token: the
+        failure mode of our user tokens). Unlearning = delete the fake users'
+        keys. Grid $\alpha = \beta \in \{0, 0.1, 0.2\}$, plus a clean
+        retrained reference.
+  \item \textbf{Our base:} item memory trained with MUNKEY's exact recipe
+        (per-batch draws, $\tau = 0.07$, eval retrieval over [self +
+        neighbours]); then our emphasis unlearning.
+  \item Arms per model: key deletion only (zero-shot), key deletion + full
+        unlearning, full unlearning alone.
+\end{enumerate}
+\end{frame}
+
+\begin{frame}{Planned next (updated Oct 20)}
+\begin{enumerate}
+  \item Item-memory unlearning replicated: \stdone{} (data seeds 3, 5).
+  \item Local repair with rows from the full retain split: \stdone{} (no effect).
+  \item $n_{keys}=256$: \stdone{} --- does not replicate, 512 stays.
+  \item Sensitive $10^{-3}$: \stdrop{} for now (spam only, Oct 21).
+  \item Sports: \stdone{} --- the spam attack did not land there.
+\end{enumerate}
+\end{frame}
+
+\begin{frame}{Queued (Oct 19/20): status}
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{|l|l|c|}
+\hline
+goal & runs & status \\
+\hline
+replicate item memory & seeds 3, 4: full / emph & \stdone \\
+replicate $n_{keys}=256$ & seeds 3, 4 (+ slot diagnostics) & \stdone \\
+item memory, sens.\ $10^{-3}$ & before / full / emph, retrain ref. & \stdrop \\
+second dataset & sports: plain vs.\ item memory & \stdone \\
+local repair, fixed & emph + local, 5 models & \stdone \\
+protect top 10\% retain slots & AF-IHF $t$=1000 / 100 & \stdone \\
+forget-only unlearning & values, AF-IHF, full model & \stdone \\
+Adam vs.\ SGD under selection & SGD lr 0.1 / 1.0 & \stdone \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+\begin{frame}{Planned next (from the meeting notes)}
+\begin{enumerate}
+  \setcounter{enumi}{5}
+  \item Protect the most-used retain rows (top 10\%) during selection, as in the
+        continual-learning paper. \stdone
+  \item Forget-set-only unlearning (no retain data, no rehearsal). \stdone
+  \item Adam vs.\ SGD under selection. \stdone
+  \item PKM vs.\ fresh FFN speed gain across seeds, attacks and datasets.
+  \item ``Normal'' TIGER $+$ unlearning baseline: \stdone{} (poisoned .0313, after full unlearning .0325).
+\end{enumerate}
+
+\medskip
+\pierre{Open question for the paper: is the contribution the collapse fix, the
+locality of memory-only unlearning, or the item-keyed memory?}
+\end{frame}
+
+\section{Results (Oct 21 to 23)}
+
+\begin{frame}{Paper recipes and references}
+\begin{itemize}
+  \item \textbf{Forget + Repair (F+R):} $\lambda_f = 0.1$, $\lambda_s =
+        \lambda_n = 0$ (the paper's validation-selected setting).
+  \item \textbf{NAU:} $\lambda_f = 0.1$, $\lambda_s = 0.01$, $\lambda_n =
+        0.01$, 8 text-embedding neighbors, mass loss.
+  \item Both match the recorded paper runs setting by setting; the NAU code on
+        this branch matches main (audited; validation-based epoch selection
+        ported, off by default).
+  \item \textbf{Retrained references} (clean-trained models, scored against the
+        spam targets): plain .0305 / 0, item memory .0363 / 0, balanced PKM
+        .0301 / 0.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Full unlearning with the paper recipes}
+Test N@10 / SH@10; seeds are the paper's data seeds (own target, own fake users):
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{|l|c|c|c|}
+\hline
+model, seed & before & full F+R & full NAU \\
+\hline
+plain, 2       & .0315/.0126 & .0328/.0003 & .0326/.0002 \\
+item mem., 2   & .0382/.0120 & .0385/.0003 & .0385/0 \\
+plain, 3       & .0323/.0012 & .0331/0 & .0325/0 \\
+item mem., 3   & .0377/.0032 & .0382/0 & .0381/0 \\
+plain, 5       & .0341/.0201 & .0348/0 & .0344/0 \\
+item mem., 5   & .0382/.0112 & .0377/0 & .0384/0 \\
+\hline
+plain, clone-inject     & .0318/.0033 & .0323/.0003 & .0320/0 \\
+item mem., clone-inject & .0381/.0017 & .0378/0 & .0380/0 \\
+\hline
+\end{tabular}
+\end{center}
+\end{frame}
+
+\begin{frame}{Full unlearning: takeaways}
+\begin{itemize}
+  \item Both paper recipes remove the spam on every model.
+  \item \textbf{Item memory keeps an 8 to 17\% utility lead} over plain after
+        unlearning, at all three data seeds and on the clone-inject attack.
+  \item Unlearned models sit above their retrained utility (item memory .0385
+        vs .0363), since unlearning includes a retain fine-tune.
+  \item NAU and F+R are close on Beauty
+  \item The seed-3 attack barely landed (plain SH .0012): little to remove.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Emphasis and zero-shot deletion}
+\begin{itemize}
+  \item \textbf{Emphasis} (entries $\times$10, backbone $\times$0.1) with the
+        paper recipes: 25 to 40\% removal at 4 epochs; validation-selected
+        epochs climb to the 10-epoch cap (about 70\%). Slow, not broken.
+  \item \textbf{The utility gain is the architecture:} full F+R on item memory
+        (.0385) matches the best emphasis result.
+  \item \textbf{Zero-shot item deletion} (target's entry becomes its neighbors'
+        mix): SH unchanged. The spam lives in the backbone, not in the target's
+        entry. \pierre{This confirms kind of that the MUNKEY results stem from the easy datasets and that the params also contain knowledge that we might need to touch}
+  \item \textbf{Local repair:} no effect; there is no utility gap left to repair.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{MUNKEY baseline (faithful port)}
+\begin{itemize}
+  \item \textbf{Spam:} key deletion of the fake users removes only 8 to 20\%
+        (SH .0174 to .0140 at the best setting); key deletion plus full
+        unlearning removes everything. MUNKEY models have about 25\% lower
+        utility than plain (N@10 .023 to .025).
+  \item \textbf{Whole-user deletion} (its home setting, random 2\% of users):
+        membership-inference AUC .699 before, .613 after key deletion, .564
+        retrained: 64\% of the gap closed with no weight update, retained users
+        unaffected (N@10 .0247 to .0245).
+  \item Deleted users' own N@10 rises after deletion (.0289 to .0306): their own
+        token had memorized training targets, as with our user tokens.
+  \item MUNKEY's training recipe on our item memory costs 5 to 7\% utility.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Switch loss: impact on utility}
+Test N@10, collapsed vs switch loss (loss term coefficient 0.1 and use batchnorm):
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{|l|c|c|c|}
+\hline
+setting & collapsed & switch & change \\
+\hline
+Beauty, encoder block 1, seed 2 & .0307 & .0305 & $-$0.7\% \\
+training seed 3                 & .0318 & .0320 & +0.6\% \\
+training seed 4                 & .0326 & .0328 & +0.6\% \\
+clean data                      & .0321 & .0313 & $-$2.5\% \\
+decoder blocks 0, 1 (1 seed)    & .0314 & .0299 & $-$4.8\% \\
+Sports, encoder block 1 (1 seed) & .0209 & .0188 & $-$10\% \\
+\hline
+\end{tabular}
+\end{center}
+Neutral in the main setting (inside seed noise); the decoder and Sports costs
+are single runs. The memory reads 92k to 165k of 262k slots instead of 32.
+\end{frame}
+
+\begin{frame}{Switch loss: all positions and smaller results}
+\begin{itemize}
+  \item \textbf{All 8 FFNs as PKMs:} utility fine (.0313), but the loss is the
+        \emph{mean} over memories, so each layer got 1/8 of the pressure:
+        encoder memories read 6 to 8k slots, forget/retain overlap .80.
+        Matched pressure (coef 0.8) is training.
+  \item $n_{keys}=256$ does not replicate (mean +1.5\%); 512 stays.
+  \item \textbf{50 requests:} full unlearning loses 3.6 to 4.7\% utility.
+  \item \textbf{Validation-selected epochs:} full unlearning picks the fixed 4.
+  \item \textbf{Cost:} every method takes the same 40 steps; memory methods buy
+        locality (parameters allowed to move), not speed.
+  \item Mean-output ablation of collapsed vs balanced memory: running.
+\end{itemize}
+\end{frame}
+
+\section{Results (Oct 26): paper grid}
+
+\begin{frame}{Paper grid: item memory vs plain (15 cells)}
+3 target strata $\times$ data seeds 2, 3, 5, 7, 11; test N@10, plain TIGER plus an explicit per-item memory (``im'') with an output-score rerank (``s'') and a consistency loss (``c'') (short: paired imsc) vs plain:
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+ & plain & imsc & imsc vs plain & min / max \\
+\hline
+before deletion   & .0313 & .0379 & +21.4\% & +7.9 / +33.6\% \\
+after full F+R    & .0319 & .0381 & \textbf{+19.5\%} & +8.1 / +28.9\% \\
+after full NAU    & .0319 & .0381 & \textbf{+19.8\%} & +8.0 / +28.6\% \\
+\hline
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item Positive in every cell; both recipes remove the spam on both
+        architectures (SH $\leq$ .0004 almost everywhere).
+  \item Popular targets: the retrained model still recommends them (reference SH
+        up to .013), so unlearning to SH $\approx$ 0 over-suppresses, for both
+        architectures alike (an objective issue, not an architecture one).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Collapsed vs balanced PKM under the paper recipes}
+Encoder block 1, test N@10 / SH@10 (fresh zero-step before evals):
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|l|c|c|c|}
+\hline
+model & before & full F+R / NAU & memory-only F+R / NAU \\
+\hline
+collapsed, s2 & .0293/.0091 & .0304/0, .0304/0 & .0297/.0057, .0297/.0065 \\
+balanced, s2  & .0309/.0161 & .0313/.0001, .0312/0 & .0306/.0116, .0305/.0127 \\
+collapsed, s3 & .0315/.0114 & .0321/.0001, .0317/0 & .0313/.0084, .0314/.0090 \\
+balanced, s3  & .0310/.0086 & .0327/0, .0320/0 & .0313/.0076, .0311/.0078 \\
+\hline
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item Full unlearning works on both; memory-only removes only 10 to 35\% on
+        both. The balanced memory gives no unlearning advantage here.
+  \item The earlier memory-only success needed $\lambda_s = 1$, like emphasis.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{All positions with matched pressure}
+Switch coefficient 0.8 over 8 memories (= 0.1 per layer, as for one layer):
+\begin{itemize}
+  \item Encoder memories now read 18 to 29\% of their slots (2 to 3\% at
+        coefficient 0.1), forget/retain overlap .35 to .66 (was .80), 13k to 16k
+        forget-exclusive slots per layer (was 150 to 394).
+  \item Decoder memories read 9 to 16\%.
+  \item Utility comparable to one layer (training-time test N@10 .0315).
+\end{itemize}
+\medskip
+\pierre{Collapse is fixable everywhere; the open question is whether a
+separable memory can be exploited by an unlearning algorithm at all.}
+\end{frame}
+
+\begin{frame}{Does the spam live in the memory? Slot deletion (Oct 26)}
+Delete slots at evaluation (never selected in top-k); test N@10 / SH change:
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|l|c|c|c|}
+\hline
+slots deleted per memory & encoder block 1 & all 8 positions & forget reads \\
+\hline
+strictly forget-exclusive (60--65) & 0 / 0 & 0 / 0 & $\approx$0\% \\
+top-1000 forget-specific & $-$0.2\% / $-$9\% & +0.2\% / $-$2\% & 49\% \\
+\textbf{every slot the fake users read} & $-$0.4\% / $-$13\% & +1.4\% / $-$2\% & 100\% \\
+\hline
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item Strict separability vanishes against the full retain set.
+  \item Deleting every forget-read slot removes only 2 to 13\% of the spam: it is
+        stored in attention and the backbone, not in the memory. A routing loss
+        cannot exploit separability for this spam.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Boosted item entries with an anti-nuking cap (Oct 26)}
+Backbone 1$\times$, forget-read entries 10$\times$; each entry capped at $c \cdot
+\lVert v_0 \rVert$ from its pre-unlearning value over the whole sequence:
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+cell (retrained SH) & full & boost & cap 0.5 & cap 0.2 \\
+\hline
+mid s2 (0)          & .0385/.0003 & .0385/.0002 & .0385/.0002 & .0385/.0002 \\
+popular s3 (.0097)  & .0376/0 & .0377/0 & .0377/0 & .0377/0 \\
+popular s11 (.0130) & .0390/0 & .0394/0 & .0392/0 & .0394/0 \\
+\hline
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item Harmless to slightly positive; entries drift at most 0.4 of their norm,
+        so nothing is nuked and the cap is a free guarantee.
+  \item Popular targets end below the retrained SH either way: the backbone's
+        forget term over-suppresses, not the entries.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Forget-dominated, not exclusive, slots (Oct 26)}
+Slots the fake users read at $\geq r\times$ the per-row retain rate, deleted at
+evaluation; test N@10 / SH (share of forget reads / retain reads deleted):
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|l|c|c|}
+\hline
+deleted & encoder block 1 & all 8 positions \\
+\hline
+none & .0275 / .0163 & .0296 / .0073 \\
+$r=10$ & .0275 / .0163 \ (3\% / 0.2\%) & .0296 / .0073 \ (1\% / 0.1\%) \\
+$r=1$ & .0276 / .0150 \ (78\% / 40\%) & .0296 / .0075 \ (70\% / 45\%) \\
+\hline
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item Even deleting the slots that carry three quarters of the fake users'
+        reads changes SH by $-$8\% / +3\%: dominance does not locate the spam either.
+  \item Utility does not move: deleted slots are replaced by the next top-$k$.
+  \item Deletion is not the goal anyway (we keep recommending the item);
+        next: update dominated slots \emph{differently} (next slide).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Running (Oct 26)}
+\begin{itemize}
+  \item \textbf{Dominated-slot boost} (PKM): full F+R / NAU, but the top-1000
+        AF-IHF slots per memory move at 10$\times$, each capped at 0.5 of its
+        norm (only boosted slots are capped). Encoder block 1 (seeds 2, 3),
+        all 8 positions (seed 2) + its pre / full references.
+  \item \textbf{FFN pathway dropout} (add mode, $p=0.5$ per sequence): pushes
+        the layer's job into the memory; then rerun slot deletion. Does the
+        spam move into the memory?
+  \item \textbf{Category memory:} keyed by the first SID level (103 groups on
+        Beauty), 32 or 128 slots per group, alone and with the item memory;
+        pre + F+R / NAU.
+  \item \textbf{Balance loss} now sums over memories (coefficient 0.1 per
+        memory, scales with the number of PKM layers).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Why a collapsed PKM keeps its utility (Oct 23)}
+Memory output replaced by its mean or by zero at evaluation, test N@10 change:
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{|l|c|c|c|}
+\hline
+model & output vs input & token variation & mean / zero \\
+\hline
+collapsed, seed 2 & 0 (exactly) & none & 0 / 0 \\
+collapsed, seed 3 & 71{,}000$\times$ & none & 0 / +0.6\% \\
+balanced, seed 2  & 0.21$\times$ & strong & $-$0.2 / +0.3\% \\
+balanced, seed 3  & 0.17$\times$ & strong & $-$0.2 / $-$1.2\% \\
+\hline
+\end{tabular}
+\end{center}
+\begin{itemize}
+  \item A collapsed memory outputs the same constant for every token: no token
+        information; the residual connection carries the network around it.
+  \item Even the balanced memory's rich output can be removed for $\leq$1.2\%:
+        this FFN position matters little for Beauty's ranking.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Decisions (Oct 23)}
+\begin{itemize}
+  \item \textbf{Framing:} this is the PKM paper; we change the architecture. F+R
+        and NAU are the unlearning algorithms run on each architecture; MUNKEY is the architectural baseline.
+  \item Headline: item memory; the collapse fix is a supporting result.
+  \item Dropped: emphasis, zero-shot item deletion, local repair.
+  \item MUNKEY setting chosen on validation; epoch selection stays off.
+  \item \textbf{Paper grid running:} plain + item memory on 3 target strata
+        $\times$ 5 data seeds (24 new trainings, references per cell).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Decisions pending (Oct 23, now decided: see above)}
+\begin{enumerate}
+  \item \textbf{Emphasis:} drop it and present item memory + standard
+        unlearning (F+R / NAU), or tune it (milder backbone damping, more epochs)?
+  \item \textbf{Contribution:} the item-memory architecture (utility lead that
+        survives unlearning), the collapse fix (separable PKM), or both?
+  \item \textbf{MUNKEY baseline:} which pathway-dropout setting to report
+        (0 / 0.1 / 0.2 differ in utility and removal)?
+  \item \textbf{Paper grid:} extend plain + item memory to data seeds 7, 11
+        and the unpopular / popular targets (about 16 trainings)?
+\end{enumerate}
+\end{frame}
+
+\begin{frame}{Decisions pending (Oct 23, cont.)}
+\begin{enumerate}
+  \setcounter{enumi}{4}
+  \item \textbf{Second dataset:} the Sports attack did not land at the mid
+        target; try another target stratum there, or use Toys?
+  \item \textbf{Drop} zero-shot item deletion and local repair (both inert)?
+  \item \textbf{Validation-based epoch selection:} keep it off (it picks the
+        fixed 4 epochs for full unlearning)?
+  \item \textbf{Sensitive scenario:} when to resume it?
+\end{enumerate}
+\end{frame}
+
+\end{document}
+
+
+

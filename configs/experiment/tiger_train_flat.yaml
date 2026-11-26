@@ -314,7 +314,8 @@ model:
     # --- anti-collapse knobs (see WORKFLOW_PKM.md section H/M) ---
     # Trained-in PKMs COLLAPSE: every token and head selects the same 32 slots
     # (0.012-0.049% utilisation, measured across all 8 encoder/decoder layouts).
-    # query_norm: none (default) | batchnorm | layernorm.
+    # query_norm: batchnorm (DEFAULT since 2026-10-20, with the switch balance loss
+    # below; together they fix the collapse) | none (the old default) | layernorm.
     #   batchnorm uses track_running_stats=False, so batch stats apply at train
     #   AND eval -- the padding-corrupted running stats that motivated leaving
     #   query_batchnorm=false never exist. Measured: it drives the token-SHARED
@@ -324,7 +325,11 @@ model:
     #   ckpt only loads into a query_norm model, and vice versa).
     #   layernorm cannot remove a token-shared direction -- measured slightly
     #   WORSE than none. Kept only for completeness.
-    query_norm: none
+    query_norm: batchnorm
+    # FFN pathway dropout (pkm_mode=add only): per training sequence, w.p. ffn_dropout the
+    # FFN branch is skipped so the memory must carry the layer (pushes instance-specific
+    # information into the memory, MUNKEY-style). 0 = off.
+    ffn_dropout: 0.0
     # Dense-ish warm-up: read warmup_knn slots per head for the first
     # warmup_steps TRAINING forward passes, then revert to knn. At init the
     # values are random, so routing barely affects the loss -> no gradient
@@ -343,6 +348,18 @@ model:
     # so warmup_knn is now hard-capped at 64.
     warmup_noise: 0.0
     warmup_steps: 0
+    # Memory (pathway) dropout, after MUNKEY (arXiv:2603.15033): in training each
+    # sequence's whole PKM read is replaced by a learned null vector with this
+    # probability, so the backbone works without a user's memory contribution --
+    # the state memory-only unlearning creates. 0 = off. Training only; the
+    # null_value param it adds is unused at eval (strict=False loads ignore it).
+    memory_dropout: 0.0
+    # Item-addressed slots (hybrid addressing, MUNKEY-style per-instance keys):
+    # every item owns a private block of item_slots slots (own keys/values) read
+    # by its tokens IN ADDITION to the shared content-routed read, so an item's
+    # slots are exclusive by construction. Encoder placements only (during beam
+    # search the generated item is unknown). 0 = off.
+    item_slots: 0
   # Optional separate optimizer param group for the PKM parameters (memory
   # keys/values + query net). null (default) => PKM shares the single global
   # optimizer group. Set a dict of per-group optimizer kwargs to give PKM its
@@ -369,6 +386,8 @@ model:
   # token b; w = token_entropy_weight, default 1 => log n_keys - mutual info).
   # w=0 is the plain marginal-entropy loss, which can be satisfied by flat,
   # identical routing for every token (i.e. still collapsed), hence w=1.
+  # Optional anneal: anneal_start / anneal_steps (optimizer steps) linearly take the
+  # coefficient to 0 (0 = constant).
   # Logs pkm/balance_loss and pkm/eff_subkeys_{batch,token}/<layer> (exp of the
   # entropies). e.g. 'model.pkm_balance={coef:0.01}'
   # kind: mi (default, above) | switch: n_keys * sum_i f_i P_i on the HARD top-knn
@@ -376,7 +395,62 @@ model:
   # scores). mi is NOT scale-invariant: it measured either inert (flat scores) or
   # sharpening tokens instead of spreading them (2026-10-08). Logs
   # pkm/eff_subkeys_assigned = exp H(f). e.g. 'model.pkm_balance={coef:0.01,kind:switch}'
-  pkm_balance: null
+  # DEFAULT since 2026-10-20: switch at coef 0.1 + query_norm=batchnorm (165k of 262k
+  # slots read vs 32, same N@10; must stay on, annealing it re-collapses). Only
+  # active when pkm_layers is set. Old behaviour: PKM_BALANCE=off in
+  # run_tiger_train.sh (= model.pkm_balance=null model.pkm_params.query_norm=none).
+  # NOTE: Hydra MERGES a dict override into this default, so
+  # 'model.pkm_balance={coef:0.01}' keeps kind=switch. For the mi kind pass kind:mi;
+  # model.pkm_balance=null turns it off (assigning a dict to null does not merge).
+  # reduction sum (default since 2026-10-26): coef is PER MEMORY, so multi-layer layouts
+  # get the same per-layer pressure as one layer (the old mean gave each of n memories
+  # coef / n: ALL at 0.1 collapsed to 2-3% of slots per encoder layer, 0.8 fixed it).
+  # Configs without the key (all runs before 2026-10-26) keep mean.
+  pkm_balance: {coef: 0.1, kind: switch, reduction: sum}
+  # Item-keyed exemplar memory (MUNKEY-style, src/models/components/network_blocks/
+  # item_memory.py). One learnable entry per item, added to the item's input SID
+  # tokens; trained with pathway dropout (p_drop -> learned null) and neighbour
+  # substitution (p_nbr -> softmax(sim/tau)-weighted stop-grad average of
+  # K'~U{1..max_neighbors} nearest items by a FROZEN item embedding). Unlearning
+  # can then emphasise the forget items' entries (unlearning.item_memory_*).
+  # Output side: score_loss_weight > 0 trains s_i(h0) = <h0, W v_i> (h0 = decoder
+  # state after BOS) with a sampled softmax over score_negatives random items
+  # (temperature score_tau); score_weight > 0 reranks the final beams by
+  # log p_beam + score_weight * s_i. Then an item's own entry shapes how strongly
+  # IT is recommended, which is the lever unlearning needs for a spam target.
+  # consistency_weight > 0 adds KL(stopgrad(p_own) || p_nbr), p_nbr = prediction
+  # with every entry swapped for its neighbour average (detached): trains the
+  # backbone so neighbour substitution stays a good prediction (one extra forward).
+  # e.g. 'model.item_memory={embedding_path:embeddings/beauty_merged_predictions_tensor_latest.pt,p_drop:0.1,p_nbr:0.2}'
+  item_memory: null
+  # Category memory keyed by the first SID level (item_memory.py GroupMemory): each group
+  # (level-0 code) owns `slots` key/value pairs; every history item reads the top-`knn`
+  # slots of its group by content and the result is added to its SID tokens.
+  # e.g. 'model.group_memory={slots:32,knn:4,key_dim:64}'
+  group_memory: null
+  # User-keyed exemplar memory: one learnable token per training user, prepended
+  # to the encoder input (replaces the hashed user embedding; needs
+  # num_user_bins=null). Neighbour users come from neighbor_file
+  # (scripts/build_user_neighbors.py: frozen history-embedding keys). Training
+  # w.p. p_drop -> learned null token, w.p. p_nbr -> softmax(sim/tau)-weighted
+  # stop-grad average of K'~U{1..K} neighbour users' tokens, else own token.
+  # p_hist > 0: MUNKEY's categorical pathway mask -- w.p. p_hist the WHOLE
+  # history is replaced by a learned null token (predict from the user token
+  # alone), w.p. p_drop the token is nulled, never both (p_hist + p_drop < 1).
+  # e.g. 'model.user_memory={neighbor_file:embeddings/user_neighbors/beauty_clean.pt,p_drop:0.1,p_nbr:0.2}'
+  user_memory: null
+  # MUNKEY baseline (src/models/components/network_blocks/munkey_memory.py, ported
+  # from the authors' code in MUNKEY/): one token_dim token per training USER,
+  # adapter to the model width, prepended to the encoder input. Keys: frozen
+  # text-embedding mean of the history (key_file from build_user_neighbors.py
+  # --save_keys; eval queries computed from the input with item_embedding_path).
+  # Training, once per batch: w.p. p_retrieval the token is the softmax(sim/tau)
+  # mix of K'~U{2..topk} neighbours (batch excluded, neighbours detached), else the
+  # own token; w.p. p_token_drop -> null token, w.p. p_hist_drop -> history masked.
+  # Eval: always retrieval (top-topk; own instance excluded if eval_exclude_self).
+  # Unlearning: unlearning.munkey_delete (+ zero_shot) deletes the forget users' keys.
+  # e.g. 'model.munkey_memory={key_file:embeddings/user_keys/beauty_spam.pt,item_embedding_path:embeddings/beauty_merged_predictions_tensor_latest.pt,p_retrieval:0.2}'
+  munkey_memory: null
 callbacks:
   model_checkpoint:
     _target_: lightning.pytorch.callbacks.ModelCheckpoint

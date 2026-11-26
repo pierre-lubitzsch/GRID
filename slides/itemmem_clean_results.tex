@@ -1,0 +1,440 @@
+\documentclass{beamer}
+
+\usetheme{metropolis}
+
+% Item memory results deck (GRID/item_memory_cur.md), 2026-11-16.
+% Clean: scripts/itemmem_clean_summary.py --recipe {es,gp40rk}
+% Poisoned ablation: scripts/itemmem_ablation_table.py
+\usepackage{xcolor}
+\usepackage{array}
+\usepackage{booktabs}
+
+\hypersetup{colorlinks=true, urlcolor=blue}
+
+\newcommand{\up}[1]{\textcolor{green!45!black}{#1}}
+\newcommand{\dn}[1]{\textcolor{red!70!black}{#1}}
+\newcommand{\na}{\textcolor{gray}{n/a}}
+
+\title{Item Memory vs.\ Plain TIGER}
+\subtitle{Clean-data study and architecture ablation on poisoned data}
+\date{November 16, 2026}
+
+\begin{document}
+
+\maketitle
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Question and setup}
+\begin{itemize}
+  \item \textbf{Clean data:} does adding an item memory to TIGER improve
+        next-item recommendation (no poisoning, no unlearning)?
+  \item \textbf{Poisoned data:} which part of the architecture gives the
+        gain, does it survive unlearning, and where does the spam live?
+  \item \textbf{Data:} Amazon Beauty, Sports, Toys (5-core, leave-last-out split).
+  \item \textbf{Seeds:} 2, 3, 5, 7, 11.
+  \item \textbf{Metrics:} test NDCG@10 (N@10), higher is better; on poisoned
+        data also SH@10 (spam hit rate), lower is better.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{What the rows mean: model variants}
+All variants share the same TIGER backbone (T5 encoder-decoder, 4 + 4 layers,
+$d_{\text{model}}=128$, 4 semantic-ID tokens per item, beam search).
+\medskip
+
+\small
+\begin{tabular}{@{}l p{0.78\linewidth}@{}}
+\toprule
+\textbf{plain}  & TIGER as is. The baseline. \\
+\textbf{im}     & plain + \textbf{item memory}: one learned 128-d vector per
+                  item, mapped by a small adapter and added to that item's
+                  input token embeddings. Trained with memory dropout (10\%
+                  null vector) and neighbor mixing (20\%, text-embedding kNN). \\
+\textbf{imc}    & im + a \textbf{consistency} loss (KL, weight 0.1) that keeps
+                  predictions with and without memory close. \\
+\textbf{imfree} & im \textbf{without} dropout and neighbor mixing. Capacity
+                  control: same extra parameters, no regularization. \\
+\bottomrule
+\end{tabular}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{What the columns mean: recipes and reporting}
+\small
+\begin{tabular}{@{}l p{0.76\linewidth}@{}}
+\toprule
+\textbf{\_es}     & Our repo recipe: Adam, lr $10^{-3}$, batch 1024, early
+                    stopping on validation Recall@5 (patience 10 checks),
+                    semantic IDs from our RQ-VAE. \\
+\textbf{\_gp40rk} & GRID paper recipe: Adam, lr $5\cdot10^{-4}$, batch 256,
+                    early stopping on validation N@10 with patience
+                    \textbf{40} checks, semantic IDs from \textbf{RK}-Means. \\
+\midrule
+\textbf{mean}     & Mean test N@10 over finished seeds. \\
+\textbf{gain}     & Paired gain vs.\ plain: per seed, (variant $-$ plain) / plain,
+                    then averaged; only seeds where both finished. \\
+\textbf{worst}    & Smallest per-seed gain (is it positive on every seed?). \\
+\textbf{memory off} & Same trained model evaluated with the null vector in
+                    place of every item's memory: how much the model leans
+                    on the memory. \\
+\bottomrule
+\end{tabular}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Clean data, recipe \_es: test N@10}
+\centering
+\begin{tabular}{lcccc}
+\toprule
+        & plain & im & imc & imfree \\
+\midrule
+Beauty  & .0328 & .0376 & \textbf{.0377} & .0324 \\
+Sports  & .0168 & \textbf{.0177} & .0175 & .0130 \\
+Toys    & .0302 & .0377 & \textbf{.0381} & .0321 \\
+\bottomrule
+\end{tabular}
+
+\medskip
+{\small Gain vs.\ plain in \%, worst seed in parentheses}\par\smallskip
+\begin{tabular}{lccc}
+\toprule
+       & im & imc & imfree \\
+\midrule
+Beauty & \up{+14.7} (+11.8) & \up{+15.1} (+9.9)  & \dn{$-$1.0} ($-$5.5) \\
+Sports & \up{+5.9} (\dn{$-$11.7}) & \up{+5.0} (\dn{$-$9.1}) & \dn{$-$22.2} ($-$31.5) \\
+Toys   & \up{+24.9} (+13.4) & \up{+26.2} (+21.4) & \up{+6.4} (+2.1) \\
+\bottomrule
+\end{tabular}
+
+\bigskip
+\footnotesize All cells: 5 seeds (2, 3, 5, 7, 11).
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Clean data, recipe \_gp40rk: test N@10}
+\centering
+\begin{tabular}{lccc}
+\toprule
+        & plain & im & imc \\
+\midrule
+Beauty  & .0337 & .0404 & .0404 \\
+Sports  & .0188 & \textbf{.0208} & .0203 \\
+Toys    & .0304 & .0381 & .0381 \\
+\bottomrule
+\end{tabular}
+
+\medskip
+{\small Gain vs.\ plain in \%, worst seed in parentheses}\par\smallskip
+\begin{tabular}{lcc}
+\toprule
+       & im & imc \\
+\midrule
+Beauty & \up{+20.3} (+7.5)  & \up{+20.1} (+13.0) \\
+Sports & \up{+10.7} (\dn{$-$0.4}) & \up{+8.2} (\dn{$-$8.8}) \\
+Toys   & \up{+25.3} (+20.7) & \up{+25.4} (+19.1) \\
+\bottomrule
+\end{tabular}
+
+\bigskip
+\footnotesize All cells: 5 seeds. imfree was not run with this recipe.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Clean data, memory off: does the model use the memory?}
+\centering
+\small
+\begin{tabular}{llcccc}
+\toprule
+       &        & \multicolumn{2}{c}{im} & \multicolumn{2}{c}{imc} \\
+recipe & data   & on & off & on & off \\
+\midrule
+\_es     & Beauty & .0376 & .0268 & .0377 & .0288 \\
+         & Sports & .0177 & .0117 & .0175 & .0125 \\
+         & Toys   & .0377 & .0226 & .0381 & .0237 \\
+\midrule
+\_gp40rk & Beauty & .0404 & .0314 & .0404 & .0332 \\
+         & Sports & .0208 & .0144 & .0203 & .0160 \\
+         & Toys   & .0381 & .0273 & .0381 & .0286 \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{itemize}\footnotesize
+  \item Memory off lowers N@10 by 18 to 40\%: the memory is used.
+  \item imc keeps more without memory, as its consistency loss intends.
+  \item imfree (\_es) collapses without memory: .0087 / .0055 / .0056.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Is our plain TIGER too weak?}
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+plain TIGER, test N@10            & Beauty & Sports & Toys \\
+\midrule
+TIGER paper (no code released)    & .0384 & .0225 & .0432 \\
+GRID library (5 runs, GBLA paper) & .0355 & .0188 & .0333 \\
+LIGER (own reimplementation)      & .0322 & .0199 & .0295 \\
+community ports (Beauty)          & .0319 to .0354 & & \\
+\midrule
+ours \_es                         & .0328 & .0168 & .0302 \\
+ours \_gp40rk                     & .0337 & .0188 & .0304 \\
+\midrule
+ours \textbf{imc \_gp40rk}        & \textbf{.0404} & .0203 & .0381 \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{itemize}\footnotesize
+  \item Our plain is within the range of independent reproductions; only the
+        original paper is clearly higher, and nobody has matched it.
+  \item imc on Beauty beats every published plain TIGER number.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Poisoned data: the architecture ladder}
+\small
+\begin{tabular}{@{}l p{0.74\linewidth}@{}}
+\toprule
+\textbf{+ score}       & output-side item score $\langle h, W_{\text{out}} v_i\rangle$
+                         from the same memory, trained with a sampled softmax,
+                         used to rerank the beam. \\
+\textbf{+ consistency} & the KL consistency loss of imc. \\
+\textbf{score only}    & plain + the score head, no input memory (control:
+                         is the gain just a reranker?). \\
+\midrule
+\textbf{setup}         & Beauty with 1\% bandwagon spam on one target item;
+                         3 target strata (unpopular, mid, popular) $\times$ 5
+                         data seeds = 15 cells; 4000 training steps. \\
+\textbf{unlearning}    & full deletion of the fake users with F+R or NAU. \\
+\textbf{SH@10}         & share of test users whose top 10 contains the spam
+                         target. Lower is better. \\
+\bottomrule
+\end{tabular}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Poisoned data: before and after unlearning}
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+                         & \multicolumn{2}{c}{before} & \multicolumn{2}{c}{after, N@10} \\
+architecture             & N@10 & SH@10 & F+R & NAU \\
+\midrule
+TIGER                    & .0313 & .0112 & .0319 & .0319 \\
++ item memory            & .0360 & .0097 & .0366 & .0365 \\
++ memory + score         & .0375 & .0121 & .0380 & .0380 \\
++ memory + score + cons. & \textbf{.0379} & .0132 & \textbf{.0380} & \textbf{.0382} \\
+\midrule
++ memory + cons.         & .0358 & .0131 & .0365 & .0365 \\
+score only (control)     & .0337 & .0133 & .0339 & .0340 \\
+\bottomrule
+\end{tabular}
+
+\bigskip
+\footnotesize Mean over all 15 cells. SH@10 after unlearning: .0000 to .0001
+for every architecture.
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Poisoned data: gain vs.\ TIGER}
+\centering
+\begin{tabular}{lccc}
+\toprule
+gain in \%               & before & after F+R & after NAU \\
+\midrule
++ item memory          & \up{+15.2} & \up{+14.9} & \up{+14.9} \\
++ memory + score         & \up{+19.9} & \up{+19.2} & \up{+19.4} \\
++ memory + score + cons. & \up{+21.4} & \up{+19.4} & \up{+20.1} \\
+score only (control)     & \up{+7.9}  & \up{+6.2}  & \up{+6.8} \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{itemize}\small
+  \item The memory gives most of the gain; the score adds about 5 points;
+        consistency adds nothing measurable (within seed noise).
+  \item The score alone is a weak reranker (+8\%, one cell below TIGER).
+  \item The gains survive both unlearning methods almost unchanged.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Poisoned data: memory off at inference (N@10)}
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+                         & \multicolumn{2}{c}{before} & \multicolumn{2}{c}{after F+R} \\
+memory                   & on & off & on & off \\
+\midrule
++ item memory            & .0360 & .0253 & .0366 & .0260 \\
++ memory + cons.         & .0358 & \textbf{.0265} & .0365 & \textbf{.0272} \\
+\midrule
++ memory + score         & .0375 & .0255 & .0380 & .0259 \\
++ memory + score + cons. & .0379 & \textbf{.0270} & .0380 & \textbf{.0271} \\
+\midrule
+score only (score off)   & .0337 & .0328 & .0339 & .0331 \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{itemize}\footnotesize
+  \item Memory contribution: 26 to 32\% of N@10, unchanged by unlearning.
+        The score adds only about 3\% and never changes SH.
+  \item \textbf{Consistency keeps 5 to 6\% more N@10 with memory off}
+        (higher in 10/15 cells without score, 13/15 with score), although
+        it does not change accuracy with memory on.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Poisoned data: memory off at inference (SH@10)}
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+                         & \multicolumn{2}{c}{before} & \multicolumn{2}{c}{after F+R} \\
+memory                   & on & off & on & off \\
+\midrule
++ item memory            & .0097 & \dn{.0343} & .0001 & .0002 \\
++ memory + cons.         & .0131 & \dn{.0365} & .0001 & .0003 \\
++ memory + score         & .0121 & \dn{.0377} & .0001 & .0004 \\
++ memory + score + cons. & .0132 & \dn{.0345} & .0001 & .0003 \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{itemize}\footnotesize
+  \item \textbf{Memory off roughly triples SH before unlearning:} the spam
+        is in the backbone, and the memory holds it back.
+  \item \textbf{After unlearning SH stays near 0 with memory off} (F+R and
+        NAU): the spam is removed from the backbone, not hidden behind the
+        memory.
+  \item All 15 cells per row.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Statistics: poisoned data (before unlearning)}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccc}
+\toprule
+comparison & gain (\%) [95\% CI] & wins & $p$ \\
+\midrule
++ item memory vs TIGER          & \up{+15.2} [12.5, 17.7] & 15/15 & $6\cdot10^{-5}$ \\
++ mem. + score + cons. vs TIGER & \up{+21.4} [18.0, 24.8] & 15/15 & $6\cdot10^{-5}$ \\
+score only vs TIGER             & \up{+7.9} [5.1, 10.5]   & 14/15 & $3\cdot10^{-4}$ \\
+score on top of memory          & \up{+4.1} [2.9, 5.4]    & 15/15 & $6\cdot10^{-5}$ \\
+cons.\ (imc vs im)              & $-0.4$ [$-2.2$, 1.4]    & 6/15  & 0.60 \\
+cons.\ (imc vs im), mem.\ off   & \up{+5.2} [1.1, 9.9]    & 10/15 & 0.048 \\
+cons.\ (imsc vs ims), mem.\ off & \up{+6.2} [3.4, 9.0]    & 13/15 & 0.002 \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{itemize}\footnotesize
+  \item 15 paired cells (3 strata $\times$ 5 data seeds). Gain = mean
+        relative N@10 gain; CI from 10k bootstrap resamples of the cells;
+        $p$ = two-sided Wilcoxon signed-rank ($6\cdot10^{-5}$ is the
+        smallest possible with 15 pairs). Paired $t$-tests agree.
+  \item Same picture after F+R and NAU: every gain vs TIGER has
+        $p\le6\cdot10^{-4}$; consistency with memory off $p\le0.05$.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Statistics: clean data (3 datasets $\times$ 5 seeds pooled)}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llccc}
+\toprule
+recipe & comparison & gain (\%) [95\% CI] & wins & $p$ \\
+\midrule
+\_es     & im vs plain            & \up{+15.2} [8.8, 21.0]  & 13/15 & $6\cdot10^{-4}$ \\
+         & imc vs plain           & \up{+15.4} [9.7, 21.0]  & 13/15 & $4\cdot10^{-4}$ \\
+         & imc vs im              & +0.4 [$-1.6$, 2.3]      & 7/15  & 0.80 \\
+         & imc vs im, memory off  & \up{+6.7} [4.1, 9.2]    & 13/15 & 0.001 \\
+\midrule
+\_gp40rk & im vs plain            & \up{+18.8} [14.0, 23.2] & 14/15 & $1\cdot10^{-4}$ \\
+         & imc vs plain           & \up{+17.9} [12.7, 22.7] & 14/15 & $1\cdot10^{-4}$ \\
+         & imc vs im              & $-0.8$ [$-2.5$, 0.9]    & 7/15  & 0.60 \\
+         & imc vs im, memory off  & \up{+7.4} [4.3, 11.3]   & 14/15 & $2\cdot10^{-4}$ \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{itemize}\footnotesize
+  \item Per dataset (5 seeds): Beauty and Toys significant under both
+        recipes ($t$-test $p<0.01$); Sports only under \_gp40rk
+        (+10.7\%, $p=0.03$), its \_es CI crosses 0.
+  \item The memory-off robustness of consistency holds on clean data too,
+        on all 3 datasets.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Plan: experiments}
+\footnotesize
+\begin{enumerate}
+  \item \textbf{Second dataset (running):} the poisoned ablation on Toys,
+        5 architectures $\times$ 15 cells, before / F+R / NAU, memory on/off,
+        with the same statistics. Sports stays in the clean table only.
+  \item \textbf{MUNKEY on the grid:} the architectural ``unlearning by
+        design'' baseline, so far only on one cell (mid, seed 2). Rows:
+        key deletion alone, key deletion + F+R, F+R, NAU.
+  \item \textbf{Retrained references:} the gold standard for every cell;
+        12 of 15 Beauty cells exist (plain, imsc); add the last 3 and Toys.
+  \item \textbf{Generality (meeting 18.08):} a second attack (clone-inject,
+        seed 2) on TIGER, + memory, + memory + score + consistency.
+  \item \textbf{Privacy (meeting 31.07):} forget-only F+R (no retain data,
+        no rehearsal) on a subset of cells; does the memory help there?
+\end{enumerate}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Plan: positioning and writing}
+\footnotesize
+\begin{itemize}
+  \item \textbf{Story:} the architecture gives +15 to 21\% N@10 that
+        survives unlearning; the spam lives in the backbone and unlearning
+        removes it there (memory-off check); consistency = robustness.
+        Do not overclaim the memory as the place where forgetting happens.
+  \item \textbf{ComeIR (arXiv 2605.11447):} related work. Its memory is
+        hashed and shared across items, so deletion cannot be localized;
+        ours has one row per item. A ComeIR-style row is optional.
+  \item \textbf{Main tables:} the architecture ablation (Beauty, Toys) with
+        CIs and $p$-values; clean results on 3 datasets and 2 recipes;
+        memory-off before / after unlearning.
+  \item \textbf{Order:} Toys $\rightarrow$ MUNKEY $\rightarrow$ references
+        $\rightarrow$ second attack $\rightarrow$ forget-only $\rightarrow$
+        write; ComeIR row only if time allows.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Takeaways}
+\begin{itemize}
+  \item Clean data: im and imc beat plain on all 3 datasets under both
+        recipes. Strong on Beauty (+15 to 20\%) and Toys (+25\%), weak on
+        Sports (+5 to 11\%, some seeds below plain).
+  \item The gain is \textbf{not} extra capacity: imfree has the same
+        parameters and is at or below plain (except Toys, +6.4\%).
+  \item Poisoned data: the memory gives most of the gain (+15\%), the score
+        adds 5 points. The score alone gives +8\%.
+  \item Gains survive F+R and NAU; every architecture forgets the spam.
+  \item Consistency adds no accuracy, but makes the model degrade more
+        gracefully when the memory is missing.
+  \item The spam lives in the backbone, not in the memory rows.
+\end{itemize}
+\end{frame}
+
+\end{document}

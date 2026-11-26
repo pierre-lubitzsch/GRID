@@ -1,0 +1,341 @@
+\documentclass{beamer}
+
+\usetheme{metropolis}
+
+% Summary of progress_v2.tex (PKM + item memory), status 2026-10-27.
+% Plain tabular + \hline, as in progress_v2.tex.
+\usepackage{xcolor}
+\usepackage{array}
+
+\hypersetup{colorlinks=true, urlcolor=blue}
+
+\newcommand{\pierre}[1]{\textcolor{cyan}{#1}}
+% shrink a table to the line width only when it is wider
+\newcommand{\fit}[1]{\resizebox{\ifdim\width>\linewidth\linewidth\else\width\fi}{!}{#1}}
+
+\title{PKM and Item Memory: Status Summary}
+\subtitle{Spam unlearning for generative recommendation (condensed from progress\_v2)}
+\date{October 27, 2026}
+
+\begin{document}
+
+\maketitle
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Setup}
+\begin{itemize}
+  \item \textbf{Model:} TIGER, $d_{\text{model}}=128$, 4 encoder and 4 decoder
+        blocks, RQ semantic IDs ($L=4$, width 256), trained from scratch.
+  \item \textbf{Attack:} bandwagon, 1\% fake users, one target; Beauty
+        (target stratum \texttt{mid} unless stated).
+  \item \textbf{Metrics:} SH@10 (spam exposure), N@10 (utility),
+        UR $=$ N@10 / own clean N@10,
+        removal $= 1 - \text{SH}_{\text{after}}/\text{SH}_{\text{before}}$.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Unlearning recipes and reference points}
+\begin{itemize}
+  \item \textbf{Forget+Repair (F+R):} $\lambda_f=0.1$, $\lambda_s=\lambda_n=0$.
+  \item \textbf{NAU:} $\lambda_f=0.1$, $\lambda_s=\lambda_n=0.01$,
+        8 text-embedding neighbors.
+\end{itemize}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|c|c|}
+\hline
+model (Beauty, retrained reference) & N@10 & SH@10 \\
+\hline
+plain TIGER       & .0305 & 0 \\
+item memory       & .0363 & 0 \\
+balanced PKM (E1) & .0301 & 0 \\
+\hline
+\end{tabular}}
+\end{center}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Post-hoc PKM: removal comes from the rebuild}
+Replace the first two decoder FFNs (\texttt{d01}), retrain on retain data,
+backbone frozen.
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|c|c|c|}
+\hline
+arm & SH@10 & removal & UR \\
+\hline
+poisoned                         & .01274 & n/a    & 0.962 \\
+full-model \texttt{unified}      & .00411 & 67\%   & 1.013 \\
+PKM \texttt{d01} + rebuild       & .00013 & 99.0\% & 0.995 \\
+fresh FFN \texttt{d01} (control) & .00022 & 98.2\% & 0.995 \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item PKM and a fresh FFN \textbf{tie} (the FFN has 1/25 of the parameters).
+  \item Encoder placements remove nothing.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Post-hoc PKM: PKM buys speed, not quality}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|c|c|c|}
+\hline
+PKM / FFN & SH@10 & removal & UR \\
+\hline
+200 steps                 & .00555 / .00863 & 57 / 32\%  & 0.977 / 0.966 \\
+600 steps                 & .00148 / .00523 & 88 / 59\%  & 0.989 / 0.979 \\
+\texttt{dall} @2000 steps & .00000 / .00009 & 100 / 99\% & 0.891 / \textbf{0.964} \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item PKM converges in 1560 vs.\ 3320 steps.
+  \item With heavy damage (all 4 decoder layers) the FFN wins.
+  \item Sequential requests (1, 5, 10 chunks): no drift for either.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Trained-in PKM: the memory collapses}
+\begin{itemize}
+  \item Trained jointly from the start, every PKM reads the \textbf{same 32 of
+        262{,}144 slots} for every token.
+  \item Jaccard 1.0 between forget and retain reads, no forget-exclusive slots.
+  \item Holds in all 8 encoder and decoder layouts.
+  \item The memory outputs a constant; the residual carries the network.
+  \item Collapse is a \textbf{routing} problem: giving every value a gradient
+        (dense updates) does not change the router's incentive.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Trained-in PKM: fixes tried}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|c|c|c|c|}
+\hline
+fix (E1, Beauty) & retain slots & Jaccard & forget-excl. & N@10 \\
+\hline
+none (collapsed)           & \alert{32} & 1.00 & 0    & .0307 \\
+dense updates, $p \le 0.5$ & 32 to 1.2k & n/a  & 0    & n/a \\
+batchnorm query only       & 2.5k       & 0.71 & 107  & .0303 \\
+MI balance, coef 0.1       & 2.4k       & 0.84 & 65   & .0328 \\
+switch, coef 0.1           & 63k        & 0.68 & 2.6k & .0322 \\
+\textbf{switch + batchnorm} & \textbf{92k} & \textbf{0.43} & 16.7k$^*$ & .0305 \\
+\hline
+\end{tabular}}
+\end{center}
+{\footnotesize $^*$ retain subset; on the full retain set only 98 slots are
+forget-exclusive (165k slots read, 63\%).}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{The switch loss}
+Load balancing on the hard top-$k$ assignment, per head and sub-key half
+($n = 512$ sub-keys):
+\[
+  \mathcal{L}_{\text{switch}} = n \sum_i f_i P_i
+\]
+\begin{itemize}
+  \item $f_i$: share of top-$k$ assignments to sub-key $i$ (counted).
+  \item $P_i$: mean softmax on \textbf{per-token standardized} scores, so it
+        cannot be satisfied by shrinking all scores.
+  \item Default now: coef 0.1 per memory (summed over memories) + batchnorm query.
+  \item \textbf{Needed throughout:} annealing it away re-collapses (128 slots);
+        raw (unstandardized) $P$ also collapses.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{The switch loss: utility}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|c|c|c|}
+\hline
+setting & slots read & N@10 collapsed & N@10 switch \\
+\hline
+Beauty E1, seed 2   & 63\%      & .0307 & .0305 \\
+Beauty E1, seed 3   & 56\%      & .0318 & .0320 \\
+Beauty E1, seed 4   & 47\%      & .0326 & .0328 \\
+clean data          & n/a       & .0321 & .0313 ($-$2.5\%) \\
+decoder D01 (1 seed) & 21k / 24k & .0314 & .0299 ($-$4.8\%) \\
+Sports E1 (1 seed)  & 56k       & .0209 & .0188 ($-$10\%) \\
+all 8 FFNs, coef 0.8 & 9 to 29\% & n/a  & .0315 \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item Utility-neutral on Beauty E1 (inside seed noise); the decoder and
+        Sports costs are single runs.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{A healthy memory does not localize the spam}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|c|c|}
+\hline
+E1, paper recipes (N@10 / SH@10) & full model F+R & memory only F+R \\
+\hline
+collapsed, seed 2 (before .0293/.0091) & .0304 / 0     & .0297 / .0057 \\
+balanced, seed 2 (before .0309/.0161)  & .0313 / .0001 & .0306 / .0116 \\
+balanced, seed 3 (before .0310/.0086)  & .0327 / 0     & .0313 / .0076 \\
+\hline
+\end{tabular}}
+
+\medskip
+\fit{\begin{tabular}{|l|c|c|}
+\hline
+slots deleted at eval (N@10 / SH change) & E1 & all 8 \\
+\hline
+strictly forget-exclusive  & 0 / 0           & 0 / 0 \\
+every slot fake users read & $-$0.4\% / $-$13\% & +1.4\% / $-$2\% \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item Memory-only unlearning removes only 10 to 35\%; the earlier success
+        needed $\lambda_s = 1$.
+  \item The spam lives in attention and the backbone, not in the slots: a
+        routing loss cannot make it separable.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Item memory: design and settings}
+One learnable entry $v_i$ per item, through a linear adapter, \textbf{added to all
+SID token embeddings} of that item at the encoder input (MUNKEY-style, item- not
+instance-keyed).
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|l|l|}
+\hline
+arm & what it adds & settings \\
+\hline
+\texttt{im}     & item memory (input side) & $p_{drop}$ 0.1 (null token), $p_{nbr}$ 0.2, \\
+                &                          & 1 to 4 text-embedding neighbors, $\tau$ 0.1 \\
+\texttt{imc}    & + consistency KL         & weight 0.1, KL(sg($p_{own}$) $\|$ $p_{nbr}$) \\
+\texttt{ims}    & + output score $s_i = \langle h_0, W v_i \rangle$ & loss 1.0, 255 negatives, \\
+                & reranks the beams        & rerank weight 1.0 \\
+\texttt{imsc}   & score + consistency      & as above \\
+\texttt{imfree} & capacity control (new)   & $p_{drop} = p_{nbr} = 0$ \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item Inference ablations: \texttt{eval\_pathway=null} (memory off),
+        \texttt{score\_weight=0} (no rerank), \texttt{input\_term=false} (score only).
+  \item Neighbors: frozen text embeddings; neighbor values detached.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Item memory: results so far (poisoned Beauty)}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|c|c|}
+\hline
+model (seed 2, before unlearning) & N@10 & SH@10 \\
+\hline
+plain TIGER                    & .0315 & .0126 \\
+\texttt{im}                    & .0352 & .0120 \\
+\texttt{ims}                   & .0364 & .0200 \\
+\texttt{imsc}                  & \textbf{.0382} & .0120 \\
+\texttt{imsc} + PKM            & .0375 & .0211 \\
+\hline
+\end{tabular}}
+
+\medskip
+\fit{\begin{tabular}{|l|c|c|c|c|}
+\hline
+paper grid, 15 cells & plain & \texttt{imsc} & gain & min / max \\
+\hline
+before deletion & .0313 & .0379 & +21.4\% & +7.9 / +33.6\% \\
+after full F+R  & .0319 & .0381 & +19.5\% & +8.1 / +28.9\% \\
+after full NAU  & .0319 & .0381 & +19.8\% & +8.0 / +28.6\% \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item Both recipes remove the spam on both architectures; the lead survives.
+  \item Zero-shot deletion of the target's entry: SH unchanged (spam is in the
+        backbone). Emphasis, local repair: dropped.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Item memory: is the gain real? (check of Oct 27)}
+\begin{itemize}
+  \item \alert{All item-memory runs stop at \texttt{max\_steps=4000}; neither
+        model has converged.} Beauty seed 2, val N@10:
+\end{itemize}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|c|c|c|c|c|}
+\hline
+step & 1000 & 2000 & 3000 & 3800 & 4000 \\
+\hline
+plain & .0201 & .0320 & .0402 & .0428 & .0432 \\
+\texttt{im} & .0232 & .0370 & .0457 & .0470 & .0474 \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item Early-stopped plain TIGER (main tree, clean, 3 seeds): best at steps
+        4200 to 5400, test N@10 .032 to .034, vs.\ .0313 capped. Part of the
+        +12\% is \textbf{convergence speed}.
+  \item \texttt{imsc} also reranks with an extra score head; \texttt{im} adds
+        one learnable vector per item (\textbf{capacity}).
+  \item Checkpoint choice and configs are otherwise matched.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Running: clean-data item-memory experiment}
+Question: does the item memory improve clean N@10 robustly, or is it seed
+luck and training length?
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|l|}
+\hline
+axis & setting \\
+\hline
+data        & clean Beauty, Sports, Toys (RQ-VAE SIDs, same per dataset) \\
+arms        & plain, \texttt{im}, \texttt{imc}, \texttt{imfree} \\
+seeds       & 2, 3, 5 (then 7, 11 if a gain shows) \\
+training    & no step cap, early stopping (patience 10, val recall@5) \\
+evaluation  & best-val checkpoint; memory on and off (\texttt{null}) \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item 36 trainings queued (2 GPUs, pgpu, $\geq$ 80 GB), each followed by
+        its test evaluation.
+  \item \texttt{imfree} $\approx$ \texttt{im} $\Rightarrow$ the gain is extra
+        parameters; \texttt{im} $>$ \texttt{imfree} $\Rightarrow$ the memory design.
+  \item Deferred: \texttt{imc} and score-only on poisoned data (is lower spam
+        pickup just the rerank?).
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Takeaways and open questions}
+\begin{itemize}
+  \item \textbf{PKM post-hoc:} spam removal is a localized decoder retrain;
+        PKM is a faster implementation, not the mechanism.
+  \item \textbf{Collapse fix:} the standardized switch loss + batchnorm keeps
+        trained-in PKMs healthy (47 to 63\% of slots) at no utility cost on
+        Beauty; it must stay on throughout training.
+  \item \textbf{But} a healthy memory gives no unlearning advantage: the spam
+        is not in the slots.
+  \item \textbf{Item memory:} \texttt{imsc} beats plain in all 15 poisoned
+        Beauty cells (+8 to +34\% N@10), still +8 to +29\% after F+R and NAU, \alert{pending the converged, capacity-controlled
+        clean runs}.
+  \item Open: Sports cost of the switch loss (1 seed, $-$10\%); whether any
+        unlearning algorithm can exploit a separable memory; paper contribution
+        (item memory vs.\ collapse fix).
+\end{itemize}
+\end{frame}
+
+\end{document}

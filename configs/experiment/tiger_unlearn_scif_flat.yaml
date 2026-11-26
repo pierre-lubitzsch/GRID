@@ -274,6 +274,9 @@ unlearning:
   slot_top_t: 32
   slot_lambda: 1.0
   slot_mu: 5.0
+  # protect the top fraction of most RETAIN-used slots from selection (the
+  # continual-learning recipe uses 0.10). 0 = off.
+  slot_protect_frac: 0.0
   slot_dot_abs: false
 
   # --- RQ-ID diagnostics (python -m src.diagnose_rq_ids) ---
@@ -479,6 +482,11 @@ unlearning:
   # guards the log against float error pushing the log-mass above 0.
   # Inert unless coherence_loss_type=suppress.
   coherence_mass_cap: 0.999
+  # (ported from the main branch 2026-10-22, unchanged)
+  # Recompute each neighbour slot's forward pass in backward (gradient checkpointing):
+  # memory no longer grows with neighborhood_count; gradients are unchanged.
+  coherence_checkpoint: false
+  sep_checkpoint: false   # recompute each generative L_sep negative in backward (memory flat in #negatives; same gradients)
   # InfoNCE temperature for L_sep. 0.07 is what EVERY recorded run used --
   # no sweep has ever overridden it. The Jun-2026 slides quote 0.007; that
   # value was never run, and since r_u/z_i are L2-normalised (cosine in
@@ -542,6 +550,43 @@ unlearning:
   #   seif:    number of repair epochs (overrides seif_repair_epochs).
   # null → each algorithm uses its own per-algorithm default.
   n_epochs: null
+  # (ported from the main branch 2026-10-21, unchanged; OFF by default)
+  # Validation-based selection of n_epochs (unified only; replaces n_epochs).
+  # mode=run (default): re-run the WHOLE request sequence from the starting
+  #   weights for n_epochs = min_epochs, min_epochs+1, ... and score each FINAL
+  #   model on the validation split once:
+  #     score = (SH_P - SH_U)/max(SH_P, sh_floor) + lambda_ndcg*(NDCG_U/NDCG_P - 1)
+  #   with P = the starting (poisoned) model, measured in-process; models with
+  #   NDCG_U/NDCG_P < tau_floor rank below all others. Stops after `patience`
+  #   values without improvement (or at max_epochs) and keeps the best model;
+  #   a larger n_epochs must win by more than score_tol.
+  # mode=request: stop inside EACH request after `patience` epochs without
+  #   improvement under the paper's rule (tau_P >= tau_floor, then smallest
+  #   |SH@10 - SH_ref|, then higher tau_P on an SH tie within sh_tie_tol), with
+  #   SH_ref/NDCG_ref from `reference` (retrained: reference_metrics_csv or
+  #   ref_sh/ref_ndcg; original: starting model's NDCG, ref_sh default 0).
+  #   Greedy: early requests over-forget (2026-10-07, beauty/mid seed 2).
+  val_selection:
+    enabled: false
+    mode: run
+    lambda_ndcg: 1.0
+    sh_floor: 0.005
+    # mode=run: a larger n_epochs must beat the best score by MORE than this
+    # to replace it, so near-ties go to fewer epochs (one rerun of n_epochs=4
+    # from a different RNG state moved val NDCG by 2.6% on beauty/mid seed 2).
+    score_tol: 0.01
+    data_folder: ${data_dir}/evaluation
+    reference: retrained
+    reference_metrics_csv: null
+    ref_sh: null
+    ref_ndcg: null
+    tau_floor: 0.95
+    sh_tie_tol: 0.0
+    patience: 2
+    max_epochs: 10
+    min_epochs: 1
+    batch_size: 64
+    max_rows: null
   # lambda_r: weight on the RETAIN (repair) term. 1.0 = current behaviour.
   # Exists so the ascent/descent baselines are exact special cases of this
   # objective instead of separate implementations, which removes every
@@ -564,6 +609,61 @@ unlearning:
   # sid_prefix_length=stable_codes. adaptive_update_backbone additionally lets
   # the shared transformer backbone move (less local, more forget capacity).
   adaptive_codes: false
+  # Item-keyed exemplar memory (model.item_memory, MUNKEY-style; unified only).
+  # The values table gets unified_lr * item_memory_lr_scale, every other tensor
+  # unified_lr * backbone_lr_scale (0 = frozen). item_memory_rows: all | forget
+  # (items the forget data reads) | afihf (top item_memory_top_t by AF-IHF over
+  # forget vs retain reads). Defaults reproduce plain unified.
+  item_memory_lr_scale: 1.0
+  backbone_lr_scale: 1.0
+  item_memory_rows: all
+  item_memory_top_t: 1000
+  # afihf_soft (item_memory_rows): every forget-read row moves, its update scaled
+  # by its AF-IHF score / max score. Warm start: v <- a*v + (1-a)*neighbour avg
+  # for the selected rows before optimizing (1.0 = off; the item is kept).
+  item_memory_reset_alpha: 1.0
+  # Anti-nuking cap (null = off): each item entry stays within max_drift * ||v_0|| of its
+  # pre-unlearning value v_0 across the whole request sequence, so (possibly adversarial)
+  # deletion requests can adjust an item's entry but never wipe it out.
+  item_memory_max_drift: null
+  # Dominated-slot boost (PKM, full unlearning): value rows of the top-t forget-dominated
+  # slots per memory get slot_boost x the update (modified, not deleted); the rest of the
+  # model keeps 1x. slot_boost_max_drift caps each such row's drift (anti-nuking).
+  slot_boost: 1.0
+  slot_boost_criterion: af_ihf
+  slot_boost_top_t: 1000
+  slot_boost_max_drift: null
+  # Local repair, an ADDITIONAL objective term (the uniform retain term stays):
+  # lambda_local * CE on retain rows whose history contains an affected item.
+  # local_repair_items: targets (forget target items) | rows (selected item rows).
+  lambda_local: 0.0
+  local_repair_items: targets
+  # full: draw the local rows from the FULL retain split (up to local_repair_max_rows,
+  # seeded); subset: mask the 16-row retain subset (held 0 affected rows -> inert).
+  local_repair_source: full
+  local_repair_max_rows: 256
+  local_repair_seed: 0
+  # MUNKEY key deletion (model.munkey_memory): mark the forget users' keys deleted
+  # so no query retrieves their tokens again. With zero_shot=true this IS MUNKEY's
+  # unlearning (no weight update); without it, key deletion + the unified update.
+  munkey_delete: false
+  # Zero-shot item deletion (model.item_memory): none | targets. targets deletes the
+  # request's target items' keys (entry -> mix of non-deleted neighbours, also in the
+  # output score); the items stay in the catalogue. + zero_shot=true: no weight update.
+  item_memory_delete: none
+  # Item-addressed PKM slots (pkm_params.item_slots > 0): which items' private
+  # slot blocks may move (all | forget | afihf over item occurrences in forget vs
+  # retain inputs, top pkm_item_top_t) and their lr multiplier.
+  pkm_item_rows: all
+  pkm_item_top_t: 1000
+  pkm_item_lr_scale: 1.0
+  # User-keyed exemplar memory (model.user_memory): lr multiplier on the user
+  # tokens, rows (all | forget = users in the forget batches), warm start towards
+  # the neighbour average (1.0 = off), and zero_shot (reset only, no steps).
+  user_memory_lr_scale: 1.0
+  user_memory_rows: all
+  user_memory_reset_alpha: 1.0
+  zero_shot: false
   stable_codes: 2
   adaptive_update_backbone: false
   # adaptive_adapter (default false = "option 1"): move the *shared* adaptive
@@ -792,6 +892,11 @@ model:
   #   'model.pkm_layers={encoder:null,decoder:[0,1]}' model.pkm_mode=replace
   # See tiger_train_flat.yaml for the meaning of pkm_layers / pkm_mode / pkm_params.
   pkm_layers: null
+  # item-keyed exemplar memory; must mirror the training run (see tiger_train_flat)
+  item_memory: null
+  group_memory: null
+  user_memory: null
+  munkey_memory: null
   pkm_mode: replace
   pkm_params:
     k_dim: ${model.huggingface_model.config.d_model}
@@ -816,7 +921,15 @@ model:
     value_init: normal
     value_init_scale: 1.0
     # anti-collapse query normalisation; must exist here too or the
-    query_norm: none
+    # auto: batchnorm if the checkpoint has this memory's q_norm weights (every
+    # trained-in PKM since the 2026-10-20 default), none otherwise (incl. a
+    # fresh post-hoc PKM). Explicit none/batchnorm still win; a mismatch with
+    # the checkpoint is an error (check_query_norm_load).
+    query_norm: auto
+    # FFN pathway dropout (pkm_mode=add only): per training sequence, w.p. ffn_dropout the
+    # FFN branch is skipped so the memory must carry the layer (pushes instance-specific
+    # information into the memory, MUNKEY-style). 0 = off.
+    ffn_dropout: 0.0
     # slot diagnostic (experiment=tiger_unlearn_scif_flat) cannot override it
     warmup_knn: 0
     # -- Hydra struct mode rejects unknown keys. See tiger_train_flat.yaml

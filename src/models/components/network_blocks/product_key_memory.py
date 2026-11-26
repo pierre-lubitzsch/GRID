@@ -73,6 +73,9 @@ class HashingMemory(nn.Module):
             keeps the routing gradients alive.
         query_norm: anti-collapse normalisation of the query, applied BEFORE the
             product-key lookup. ``none`` (default) reproduces prior behaviour.
+            ``auto`` (the unlearning configs) is decided when a checkpoint is
+            loaded, by resolve_auto_query_norm: batchnorm if the checkpoint
+            holds this memory's q_norm weights, else none.
 
             ``batchnorm`` normalises each query dimension across the batch with
             ``track_running_stats=False``, so batch statistics are used at train
@@ -139,6 +142,9 @@ class HashingMemory(nn.Module):
         warmup_knn: int = 0,
         warmup_noise: float = 0.0,
         warmup_steps: int = 0,
+        memory_dropout: float = 0.0,
+        item_slots: int = 0,
+        num_items: int = 0,
     ) -> None:
         super().__init__()
 
@@ -185,9 +191,9 @@ class HashingMemory(nn.Module):
 
         # anti-collapse query normalisation (see the class docstring)
         self.query_norm = str(query_norm).strip().lower()
-        if self.query_norm not in ("none", "batchnorm", "layernorm"):
+        if self.query_norm not in ("none", "batchnorm", "layernorm", "auto"):
             raise ValueError(
-                f"query_norm must be none|batchnorm|layernorm, got {query_norm!r}"
+                f"query_norm must be none|batchnorm|layernorm|auto, got {query_norm!r}"
             )
         if self.query_norm == "batchnorm":
             # track_running_stats=False -> batch stats at train AND eval, so the
@@ -215,6 +221,41 @@ class HashingMemory(nn.Module):
                 f"overflow topk. Use warmup_noise for a cheap warm-up instead."
             )
         self.warmup_noise = float(warmup_noise or 0.0)
+
+        # memory (pathway) dropout, after MUNKEY's stochastic pathway dropout
+        # (Laguna et al. 2026, arXiv:2603.15033): in training, each SEQUENCE's
+        # whole memory read is replaced by a learned null vector with this
+        # probability, so the backbone learns to work when a user's memory
+        # contribution is missing -- the state that memory-only unlearning
+        # creates. Inactive at eval. Adds `null_value` to the state_dict only
+        # when > 0.
+        self.memory_dropout = float(memory_dropout or 0.0)
+        if not 0.0 <= self.memory_dropout < 1.0:
+            raise ValueError(f"memory_dropout must be in [0, 1), got {memory_dropout}")
+        if self.memory_dropout > 0:
+            self.null_value = nn.Parameter(torch.zeros(self.v_dim))
+
+        # Item-addressed slots (hybrid addressing, after MUNKEY's per-instance
+        # keys): every item owns a private block of `item_slots` slots with its
+        # own keys/values, separate from the shared content-routed table. A token
+        # of item i reads ONLY block i (softmax over its item_slots keys, using
+        # head 0's query) and the result is added to the shared read. So an
+        # item's slots are exclusive by construction -- the property slot
+        # selection lacked on the shared table (forget-exclusive slots ~0).
+        # The owning model sets the token -> item map per forward
+        # (set_item_context); tokens without an item (-1) get no item read.
+        self.item_slots = int(item_slots or 0)
+        self.num_items = int(num_items or 0)
+        self._item_ctx: torch.Tensor | None = None
+        if self.item_slots > 0:
+            if self.num_items <= 0:
+                raise ValueError("item_slots > 0 needs num_items (set by the model)")
+            bound = 1 / math.sqrt(self.k_dim)
+            self.item_keys = nn.Parameter(
+                torch.empty(self.num_items, self.item_slots, self.k_dim).uniform_(-bound, bound)
+            )
+            self.item_values = nn.Embedding(self.num_items * self.item_slots, self.v_dim)
+            nn.init.normal_(self.item_values.weight, mean=0, std=self.v_dim ** -0.5)
         # persistent=False: a step counter must not change the checkpoint schema.
         self.register_buffer(
             "_pkm_step", torch.zeros((), dtype=torch.long), persistent=False
@@ -230,6 +271,7 @@ class HashingMemory(nn.Module):
         self._balance = False
         self._balance_token_entropy = 1.0
         self._balance_kind = "mi"
+        self._balance_standardize = True
         self.balance_loss = None
         self.balance_stats = {}
 
@@ -265,6 +307,10 @@ class HashingMemory(nn.Module):
             self.register_buffer(
                 "_access_mass", torch.zeros(self.size, device=dev), persistent=False
             )
+        if self.item_slots > 0 and getattr(self, "_item_access_count", None) is None:
+            self.register_buffer(
+                "_item_access_count", torch.zeros(self.num_items, device=dev), persistent=False
+            )
         self._count_access = True
 
     def disable_access_counting(self) -> None:
@@ -274,6 +320,8 @@ class HashingMemory(nn.Module):
         if getattr(self, "_access_count", None) is not None:
             self._access_count.zero_()
             self._access_mass.zero_()
+        if getattr(self, "_item_access_count", None) is not None:
+            self._item_access_count.zero_()
 
     def get_access_counts(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(read_count, softmax_mass)`` per slot, both length ``size``."""
@@ -282,6 +330,32 @@ class HashingMemory(nn.Module):
                 "access counting was never enabled; call enable_access_counting()"
             )
         return self._access_count.detach().clone(), self._access_mass.detach().clone()
+
+    # ---- item-addressed slots ------------------------------------------------
+    def set_item_context(self, token_item_ids: "torch.Tensor | None") -> None:
+        """(B, L) item id per input token (-1 = none), for the next forward."""
+        self._item_ctx = token_item_ids
+
+    def _item_read(self, query: torch.Tensor, bs: int) -> torch.Tensor | None:
+        """Read each token's own item block; ``query`` is (bs*heads, k_dim)."""
+        if self.item_slots <= 0 or self._item_ctx is None:
+            return None
+        ids = self._item_ctx.reshape(-1)
+        if ids.numel() != bs:
+            return None  # layout mismatch (e.g. incremental decoding): skip
+        valid = ids >= 0
+        ids = ids.clamp(min=0)
+        q0 = query.view(bs, self.heads, self.k_dim)[:, 0]  # head 0's query
+        scores = torch.einsum("bk,bsk->bs", q0, self.item_keys[ids])  # (bs, item_slots)
+        w = F.softmax(scores.float(), dim=-1).type_as(scores)
+        rows = ids.unsqueeze(1) * self.item_slots + torch.arange(self.item_slots, device=ids.device)
+        out = (self.item_values(rows) * w.unsqueeze(-1)).sum(1)  # (bs, v_dim)
+        if self._count_access and getattr(self, "_item_access_count", None) is not None:
+            with torch.no_grad():
+                self._item_access_count.index_add_(
+                    0, ids[valid], torch.ones_like(ids[valid], dtype=self._item_access_count.dtype)
+                )
+        return out * valid.unsqueeze(1).to(out.dtype)
 
     # ---- explore / exploit training ------------------------------------------
     def set_explore(
@@ -318,7 +392,8 @@ class HashingMemory(nn.Module):
 
     # ---- routing balance (anti-collapse) -------------------------------------
     def set_balance(
-        self, active: bool, token_entropy_weight: float = 1.0, kind: str = "mi"
+        self, active: bool, token_entropy_weight: float = 1.0, kind: str = "mi",
+        standardize: bool = True,
     ) -> None:
         """Compute a routing balance loss on the following TRAINING passes.
 
@@ -351,6 +426,9 @@ class HashingMemory(nn.Module):
         self._balance = bool(active)
         self._balance_token_entropy = float(token_entropy_weight)
         self._balance_kind = kind
+        # switch only: P on per-token standardised scores (default). False uses
+        # the raw scores -- the ablation for the scale-loophole argument.
+        self._balance_standardize = bool(standardize)
 
     def _balance_term(self, scores: torch.Tensor) -> torch.Tensor:
         if self._balance_kind == "switch":
@@ -373,7 +451,10 @@ class HashingMemory(nn.Module):
                 0, top.reshape(-1), torch.ones(top.numel(), device=scores.device)
             )
             f = f / top.numel()
-        z = (scores - scores.mean(-1, keepdim=True)) / scores.std(-1, keepdim=True).clamp_min(1e-6)
+        if self._balance_standardize:
+            z = (scores - scores.mean(-1, keepdim=True)) / scores.std(-1, keepdim=True).clamp_min(1e-6)
+        else:
+            z = scores
         P = F.softmax(z, dim=-1).mean(0)
         with torch.no_grad():
             self._bal_h_marg.append(-(P * torch.log(P.clamp_min(1e-12))).sum())
@@ -496,6 +577,12 @@ class HashingMemory(nn.Module):
             + indices2.view(bs, 1, knn).expand(bs, knn, knn)
         ).view(bs, -1)  # (bs, knn ** 2)
 
+        # slot deletion (diagnostic / zero-shot): masked slots are never selected
+        slot_mask = getattr(self, "slot_mask", None)
+        if slot_mask is not None:
+            all_scores = all_scores.masked_fill(slot_mask.to(all_indices.device)[all_indices],
+                                                -float("inf"))
+
         # select the overall best scores with associated indices
         scores, best_indices = torch.topk(all_scores, k=knn, dim=1)  # (bs, knn)
         indices = all_indices.gather(1, best_indices)  # (bs, knn)
@@ -583,6 +670,9 @@ class HashingMemory(nn.Module):
 
         # weighted sum of values
         output = self.values(indices, per_sample_weights=scores)  # (bs, v_dim)
+        item_out = self._item_read(query, bs)
+        if item_out is not None:
+            output = output + item_out
         if explore:  # straight_through: sparse forward, dense gradient
             dense = self._dense_read(query)
             output = output + (dense - dense.detach())
@@ -598,7 +688,77 @@ class HashingMemory(nn.Module):
             output = output.view(prefix_shape + (self.v_dim,))  # (..., v_dim)
         elif len(prefix_shape) == 0:
             output = output.view(self.v_dim)
-        return output
+        return self._apply_memory_dropout(output, prefix_shape)
+
+    def _apply_memory_dropout(self, output: torch.Tensor, prefix_shape: torch.Size) -> torch.Tensor:
+        """Replace whole sequences' reads (leading dim) by the null vector."""
+        if not (self.memory_dropout > 0 and self.training) or len(prefix_shape) == 0:
+            return output
+        n_seq = prefix_shape[0]
+        drop = torch.rand(n_seq, device=output.device) < self.memory_dropout
+        drop = drop.view((n_seq,) + (1,) * (output.dim() - 1))
+        return torch.where(drop, self.null_value.to(output.dtype).expand_as(output), output)
+
+
+def resolve_auto_query_norm(model: nn.Module, state_dict: dict, adopt: bool = False) -> list:
+    """Settle every ``query_norm='auto'`` memory in ``model`` from a checkpoint.
+
+    batchnorm when the checkpoint holds that memory's ``q_norm`` weights (every
+    trained-in PKM since the switch-loss default), none otherwise (no norm, or a
+    fresh post-hoc PKM that is not in the checkpoint at all). BatchNorm and
+    LayerNorm have the same keys, so a layernorm checkpoint must be set
+    explicitly. Call BEFORE load_state_dict and before building optimizers.
+    adopt=True (evaluation) applies the same rule to EVERY memory whose weights
+    are in the checkpoint, whatever it was built with (a layernorm memory facing
+    q_norm weights stays layernorm): the checkpoint is the ground truth there.
+    Returns ``[(module name, resolved mode)]``.
+    """
+    out = []
+    for name, m in model.named_modules():
+        if not isinstance(m, HashingMemory):
+            continue
+        if adopt and f"{name}.keys" in state_dict and m.query_norm != "auto":
+            has = any(k.startswith(f"{name}.q_norm.") for k in state_dict)
+            if has and m.q_norm is None:
+                m.q_norm = nn.BatchNorm1d(m.k_dim, track_running_stats=False).to(m.keys.device)
+                m.query_norm = "batchnorm"
+                out.append((name, m.query_norm))
+            elif not has and m.q_norm is not None:
+                m.q_norm, m.query_norm = None, "none"
+                out.append((name, m.query_norm))
+            continue
+        if m.query_norm == "auto":
+            if any(k.startswith(f"{name}.q_norm.") for k in state_dict):
+                m.q_norm = nn.BatchNorm1d(m.k_dim, track_running_stats=False).to(m.keys.device)
+                m.query_norm = "batchnorm"
+            else:
+                m.query_norm = "none"
+            out.append((name, m.query_norm))
+    return out
+
+
+def check_query_norm_load(model: nn.Module, state_dict: dict) -> None:
+    """Fail loudly when a strict=False load would silently drop or skip q_norm.
+
+    A memory's q_norm weights in the checkpoint but no q_norm in the model (or
+    the reverse, for a memory whose other weights ARE in the checkpoint) means
+    query_norm disagrees with how the checkpoint was trained.
+    """
+    for name, m in model.named_modules():
+        if not isinstance(m, HashingMemory):
+            continue
+        in_ckpt = any(k.startswith(f"{name}.q_norm.") for k in state_dict)
+        trained = f"{name}.keys" in state_dict
+        if in_ckpt and m.q_norm is None:
+            raise ValueError(
+                f"checkpoint has {name}.q_norm but the model was built with "
+                f"query_norm={m.query_norm!r}: pass model.pkm_params.query_norm="
+                "batchnorm (or auto)")
+        if trained and not in_ckpt and m.q_norm is not None:
+            raise ValueError(
+                f"checkpoint has a trained {name} without q_norm but the model "
+                f"was built with query_norm={m.query_norm!r}: pass "
+                "model.pkm_params.query_norm=none (or auto)")
 
 
 class PKMExploreController:

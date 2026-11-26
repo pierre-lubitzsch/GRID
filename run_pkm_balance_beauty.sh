@@ -27,6 +27,10 @@
 #         ARMS="bal10" ./run_pkm_balance_beauty.sh
 set -euo pipefail
 
+# These runs predate the switch-loss default (2026-10-20): train them unbalanced,
+# as recorded. Arms that set pkm_balance / query_norm themselves still do so.
+export PKM_BALANCE="${PKM_BALANCE:-off}"
+
 DATA=src/data/amazon_data/beauty_spam_tgtmid_seed2_pct1_n1
 SID=embeddings/beauty_rqvae/merged_predictions_tensor.pt
 STEPS="${STEPS:-4000}"

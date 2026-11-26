@@ -437,6 +437,36 @@ if [ "${UNLEARN_RUN_POST_EVAL}" = "true" ]; then
       hydra.run.dir="${EVAL_OUT}"
     echo "[$(date -Is)] Post-unlearn eval finished"
     echo "Metrics: ${EVAL_OUT}/csv/version_0/metrics.csv"
+    # OFF_EVALS=1: item-memory pathways switched off at inference on the same final
+    # model, each into eval_off_<mode>/: nulltoken (input memory -> null token, needs
+    # the input term), scoreoff (score_weight 0: no reranking, needs a score), both.
+    if [ "${OFF_EVALS:-0}" = 1 ] && [[ "${EVAL_EXTRA_OVERRIDES:-}" == *model.item_memory=\{* ]]; then
+      _modes=()
+      [[ "${EVAL_EXTRA_OVERRIDES}" != *input_term:false* ]] && _modes+=(nulltoken)
+      [[ "${EVAL_EXTRA_OVERRIDES}" =~ score_weight:[1-9] ]] && _modes+=(scoreoff)
+      [ "${#_modes[@]}" = 2 ] && _modes+=(both)
+      for _m in "${_modes[@]}"; do
+        _o="${EVAL_EXTRA_OVERRIDES}"
+        [[ "$_m" == nulltoken || "$_m" == both ]] && _o="${_o/model.item_memory=\{/model.item_memory=\{eval_pathway:nulltoken,}"
+        [[ "$_m" == scoreoff || "$_m" == both ]] && _o=$(echo "$_o" | sed -E 's/score_weight:[0-9.]+/score_weight:0.0/')
+        read -r -a _OFF_OVR <<< "$_o"
+        echo "[$(date -Is)] Off eval ($_m): ${_o}"
+        python -u -m scripts.eval_ckpt_on_test \
+          experiment="$(grid_model_config tiger_train_flat)" \
+          data_dir="${UNLEARN_EVAL_DATA_DIR}" \
+          "semantic_id_path='${SEMANTIC_ID_PATH}'" \
+          "ckpt_path='${FINAL_CKPT}'" \
+          "${SPAM_MANIFEST_ARGS[@]}" \
+          num_hierarchies="${NUM_HIER}" \
+          ${SEQ_OVR[@]+"${SEQ_OVR[@]}"} \
+          seed="${UNLEARN_SEED}" \
+          train=False test=True \
+          trainer.devices=1 trainer.strategy=auto trainer.sync_batchnorm=false trainer.num_nodes=1 \
+          trainer.deterministic=true callbacks.model_checkpoint=null callbacks.early_stopping=null \
+          "${_OFF_OVR[@]}" \
+          hydra.run.dir="${UNLEARN_OUTPUT_DIR}/eval_off_${_m}"
+      done
+    fi
   fi
 else
   echo "Post-unlearn eval skipped (UNLEARN_RUN_POST_EVAL=${UNLEARN_RUN_POST_EVAL})"

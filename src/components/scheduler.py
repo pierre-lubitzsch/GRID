@@ -64,3 +64,18 @@ class WarmupCosineSchedulerNonzeroMin(torch.optim.lr_scheduler.LambdaLR):
             return max(self.min_ratio, self.min_ratio + coeff * (1 - self.min_ratio))
         else:  # current_step > self.scheduler_steps
             return self.min_ratio
+
+
+class ConstantThenInverseSqrt(torch.optim.lr_scheduler.LambdaLR):
+    """TIGER's schedule (Rajput et al. 2023): the initial lr for the first
+    `constant_steps` optimizer steps, then inverse square-root decay,
+    lr(step) = lr * sqrt(constant_steps / step)."""
+
+    def __init__(self, optimizer: torch.optim.Optimizer, constant_steps: int, last_epoch: int = -1):
+        self.constant_steps = int(constant_steps)
+        super().__init__(optimizer, self.lr_lambda, last_epoch=last_epoch)
+
+    def lr_lambda(self, step: int) -> float:
+        if step < self.constant_steps:
+            return 1.0
+        return math.sqrt(self.constant_steps / float(step))

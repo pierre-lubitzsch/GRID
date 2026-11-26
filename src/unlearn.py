@@ -111,6 +111,13 @@ def unlearn(cfg: DictConfig) -> Dict[str, Any]:
                 f"Checkpoint at {ckpt_path} has no 'state_dict' key; got "
                 f"{sorted(source_ckpt.keys())}"
             )
+        # query_norm=auto -> settled from the checkpoint; any explicit mismatch
+        # is an error (the strict=False load below would only warn)
+        from src.models.components.network_blocks.product_key_memory import (
+            check_query_norm_load, resolve_auto_query_norm)
+        for _qn_name, _qn_mode in resolve_auto_query_norm(model, source_ckpt["state_dict"]):
+            command_line_logger.info(f"[pkm] {_qn_name}: query_norm=auto -> {_qn_mode}")
+        check_query_norm_load(model, source_ckpt["state_dict"])
         load_result = model.load_state_dict(source_ckpt["state_dict"], strict=False)
         if load_result.missing_keys:
             command_line_logger.warning(

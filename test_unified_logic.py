@@ -63,6 +63,7 @@ class MockTigerModel(nn.Module):
         positives: str = "history",
         loss_type: str = "cosine",
         gen_temperature: float = 1.0,
+        checkpoint: bool = False,  # unified passes it since the checkpointing port
     ) -> torch.Tensor:
         x, _ = batch
         return (self.lin(x) ** 2).mean() / max(float(temperature), 1e-3)

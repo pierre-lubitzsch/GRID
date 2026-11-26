@@ -113,6 +113,7 @@ def select_top_t_slots(
     lam: float = 1.0,
     mu: float = 5.0,
     dot_abs: bool = False,
+    protect_frac: float = 0.0,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     """Return ``(row_masks, info)``.
 
@@ -142,6 +143,7 @@ def select_top_t_slots(
         "lambda": float(lam),
         "mu": float(mu),
         "dot_abs": bool(dot_abs),
+        "protect_frac": float(protect_frac),
         "per_memory": {},
     }
     for name, mem in mems:
@@ -175,6 +177,20 @@ def select_top_t_slots(
         eligible = a > 0
         if need_grad:
             eligible = eligible | (gf[name].norm(dim=1) > 0)
+        # PROTECTION (continual-learning recipe: the top 10% most historically
+        # used rows cannot change): slots in the top protect_frac of RETAIN reads
+        # are never selected, whatever their score.
+        n_protected = 0
+        if protect_frac > 0:
+            used = h > 0
+            n_used = int(used.sum().item())
+            n_prot = int(round(float(protect_frac) * n_used))
+            if n_prot > 0:
+                prot_idx = torch.topk(torch.where(used, h, torch.full_like(h, -1.0)), n_prot).indices
+                protected = torch.zeros_like(eligible)
+                protected[prot_idx] = True
+                eligible = eligible & ~protected
+                n_protected = n_prot
         n_eligible = int(eligible.sum().item())
         if n_eligible == 0:
             raise ValueError(
@@ -209,6 +225,7 @@ def select_top_t_slots(
             "selected_live": int(((a[idx] > 0) | (h[idx] > 0)).sum().item()),
             "selected_retain_unused": int((h[idx] == 0).sum().item()),
             "eligible_slots": n_eligible,
+            "protected_slots": n_protected,
         }
         if k >= live:
             log.warning(

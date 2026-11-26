@@ -10,7 +10,7 @@ import re
 import time
 from copy import deepcopy
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -467,17 +467,46 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         info.update(ctx["meta"])
         return info
 
-    def _run_unified(self, **kwargs: Any) -> Dict[str, Any]:
-        ctx = self._prepare_unlearning_context(**kwargs)
-        device = kwargs.get("device") or next(self.parameters()).device
-        cfg = kwargs["unlearning_cfg"]
-        t0 = time.time()
-        local_repair = cfg.get("local_repair") or {}
-        n_epochs_cfg = cfg.get("n_epochs")
+    # -- ported from the main branch (2026-10-21), unchanged: request inputs with
+    # the replay cache, and validation-based epoch selection (mode=request) --
+    def _unified_request_inputs(
+        self, cfg: Any, lambda_neighborhood: float, **kwargs: Any
+    ) -> Tuple[Dict[str, Any], Any, Optional[torch.Tensor]]:
+        """Batches, L_n neighbours and code-row mask for one unified request.
 
+        With ``cfg["_cache_request_context"]`` (set by the sequential driver
+        when it re-runs the whole request sequence for validation-based
+        n_epochs selection) the result is computed once per request directory
+        (``data_dir``)
+        and reused by later passes, together with the RNG state right after
+        preparation. Building the retain subset (a full TFRecord scan, ~20 s
+        per request on Beauty) is >90% of a pass and identical in every pass:
+        the same earlier requests have been removed and the sampling is seeded.
+        Restoring the RNG makes every pass see the same data and random draws,
+        so passes differ only in n_epochs. Each call gets a deep copy, so
+        nothing a pass does to its batches leaks into the next pass.
+        """
+        import random as _random
+        # The request directory (<run>/requests/<k>) is the same path in every
+        # pass, so it identifies the request.
+        key = None
+        if cfg.get("_cache_request_context"):
+            key = kwargs.get("data_dir")
+            if not key:
+                raise ValueError("_cache_request_context needs data_dir (the request dir)")
+        cache = self.__dict__.setdefault("_request_ctx_cache", {})
+        if key is not None and key in cache:
+            entry = cache[key]
+            torch.set_rng_state(entry["rng_cpu"])
+            if entry["rng_cuda"] is not None:
+                torch.cuda.set_rng_state_all(entry["rng_cuda"])
+            _random.setstate(entry["rng_py"])
+            log.info("[unified] request inputs reused from the first pass (%s)", key)
+            return deepcopy((entry["ctx"], entry["coh"], entry["crk"]))
+
+        ctx = self._prepare_unlearning_context(**kwargs)
         # Coherence loss L_n (TRACER Eq. 9): precompute, per forget batch, the
         # prefix-neighbour semantic ids of each sample's target item.
-        lambda_neighborhood = float(cfg.get("lambda_n", 0.0))
         coherence_neighbors = None
         if lambda_neighborhood != 0.0:
             coherence_neighbors = self._build_coherence_neighbors(
@@ -507,16 +536,145 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
                 latent_path=cfg.get("coherence_latent_path"),
                 union_size=str(cfg.get("coherence_union_size", "full")),
             )
+        code_row_keep = self._resolve_code_row_keep(ctx, cfg, **kwargs)
+        if key is not None:
+            cache[key] = {
+                "ctx": deepcopy(ctx), "coh": deepcopy(coherence_neighbors),
+                "crk": deepcopy(code_row_keep),
+                "rng_cpu": torch.get_rng_state(),
+                "rng_cuda": (torch.cuda.get_rng_state_all()
+                             if torch.cuda.is_available() else None),
+                "rng_py": _random.getstate(),
+            }
+        return ctx, coherence_neighbors, code_row_keep
+
+    def clear_request_cache(self) -> None:
+        self.__dict__.pop("_request_ctx_cache", None)
+
+    def _build_epoch_selector(self, cfg: Any, **kwargs: Any):
+        """EpochSelector for this request, or None when val_selection is off.
+
+        The validation batches (and, for reference=original, the starting
+        model's validation NDCG) are computed once per run and cached on the
+        module, since sequential unlearning calls this once per request.
+        """
+        from src.components.unlearning.val_selection import (
+            EpochSelector,
+            build_val_batches,
+            evaluate_batches,
+            read_reference_metrics,
+        )
+
+        vs = cfg.get("val_selection") or {}
+        # mode=run is handled by the sequential driver (one n_epochs for the
+        # whole sequence); only mode=request stops inside each request.
+        if not vs.get("enabled", False) or str(vs.get("mode", "run")).lower() != "request":
+            return None
+        folder = vs.get("data_folder")
+        if not folder or not os.path.isdir(folder):
+            raise FileNotFoundError(
+                f"unlearning.val_selection.data_folder={folder!r} is not a "
+                "directory; it must be the VALIDATION split (<data_dir>/evaluation)."
+            )
+        device = kwargs.get("device") or next(self.parameters()).device
+        key = (os.path.abspath(folder), int(vs.get("batch_size", 64)),
+               vs.get("max_rows"))
+        cache = getattr(self, "_val_selection_cache", None)
+        if cache is None or cache["key"] != key:
+            t0 = time.time()
+            batches = build_val_batches(
+                kwargs["train_dataloader_config"], folder, device,
+                batch_size=key[1], max_rows=key[2])
+            cache = {"key": key, "batches": batches, "origin": None}
+            self._val_selection_cache = cache
+            log.info("[val_select] %d validation rows in %d batches from %s "
+                     "(%.1fs)", sum(int(b[0].mask.shape[0]) for b in batches),
+                     len(batches), folder, time.time() - t0)
+
+        reference = str(vs.get("reference", "retrained")).strip().lower()
+        ref_sh = vs.get("ref_sh")
+        ref_ndcg = vs.get("ref_ndcg")
+        if reference == "retrained":
+            if vs.get("reference_metrics_csv"):
+                csv_sh, csv_ndcg = read_reference_metrics(
+                    str(vs["reference_metrics_csv"]))
+                ref_sh = csv_sh if ref_sh is None else ref_sh
+                ref_ndcg = csv_ndcg if ref_ndcg is None else ref_ndcg
+            if ref_sh is None or ref_ndcg is None:
+                raise ValueError(
+                    "val_selection.reference=retrained needs the retrained "
+                    "model's validation SH@10 and NDCG@10: set "
+                    "reference_metrics_csv or ref_sh/ref_ndcg.")
+        elif reference == "original":
+            # Measured on the model as it is BEFORE the first request's update.
+            if cache["origin"] is None:
+                cache["origin"] = evaluate_batches(self, cache["batches"])
+                log.info("[val_select] starting model: %s", cache["origin"])
+            ref_ndcg = cache["origin"]["ndcg@10"] if ref_ndcg is None else ref_ndcg
+            ref_sh = 0.0 if ref_sh is None else ref_sh
+        else:
+            raise ValueError(
+                f"val_selection.reference must be retrained|original, got {reference!r}")
+
+        return EpochSelector(
+            model=self,
+            batches=cache["batches"],
+            ref_sh=float(ref_sh),
+            ref_ndcg=float(ref_ndcg),
+            tau_floor=float(vs.get("tau_floor", 0.95)),
+            sh_tie_tol=float(vs.get("sh_tie_tol", 0.0)),
+            patience=int(vs.get("patience", 2)),
+            max_epochs=int(vs.get("max_epochs", 10)),
+            min_epochs=int(vs.get("min_epochs", 1)),
+        )
+
+    def _run_unified(self, **kwargs: Any) -> Dict[str, Any]:
+        device = kwargs.get("device") or next(self.parameters()).device
+        cfg = kwargs["unlearning_cfg"]
+        t0 = time.time()
+        local_repair = cfg.get("local_repair") or {}
+        n_epochs_cfg = cfg.get("n_epochs")
+        lambda_neighborhood = float(cfg.get("lambda_n", 0.0))
+        ctx, coherence_neighbors, code_row_keep = self._unified_request_inputs(
+            cfg, lambda_neighborhood, **kwargs)
+
+        # Validation-based epoch selection: n_epochs becomes the epoch at which
+        # the selector stops at the latest; it may stop earlier and restores the
+        # best epoch's weights (see val_selection.EpochSelector).
+        selector = self._build_epoch_selector(cfg, **kwargs)
+        if selector is not None:
+            n_epochs_cfg = selector.max_epochs
+
+        # Zero-shot item deletion (item memory): the request's target items' keys are
+        # deleted before any step, so their entries become their neighbours' mix (the
+        # items stay in the catalogue). With zero_shot=true this is the whole update.
+        item_delete = str(cfg.get("item_memory_delete", "none") or "none").strip().lower()
+        item_delete_info = None
+        if item_delete != "none":
+            if getattr(self, "item_memory", None) is None:
+                raise ValueError("unlearning.item_memory_delete needs model.item_memory")
+            if item_delete != "targets":
+                raise ValueError(f"item_memory_delete must be none|targets, got {item_delete!r}")
+            tgt = sorted(int(i) for i in (ctx["meta"].get("target_items") or []))
+            if not tgt:
+                raise ValueError("item_memory_delete=targets: the request has no target items")
+            new = self.item_memory.delete(tgt)
+            item_delete_info = {"items": tgt, "newly_deleted": new,
+                                "deleted_total": int(self.item_memory.deleted.sum().item())}
+            log.info("[unified] item key deletion: %s", item_delete_info)
 
         info = unified_unlearn(
             self,
             ctx["forget_batches"],
             ctx["retain_batches"],
-            code_row_keep=self._resolve_code_row_keep(ctx, cfg, **kwargs),
+            code_row_keep=code_row_keep,
             steps=int(cfg.get("unified_steps", 500)),
             n_epochs=(
                 int(n_epochs_cfg) if n_epochs_cfg is not None else None
             ),
+            epoch_end_callback=selector,
+            coherence_checkpoint=bool(cfg.get("coherence_checkpoint", False)),
+            sep_checkpoint=bool(cfg.get("sep_checkpoint", False)),
             lr=float(cfg.get("unified_lr", 1e-4)),
             # lambda_r weights the retain term. 1.0 = current behaviour.
             # 0.0 turns repair off, which with lambda_f > 0 is pure gradient
@@ -579,6 +737,7 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             slot_lambda=float(cfg.get("slot_lambda", 1.0)),
             slot_mu=float(cfg.get("slot_mu", 5.0)),
             slot_dot_abs=bool(cfg.get("slot_dot_abs", False)),
+            slot_protect_frac=float(cfg.get("slot_protect_frac", 0.0)),
             optimizer=_resolve_optimizer(cfg, "unified"),
             # 1.0 = one lr for every parameter, the value every recorded run
             # used. Lower it (0.1 / 0.01) to slow the identifier space down.
@@ -587,8 +746,37 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
             # top of code_lr_scale. 1.0 = one code group (previous behaviour).
             adaptive_code_lr_scale=float(cfg.get("adaptive_code_lr_scale", 1.0)),
             stable_code_lr_scale=float(cfg.get("stable_code_lr_scale", 1.0)),
+            # item-keyed exemplar memory: lr emphasis + row restriction
+            item_memory_lr_scale=float(cfg.get("item_memory_lr_scale", 1.0)),
+            backbone_lr_scale=float(cfg.get("backbone_lr_scale", 1.0)),
+            item_memory_rows=str(cfg.get("item_memory_rows", "all")),
+            item_memory_top_t=int(cfg.get("item_memory_top_t", 1000)),
+            item_memory_reset_alpha=float(cfg.get("item_memory_reset_alpha", 1.0)),
+            lambda_local=float(cfg.get("lambda_local", 0.0)),
+            local_repair_items=str(cfg.get("local_repair_items", "targets")),
+            local_retain_pool=ctx.get("local_retain_pool"),
+            local_repair_max_rows=int(cfg.get("local_repair_max_rows", 256)),
+            local_repair_seed=int(cfg.get("local_repair_seed", 0)),
+            pkm_item_rows=str(cfg.get("pkm_item_rows", "all")),
+            pkm_item_top_t=int(cfg.get("pkm_item_top_t", 1000)),
+            pkm_item_lr_scale=float(cfg.get("pkm_item_lr_scale", 1.0)),
+            user_memory_lr_scale=float(cfg.get("user_memory_lr_scale", 1.0)),
+            user_memory_rows=str(cfg.get("user_memory_rows", "all")),
+            user_memory_reset_alpha=float(cfg.get("user_memory_reset_alpha", 1.0)),
+            zero_shot=bool(cfg.get("zero_shot", False)),
+            munkey_delete=bool(cfg.get("munkey_delete", False)),
+            item_memory_max_drift=cfg.get("item_memory_max_drift"),
+            slot_boost=float(cfg.get("slot_boost", 1.0)),
+            slot_boost_criterion=str(cfg.get("slot_boost_criterion", "af_ihf")),
+            slot_boost_top_t=int(cfg.get("slot_boost_top_t", 1000)),
+            slot_boost_max_drift=cfg.get("slot_boost_max_drift"),
+            munkey_forget_user_ids=ctx.get("forget_user_ids"),
             device=device,
         )
+        if selector is not None:
+            info["val_selection"] = selector.finalize()
+        if item_delete_info is not None:
+            info["item_memory_delete"] = item_delete_info
         info["wall_seconds"] = time.time() - t0
         info["update_scope"] = str(cfg.get("update_scope", "all"))
         info["optimizer"] = str(cfg.get("unified_optimizer", "adam"))
@@ -1859,6 +2047,41 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         retain_size_full = _count_rows_in_tfrecord_dir(retain_dir)
         retain_samples_used = int(unlearning_cfg.get("retain_samples_used_for_update") or 16)
 
+        # MUNKEY key deletion must delete EVERY requested instance. The forget batch
+        # above is capped and sampled (recorded recipe), which left ~10 of 226 fake
+        # users out of the deletion in the first CPU test, so the users come from an
+        # uncapped pass over the request's whole forget set instead.
+        forget_user_ids = None
+        if bool(unlearning_cfg.get("munkey_delete", False)):
+            from src.components.unlearning.unified import _forget_user_ids
+            forget_user_ids = _forget_user_ids(_drain_loader(
+                _build_finite_loader(
+                    base_train_cfg=train_dataloader_config,
+                    data_folder=forget_dir,
+                    batch_size_per_device_override=unlearn_batch_size,
+                    max_batch_size_override=10 ** 9,
+                ),
+                device=torch.device("cpu"),
+            ))
+
+        # Local repair pool (unified lambda_local > 0, local_repair_source=full):
+        # the FULL retain split, kept on CPU, from which unified draws the
+        # affected users' rows. Only rows sampled from it are ever forwarded, so
+        # this does not have the retain_source=full cost.
+        local_retain_pool = None
+        if (float(unlearning_cfg.get("lambda_local", 0.0) or 0.0) > 0
+                and str(unlearning_cfg.get("local_repair_source", "full")).strip().lower() == "full"):
+            local_retain_pool = _drain_loader(
+                _build_finite_loader(
+                    base_train_cfg=train_dataloader_config,
+                    data_folder=retain_dir,
+                    batch_size_per_device_override=unlearn_batch_size,
+                ),
+                device=torch.device("cpu"),
+            )
+            log.info("[local repair] pool = full retain split %s: %d batches",
+                     retain_dir, len(local_retain_pool))
+
         sep_negative_items = self._sample_sep_random_negatives(
             unlearning_cfg=unlearning_cfg,
             retain_dir=retain_dir,
@@ -1871,6 +2094,8 @@ class TigerUnlearningModule(SemanticIDEncoderDecoder):
         return {
             "forget_batches": forget_batches,
             "retain_batches": retain_batches,
+            "local_retain_pool": local_retain_pool,
+            "forget_user_ids": forget_user_ids,
             "forget_size_for_scif": int(forget_size_hint),
             "retain_size_full": int(retain_size_full),
             "retain_samples_used_for_update": retain_samples_used,

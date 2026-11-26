@@ -136,6 +136,15 @@ def evaluate(cfg: DictConfig) -> None:
 
     with pipeline_launcher(cfg) as pipeline_modules:
         install_decode_filter(cfg, pipeline_modules.model)
+        # the PKM query_norm follows the checkpoint (the training default became
+        # batchnorm on 2026-10-20; older trained-in ckpts have none)
+        from src.models.components.network_blocks.product_key_memory import (
+            resolve_auto_query_norm)
+        import torch
+        _sd = torch.load(cfg.ckpt_path, map_location="cpu", weights_only=False).get("state_dict", {})
+        for _qn_name, _qn_mode in resolve_auto_query_norm(pipeline_modules.model, _sd, adopt=True):
+            command_line_logger.info(f"[pkm] {_qn_name}: query_norm -> {_qn_mode} (from the checkpoint)")
+        del _sd
         command_line_logger.info(
             f"Running trainer.test(ckpt_path={cfg.ckpt_path}) ..."
         )

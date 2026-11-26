@@ -182,3 +182,181 @@ def test_switch_balance_sets_assigned_stat():
     mem(torch.randn(5, 16))
     assert set(mem.balance_stats) == {"eff_subkeys_batch", "eff_subkeys_assigned"}
     assert mem.balance_loss.item() >= 1.0 - 1e-4
+
+
+# ---- memory (pathway) dropout ----------------------------------------------------
+def test_memory_dropout_replaces_whole_sequences_in_training_only():
+    torch.manual_seed(0)
+    mem = HashingMemory(input_dim=16, output_dim=16, k_dim=8, heads=2, knn=4, n_keys=8,
+                        memory_dropout=0.5)
+    with torch.no_grad():
+        mem.null_value.fill_(7.0)
+    x = torch.randn(64, 5, 16)  # 64 sequences of 5 tokens
+    mem.train()
+    out = mem(x)
+    dropped = (out == 7.0).all(-1)  # (64, 5)
+    assert (dropped.all(1) | (~dropped).all(1)).all()  # per sequence, never per token
+    assert 10 < dropped.all(1).sum().item() < 54
+    out.sum().backward()
+    assert mem.null_value.grad.abs().sum() > 0  # the null vector is learned
+    mem.eval()
+    assert not (mem(x) == 7.0).all(-1).any()  # inactive at eval
+
+
+def test_memory_dropout_off_adds_no_param():
+    mem = HashingMemory(input_dim=16, output_dim=16, k_dim=8, heads=2, knn=4, n_keys=8)
+    assert "null_value" not in mem.state_dict()
+
+
+# ---- item-addressed slots ---------------------------------------------------------
+def _imem():
+    torch.manual_seed(0)
+    return HashingMemory(input_dim=16, output_dim=16, k_dim=8, heads=2, knn=4, n_keys=8,
+                         item_slots=3, num_items=5)
+
+
+def test_item_slots_read_only_own_block():
+    mem = _imem()
+    mem.train()
+    x = torch.randn(1, 4, 16)
+    base = mem(x).detach()  # no context -> shared read only
+    mem.set_item_context(torch.tensor([[2, 2, -1, 4]]))
+    out = mem(x)
+    assert torch.equal(out[0, 2], base[0, 2])  # token without item unchanged
+    assert not torch.equal(out[0, 0], base[0, 0])
+    out.sum().backward()
+    g = mem.item_values.weight.grad.abs().sum(1)
+    touched = set(g.nonzero().flatten().tolist())
+    assert touched == {6, 7, 8, 12, 13, 14}  # blocks of items 2 and 4 only
+    gk = mem.item_keys.grad.abs().sum((1, 2))
+    assert set(gk.nonzero().flatten().tolist()) == {2, 4}
+
+
+def test_item_slots_skip_on_layout_mismatch():
+    mem = _imem()
+    mem.set_item_context(torch.tensor([[1, 2]]))  # 2 ids for 4 tokens
+    assert mem._item_read(torch.randn(4 * 2, 8), 4) is None
+
+
+def test_switch_raw_scores_are_scale_dependent():
+    mem = _mem()
+    mem.train()
+    mem.set_balance(True, kind="switch", standardize=False)
+    torch.manual_seed(0)
+    collapsed = torch.randn(64, 8) * 0.1
+    collapsed[:, :4] += 3.0
+    # without standardisation, shrinking all scores flattens P and lowers the
+    # loss towards 1 although the top-k assignment is still collapsed
+    assert _switch(mem, collapsed * 1e-3).item() < _switch(mem, collapsed).item() - 0.5
+
+
+def test_slot_selection_protects_top_retain_slots(monkeypatch):
+    import src.components.unlearning.slot_selection as ss
+    mem = _mem()  # 64 slots
+    af = torch.zeros(64, dtype=torch.float64); af[[1, 2, 3, 4]] = torch.tensor([9.0, 8.0, 7.0, 6.0], dtype=torch.float64)
+    hf = torch.zeros(64, dtype=torch.float64); hf[[1, 5, 6, 7, 8, 9, 10, 11, 12, 13]] = 1.0; hf[1] = 100.0
+    sweeps = iter([{"m": af}, {"m": hf}])
+    monkeypatch.setattr(ss, "_memories", lambda model: [("m", mem)])
+    monkeypatch.setattr(ss, "_access_sweep", lambda model, mems, batches: next(sweeps))
+    masks, info = ss.select_top_t_slots(None, [], [], criterion="af", top_t=2, protect_frac=0.1)
+    sel = masks["m"].flatten().nonzero().flatten().tolist()
+    assert 1 not in sel and sel == [2, 3]  # slot 1 = most retain-used -> protected
+    assert info["per_memory"]["m"]["protected_slots"] == 1
+
+
+# ---- query_norm from the checkpoint (auto / adopt / mismatch guard) ----------------
+def _wrapped(query_norm):
+    torch.manual_seed(0)
+    w = torch.nn.Module()
+    w.mem = HashingMemory(input_dim=16, output_dim=16, k_dim=8, heads=2, knn=4, n_keys=8,
+                          query_norm=query_norm)
+    return w
+
+
+def test_auto_query_norm_resolves_from_checkpoint():
+    import pytest
+    from src.models.components.network_blocks.product_key_memory import (
+        check_query_norm_load, resolve_auto_query_norm)
+
+    bn_sd = _wrapped("batchnorm").state_dict()
+    plain_sd = _wrapped("none").state_dict()
+    assert any(".q_norm." in k for k in bn_sd) and not any(".q_norm." in k for k in plain_sd)
+
+    w = _wrapped("auto")
+    assert resolve_auto_query_norm(w, bn_sd) == [("mem", "batchnorm")]
+    w.load_state_dict(bn_sd)  # strict: keys match after resolution
+    w = _wrapped("auto")
+    assert resolve_auto_query_norm(w, plain_sd) == [("mem", "none")]
+    w.load_state_dict(plain_sd)
+    w = _wrapped("auto")  # fresh post-hoc PKM: not in the checkpoint at all
+    assert resolve_auto_query_norm(w, {}) == [("mem", "none")]
+
+    # explicit settings are left alone, and a mismatch is an error
+    w = _wrapped("none")
+    assert resolve_auto_query_norm(w, bn_sd) == []
+    with pytest.raises(ValueError):
+        check_query_norm_load(w, bn_sd)
+    w = _wrapped("batchnorm")
+    with pytest.raises(ValueError):
+        check_query_norm_load(w, plain_sd)
+    check_query_norm_load(w, {})  # untrained post-hoc memory: fine
+
+    # adopt (evaluation): the checkpoint wins over an explicit setting
+    w = _wrapped("batchnorm")
+    assert resolve_auto_query_norm(w, plain_sd, adopt=True) == [("mem", "none")]
+    w.load_state_dict(plain_sd)
+    w = _wrapped("none")
+    assert resolve_auto_query_norm(w, bn_sd, adopt=True) == [("mem", "batchnorm")]
+    w.load_state_dict(bn_sd)
+
+
+def test_balance_reduction_sum_is_per_memory():
+    """reduction=sum gives every memory the full coefficient (= coef * n under mean)."""
+    from types import SimpleNamespace as NS
+    import src.utils  # noqa: F401  (import order as in src.train; avoids a circular import)
+    from src.models.modules.semantic_id.tiger_generation_model import SemanticIDEncoderDecoder
+    mems = [("a", NS(balance_loss=torch.tensor(2.0), balance_stats={})),
+            ("b", NS(balance_loss=torch.tensor(4.0), balance_stats={}))]
+    fake = NS(_pkm_memories=lambda: mems, log=lambda *a, **k: None, device="cpu")
+    fake._pkm_balance_reduction = "mean"
+    assert float(SemanticIDEncoderDecoder._pkm_balance_loss(fake)) == 3.0
+    fake._pkm_balance_reduction = "sum"
+    assert float(SemanticIDEncoderDecoder._pkm_balance_loss(fake)) == 6.0
+    del fake._pkm_balance_reduction                # configs without the key keep mean
+    assert float(SemanticIDEncoderDecoder._pkm_balance_loss(fake)) == 3.0
+
+
+def test_slot_mask_excludes_masked_slots_from_reads():
+    mem = _mem()  # 64 slots, knn 4
+    mem.eval()
+    x = torch.randn(6, 16)
+    q = mem.query_proj(x).view(-1, mem.heads, mem.k_dim)
+    _, idx = mem._get_indices(q[:, 0], mem.keys[0])
+    read = idx.unique()
+    mem.slot_mask = torch.zeros(mem.size, dtype=torch.bool)
+    mem.slot_mask[read] = True                      # delete every slot read before
+    _, idx2 = mem._get_indices(q[:, 0], mem.keys[0])
+    assert not torch.isin(idx2, read).any()
+    mem.slot_mask = None
+    _, idx3 = mem._get_indices(q[:, 0], mem.keys[0])
+    assert torch.equal(idx3, idx)                   # no mask -> unchanged
+
+
+def test_ffn_pathway_dropout_in_add_mode():
+    import src.utils  # noqa: F401  (import order)
+    from transformers import T5Config
+    from transformers.models.t5.modeling_t5 import T5LayerFF
+    from src.models.modules.semantic_id.tiger_generation_model import T5LayerFFWithPKM, T5LayerPKM
+    cfg = T5Config(d_model=16, d_ff=32, dropout_rate=0.0)
+    pp = dict(k_dim=8, heads=2, knn=4, n_keys=8)
+    torch.manual_seed(0)
+    layer = T5LayerFFWithPKM(T5LayerFF(cfg), cfg, {**pp, "ffn_dropout": 0.999})
+    h = torch.randn(4, 5, 16)
+    layer.train()
+    mem = layer.memory(layer.layer_norm(h))
+    torch.testing.assert_close(layer(h), h + mem)       # FFN branch skipped -> residual + memory
+    layer.eval()
+    torch.testing.assert_close(layer(h), layer.ffn(h) + layer.memory(layer.layer_norm(h)))
+    import pytest
+    with pytest.raises(ValueError):
+        T5LayerPKM(cfg, {**pp, "ffn_dropout": 0.5})     # replace mode has no FFN to drop

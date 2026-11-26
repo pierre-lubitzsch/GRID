@@ -276,6 +276,17 @@ case "${PKM_MODE_LC}" in
     echo "Unknown PKM_MODE='${PKM_MODE}' (expected add|replace|none)"; exit 1 ;;
 esac
 
+# PKM_BALANCE: the switch balance loss (coef 0.1) + query_norm=batchnorm are the
+# config DEFAULT since 2026-10-20 (they fix trained-in collapse). PKM_BALANCE=off
+# restores the old unbalanced PKM (model.pkm_balance=null, query_norm=none), e.g.
+# for the p0 control arms. Placed before the trailing overrides, so an arm's own
+# pkm_balance / query_norm override still wins. No effect without PKM_MODE.
+case "$(printf '%s' "${PKM_BALANCE:-on}" | tr '[:upper:]' '[:lower:]')" in
+  off|0|false|no) EXTRA_OVERRIDES+=("model.pkm_balance=null" "model.pkm_params.query_norm=none") ;;
+  on|1|true|yes)  : ;;
+  *) echo "Unknown PKM_BALANCE='${PKM_BALANCE}' (expected on|off)"; exit 1 ;;
+esac
+
 # Deterministic training (opt-in: DETERMINISTIC=1). Makes runs reproducible
 # run-to-run for a fixed seed WITHOUT giving up the 2-GPU pgpu allocation: DDP
 # all-reduce is reproducible on a fixed GPU model, seed_everything(workers=True)

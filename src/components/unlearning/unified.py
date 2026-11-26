@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from torch import nn
@@ -25,6 +25,393 @@ from src.components.unlearning.target_params import (
 
 log = logging.getLogger(__name__)
 TigerBatch = Any
+
+
+def _item_counts_from_inputs(model: nn.Module, batches: Sequence[Any]) -> torch.Tensor:
+    """Per-item occurrence counts in the batches' input histories (no forward)."""
+    model._ensure_item_id_map()
+    H = int(model.num_hierarchies)
+    n = int(model.codebooks.size(0))
+    dev = model._adaptive_sorted_keys.device
+    counts = torch.zeros(n, dtype=torch.float64, device=dev)
+    for b in batches:
+        seq = b[0].transformed_sequences.get("sequence_data")
+        if seq is None or seq.dim() != 2 or seq.size(1) % H != 0:
+            continue
+        ids = model._codes_to_item_ids(seq.to(dev).view(seq.size(0), -1, H).long()).flatten()
+        ids = ids[ids >= 0]
+        counts.index_add_(0, ids, torch.ones_like(ids, dtype=torch.float64))
+    return counts
+
+
+def _apply_pkm_item_policy(
+    model: nn.Module,
+    params: List[nn.Parameter],
+    multiplier: Dict[int, float],
+    grad_masks: Dict[int, torch.Tensor],
+    forget_batches: Sequence[Any],
+    retain_batches: Sequence[Any],
+    *,
+    rows: str,
+    top_t: int,
+    lr_scale: float,
+) -> Dict[str, Any]:
+    """Row restriction + lr multiplier for item-addressed PKM slot blocks."""
+    from src.models.components.network_blocks.product_key_memory import HashingMemory
+
+    mems = [m for m in model.modules() if isinstance(m, HashingMemory) and getattr(m, "item_slots", 0) > 0]
+    rows = str(rows).strip().lower()
+    if rows not in ("all", "forget", "afihf"):
+        raise ValueError(f"pkm_item_rows must be all|forget|afihf, got {rows!r}")
+    if not mems:
+        if rows != "all" or lr_scale != 1.0:
+            raise ValueError("pkm_item_rows / pkm_item_lr_scale need pkm_params.item_slots > 0")
+        return {}
+    info: Dict[str, Any] = {"pkm_item_rows": rows, "pkm_item_lr_scale": lr_scale}
+    item_tensor_ids = {id(t) for m in mems for t in (m.item_values.weight, m.item_keys)}
+    for p in params:
+        if id(p) in item_tensor_ids:
+            multiplier[id(p)] *= lr_scale
+    if rows != "all":
+        af = _item_counts_from_inputs(model, forget_batches)
+        if rows == "forget":
+            sel = af > 0
+        else:
+            hf = _item_counts_from_inputs(model, retain_batches)
+            score = af * torch.log((hf.sum() + 1.0) / (hf + 1.0))
+            score[af <= 0] = -float("inf")
+            k = min(int(top_t), int((af > 0).sum().item()))
+            sel = torch.zeros_like(af, dtype=torch.bool)
+            if k > 0:
+                sel[score.topk(k).indices] = True
+        for m in mems:
+            w = m.item_values.weight
+            grad_masks[id(w)] = sel.repeat_interleave(m.item_slots).to(w.dtype).unsqueeze(1).to(w.device)
+            grad_masks[id(m.item_keys)] = sel.to(w.dtype).view(-1, 1, 1).to(w.device)
+        info.update(n_items_forget=int((af > 0).sum().item()), n_items_selected=int(sel.sum().item()))
+    log.info("[unified] PKM item-slot policy: %s", info)
+    return info
+
+
+@torch.no_grad()
+def _project_item_drift(w: torch.Tensor, anchor: torch.Tensor, max_drift: float,
+                        rows: Optional[torch.Tensor] = None) -> None:
+    """Rows of ``w`` moved more than max_drift * ||anchor row|| are pulled back onto that
+    radius (only rows that actually moved are affected; with ``rows``, a bool row mask,
+    only those rows are capped)."""
+    d = w - anchor
+    n = d.norm(dim=1)
+    lim = max_drift * anchor.norm(dim=1).clamp(min=1e-12)
+    over = n > lim
+    if rows is not None:
+        over = over & rows.to(over.device)
+    scale = torch.where(over, lim / n.clamp(min=1e-12), torch.ones_like(n))
+    w.copy_(anchor + d * scale.unsqueeze(1))
+
+
+@torch.no_grad()
+def _item_drift_stats(w: torch.Tensor, anchor: torch.Tensor, max_drift: float,
+                     rows: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+    rel = (w - anchor).norm(dim=1) / anchor.norm(dim=1).clamp(min=1e-12)
+    if rows is not None:  # stats over the capped rows only
+        rel = rel[rows.to(rel.device)]
+    moved = rel > 1e-9
+    return {"max_drift": max_drift, "rows_moved": int(moved.sum()),
+            "rel_drift_max": float(rel.max()),
+            "rel_drift_mean_moved": float(rel[moved].mean()) if bool(moved.any()) else 0.0,
+            "rows_at_cap": int((rel >= max_drift * (1 - 1e-4)).sum())}
+
+
+def _forget_user_ids(forget_batches: Sequence[Any]) -> torch.Tensor:
+    """Distinct user ids of the forget rows (empty if the batches carry none)."""
+    out = []
+    for b in forget_batches:
+        u = b[0].transformed_sequences.get("user_id")
+        if u is not None:
+            out.append(u.reshape(u.size(0), -1)[:, 0].long().cpu())
+    return torch.cat(out).unique() if out else torch.zeros(0, dtype=torch.long)
+
+
+def _apply_munkey_delete(
+    model: nn.Module, forget_batches: Sequence[Any], user_ids: Optional[torch.Tensor] = None
+) -> Dict[str, Any]:
+    """MUNKEY key deletion: the forget users' instances are never retrieved again.
+
+    ``user_ids``: every user of the request (from an uncapped pass over the forget
+    set); falls back to the users present in the (capped, sampled) forget batches.
+    """
+    mm = getattr(model, "munkey_memory", None)
+    if mm is None:
+        raise ValueError("unlearning.munkey_delete needs model.munkey_memory")
+    uids = user_ids.long().cpu() if user_ids is not None else _forget_user_ids(forget_batches)
+    if uids.numel() == 0:
+        raise ValueError("munkey_delete: the forget batches carry no user_id")
+    lut = mm.uid_to_row.cpu()
+    ok = (uids >= 0) & (uids < lut.numel())
+    rows = lut[uids[ok]]
+    rows = rows[rows >= 0]
+    new = mm.delete(rows)
+    info = {"munkey_forget_users": int(uids.numel()), "munkey_keys_deleted_new": new,
+            "munkey_keys_deleted_total": int(mm.deleted.sum().item())}
+    log.info("[unified] munkey key deletion: %s", info)
+    return info
+
+
+def _apply_user_memory_policy(
+    model: nn.Module,
+    params: List[nn.Parameter],
+    multiplier: Dict[int, float],
+    grad_masks: Dict[int, torch.Tensor],
+    forget_batches: Sequence[Any],
+    *,
+    lr_scale: float,
+    rows: str,
+    reset_alpha: float,
+) -> Dict[str, Any]:
+    """User-token lr multiplier, row restriction and neighbour reset."""
+    um = getattr(model, "user_memory", None)
+    rows = str(rows).strip().lower()
+    if rows not in ("all", "forget"):
+        raise ValueError(f"user_memory_rows must be all|forget, got {rows!r}")
+    if um is None:
+        if lr_scale != 1.0 or rows != "all" or reset_alpha != 1.0:
+            raise ValueError("user_memory_* knobs need model.user_memory enabled")
+        return {}
+    vid = id(um.values.weight)
+    if vid in multiplier:
+        multiplier[vid] *= lr_scale
+    info: Dict[str, Any] = {"user_memory_lr_scale": lr_scale, "user_memory_rows": rows}
+    sel = None
+    if rows == "forget" or reset_alpha != 1.0:
+        lut = um.uid_to_row
+        sel = torch.zeros(um.num_items, dtype=torch.bool, device=lut.device)
+        for b in forget_batches:
+            u = b[0].transformed_sequences.get("user_id")
+            if u is None:
+                continue
+            u = u.reshape(u.size(0), -1)[:, 0].long().to(lut.device)
+            ok = (u >= 0) & (u < lut.numel())
+            r = lut[u[ok]]
+            sel[r[r >= 0]] = True
+        info["n_forget_users"] = int(sel.sum().item())
+        if rows == "forget":
+            grad_masks[vid] = sel.to(um.values.weight.dtype).unsqueeze(1).to(um.values.weight.device)
+    if reset_alpha != 1.0 and sel is not None and sel.any():
+        ridx = sel.nonzero().flatten().to(um.values.weight.device)
+        with torch.no_grad():
+            w = torch.softmax(um.neighbor_sim[ridx] / um.tau, dim=-1)
+            nbr = (um.values.weight[um.neighbor_idx[ridx]] * w.unsqueeze(-1)).sum(1)
+            um.values.weight[ridx] = reset_alpha * um.values.weight[ridx] + (1 - reset_alpha) * nbr
+        info.update(user_reset_alpha=reset_alpha, n_users_reset=int(ridx.numel()))
+    log.info("[unified] user memory policy: %s", info)
+    return info
+
+
+# item-memory rows chosen by the last policy call per model (for local repair)
+_selected_rows: Dict[int, Optional[torch.Tensor]] = {}
+
+
+def _local_row_masks(
+    model: nn.Module, batches: Sequence[Any], items: Optional[torch.Tensor]
+) -> List[Optional[torch.Tensor]]:
+    """Per retain batch: bool (B,) mask of rows whose history has an affected item."""
+    if items is None or not bool(items.any()):
+        return [None] * len(batches)
+    if hasattr(model, "_ensure_item_id_map"):
+        model._ensure_item_id_map()
+    H = int(model.num_hierarchies)
+    items = items.to(model._adaptive_sorted_keys.device)
+    out = []
+    for b in batches:
+        mi = b[0]
+        seq = mi.transformed_sequences.get("sequence_data")
+        if seq is None or seq.dim() != 2 or seq.size(1) % H != 0:
+            out.append(None)
+            continue
+        seq = seq.to(items.device)
+        ids = model._codes_to_item_ids(seq.view(seq.size(0), -1, H).long())
+        hit = items[ids.clamp(min=0)] & (ids >= 0)
+        out.append(hit.any(dim=1))
+    return out
+
+
+def gather_batch_rows(sources: Sequence[Tuple[Any, torch.Tensor]]) -> Any:
+    """Rows ``idx`` of each TigerBatch in ``sources`` [(batch, idx), ...],
+    concatenated into one TigerBatch.
+
+    Same field rules as _split_batch_rows: a tensor (or list) whose leading dim
+    is a multiple k of the row count holds k entries per row and is gathered
+    per row; anything else (per-hierarchy, scalar) passes through untouched.
+    Fields are classified on the source with the most rows, since with one row
+    every field would look row-major.
+    """
+    import dataclasses
+
+    ns = [int(b[0].transformed_sequences["sequence_data"].size(0)) for b, _ in sources]
+    ref = max(range(len(sources)), key=lambda i: ns[i])
+
+    def _take(vals):
+        v0 = vals[ref]
+        if isinstance(v0, torch.Tensor):
+            n = ns[ref]
+            if not (v0.dim() >= 1 and v0.shape[0] % n == 0 and v0.shape[0] >= n):
+                return v0
+            k = v0.shape[0] // n
+            out = []
+            for v, (_, idx) in zip(vals, sources):
+                rows = (idx.long().cpu()[:, None] * k + torch.arange(k)).flatten()
+                out.append(v[rows.to(v.device)].to(v0.device))
+            return torch.cat(out, 0)
+        if isinstance(v0, dict):
+            return {key: _take([v[key] for v in vals]) for key in v0}
+        if isinstance(v0, list):
+            n = ns[ref]
+            if not (len(v0) % n == 0 and len(v0) >= n):
+                return v0
+            k = len(v0) // n
+            return [v[int(i) * k + j] for v, (_, idx) in zip(vals, sources)
+                    for i in idx for j in range(k)]
+        return v0
+
+    out = []
+    for part in range(2):
+        objs = [b[part] for b, _ in sources]
+        out.append(dataclasses.replace(objs[ref], **{
+            f.name: _take([getattr(o, f.name) for o in objs])
+            for f in dataclasses.fields(objs[ref])}))
+    return tuple(out)
+
+
+def _local_batches_from_pool(
+    model: nn.Module, pool: Sequence[Any], items: torch.Tensor, max_rows: int, seed: int
+) -> Tuple[List[Any], int]:
+    """One batch of at most ``max_rows`` pool rows whose history has an affected
+    item (seeded sample), plus the number of such rows in the whole pool."""
+    masks = _local_row_masks(model, pool, items)
+    hits = [(b, r) for b, m in enumerate(masks) if m is not None
+            for r in m.nonzero().flatten().tolist()]
+    if not hits:
+        return [], 0
+    g = torch.Generator().manual_seed(int(seed))
+    pick = torch.randperm(len(hits), generator=g)[: int(max_rows)].tolist()
+    by_batch: Dict[int, List[int]] = {}
+    for i in sorted(pick):
+        b, r = hits[i]
+        by_batch.setdefault(b, []).append(r)
+    return [gather_batch_rows([(pool[b], torch.tensor(rs)) for b, rs in by_batch.items()])], len(hits)
+
+
+def _item_read_counts(model: nn.Module, batches: Sequence[Any]) -> torch.Tensor:
+    """Per-item exemplar-memory reads over ``batches`` (forward only)."""
+    im = model.item_memory
+    im.enable_access_counting()
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for b in batches:
+            model.model_step(*b)
+    counts = im.get_access_counts().double()
+    im.disable_access_counting()
+    if was_training:
+        model.train()
+    return counts
+
+
+def _apply_item_memory_policy(
+    model: nn.Module,
+    params: List[nn.Parameter],
+    multiplier: Dict[int, float],
+    grad_masks: Dict[int, torch.Tensor],
+    forget_batches: Sequence[Any],
+    retain_batches: Sequence[Any],
+    *,
+    lr_scale: float,
+    backbone_scale: float,
+    rows: str,
+    top_t: int,
+    reset_alpha: float = 1.0,
+) -> Dict[str, Any]:
+    """Item-memory lr emphasis + row restriction (no-op without item_memory).
+
+    rows: all | forget | afihf (hard top_t) | afihf_soft (every forget-read row,
+    its UPDATE scaled by score / max score -- returned as info["_row_scale"] for
+    the caller's post-step row rescaling).
+    """
+    im = getattr(model, "item_memory", None)
+    rows = str(rows).strip().lower()
+    if rows not in ("all", "forget", "afihf", "afihf_soft"):
+        raise ValueError(f"item_memory_rows must be all|forget|afihf|afihf_soft, got {rows!r}")
+    um = getattr(model, "user_memory", None)
+    # exemplar entries are exempt from the backbone scale (they get their own)
+    exempt = {id(m.values.weight) for m in (im, um) if m is not None}
+    if im is None:
+        if lr_scale != 1.0 or rows != "all" or reset_alpha != 1.0:
+            raise ValueError(
+                "item_memory_lr_scale / item_memory_rows / item_memory_reset_alpha "
+                "need a model with model.item_memory enabled"
+            )
+        if backbone_scale != 1.0:
+            if um is None:
+                raise ValueError("backbone_lr_scale needs model.item_memory or model.user_memory")
+            if backbone_scale < 0:
+                raise ValueError("backbone_lr_scale must be >= 0")
+            for p in params:
+                if id(p) not in exempt:
+                    multiplier[id(p)] *= backbone_scale
+            return {"backbone_lr_scale": backbone_scale}
+        return {}
+    if lr_scale < 0 or backbone_scale < 0:
+        raise ValueError("item_memory_lr_scale and backbone_lr_scale must be >= 0")
+    vid = id(im.values.weight)
+    if vid not in multiplier:
+        # a restricted update scope (e.g. pkm_only) legitimately leaves the item
+        # memory out; only a requested item-memory setting is then an error
+        if lr_scale != 1.0 or rows != "all" or reset_alpha != 1.0 or backbone_scale != 1.0:
+            raise ValueError("item_memory_* / backbone_lr_scale requested, but "
+                             "item_memory.values is not in the update set (restricted scope?)")
+        return {}
+    for p in params:
+        if id(p) == vid:
+            multiplier[id(p)] *= lr_scale
+        elif id(p) not in exempt:
+            multiplier[id(p)] *= backbone_scale
+    info: Dict[str, Any] = {"item_memory_lr_scale": lr_scale, "backbone_lr_scale": backbone_scale,
+                            "item_memory_rows": rows}
+    sel = None
+    if rows != "all" or reset_alpha != 1.0:
+        af = _item_read_counts(model, forget_batches)
+        if rows in ("forget", "all"):
+            sel = af > 0
+        elif rows == "afihf_soft":
+            hf = _item_read_counts(model, retain_batches)
+            score = (af * torch.log((hf.sum() + 1.0) / (hf + 1.0))).clamp(min=0)
+            sel = af > 0
+            if score.max() > 0:
+                info["_row_scale"] = (score / score.max()).to(im.values.weight.dtype)
+        else:
+            hf = _item_read_counts(model, retain_batches)
+            score = af * torch.log((hf.sum() + 1.0) / (hf + 1.0))
+            score[af <= 0] = -float("inf")
+            k = min(int(top_t), int((af > 0).sum().item()))
+            sel = torch.zeros_like(af, dtype=torch.bool)
+            if k > 0:
+                sel[score.topk(k).indices] = True
+        if rows != "all":
+            mask = sel.to(im.values.weight.dtype).unsqueeze(1).to(im.values.weight.device)
+            grad_masks[vid] = mask
+        info.update(n_items_forget=int((af > 0).sum().item()), n_rows_selected=int(sel.sum().item()))
+    if reset_alpha != 1.0 and sel is not None and sel.any():
+        rows_idx = sel.nonzero().flatten().to(im.values.weight.device)
+        with torch.no_grad():
+            nid = im.neighbor_idx[rows_idx]  # (r, K)
+            w = torch.softmax(im.neighbor_sim[rows_idx] / im.tau, dim=-1)
+            nbr = (im.values.weight[nid] * w.unsqueeze(-1)).sum(1)
+            im.values.weight[rows_idx] = reset_alpha * im.values.weight[rows_idx] + (1 - reset_alpha) * nbr
+        info["reset_alpha"] = reset_alpha
+        info["n_rows_reset"] = int(rows_idx.numel())
+    _selected_rows[id(model)] = sel
+    log.info("[unified] item memory policy: %s", info)
+    return info
 
 
 def unified_unlearn(
@@ -74,6 +461,7 @@ def unified_unlearn(
     slot_lambda: float = 1.0,
     slot_mu: float = 5.0,
     slot_dot_abs: bool = False,
+    slot_protect_frac: float = 0.0,
     optimizer: str = "adam",
     code_lr_scale: float = 1.0,
     adaptive_code_lr_scale: float = 1.0,
@@ -84,6 +472,79 @@ def unified_unlearn(
     # request actually touches, so a deletion stops editing the identifier space
     # of the thousands of items that merely share a coarse code.
     code_row_keep: Optional[torch.Tensor] = None,
+    # Item-keyed exemplar memory (model.item_memory): put the update on the
+    # forget items' entries rather than the shared backbone. The values table
+    # gets lr * item_memory_lr_scale, every other tensor lr * backbone_lr_scale
+    # (0 = frozen, left out of the optimizer). item_memory_rows restricts which
+    # entries may move: all | forget (items read by the forget data) | afihf
+    # (top item_memory_top_t items by AF-IHF over forget vs retain reads).
+    item_memory_lr_scale: float = 1.0,
+    backbone_lr_scale: float = 1.0,
+    item_memory_rows: str = "all",
+    item_memory_top_t: int = 1000,
+    # Warm start: before optimizing, move each selected entry towards its
+    # neighbour average, v <- a*v + (1-a)*nbr(v). 1.0 = off. The item is KEPT;
+    # training with neighbour substitution makes this a state the model knows.
+    item_memory_reset_alpha: float = 1.0,
+    # Anti-nuking cap: after every step each item entry is projected back to within
+    # max_drift * ||v_0|| of its PRE-UNLEARNING value v_0 (anchor kept on the model across
+    # the requests of a sequence), so deletion requests (possibly adversarial) can adjust
+    # an item's entry but never wipe it out. None / 0 = off.
+    item_memory_max_drift: Optional[float] = None,
+    # Dominated-slot boost (PKM, full unlearning): the value rows of the top-t forget-
+    # dominated slots per memory (slot_boost_criterion, e.g. af_ihf) get slot_boost x the
+    # update while the rest of the model keeps 1x: the slots are modified, not deleted.
+    # slot_boost_max_drift: anti-nuking cap on PKM value rows (as item_memory_max_drift).
+    slot_boost: float = 1.0,
+    slot_boost_criterion: str = "af_ihf",
+    slot_boost_top_t: int = 1000,
+    slot_boost_max_drift: Optional[float] = None,
+    # Local repair (ADDITIONAL term; the uniform retain term is unchanged):
+    # lambda_local * CE on the retain rows whose history contains an affected
+    # item -- the users where collateral damage would show first.
+    #   local_repair_items: targets (the forget target items) | rows (the
+    #   item-memory rows selected for update)
+    lambda_local: float = 0.0,
+    local_repair_items: str = "targets",
+    # Where the local rows come from. The per-request retain subset is only
+    # retain_samples_used_for_update rows (16) and held 0 affected rows in every
+    # request of the first emphlocal runs, so the term never fired. With a pool
+    # (the FULL retain split, from the module when local_repair_source=full) the
+    # rows are drawn from it: up to local_repair_max_rows affected rows, a fixed
+    # seeded sample per request, one extra batch per step. None = the old
+    # subset-masking path.
+    local_retain_pool: Optional[Sequence[Any]] = None,
+    local_repair_max_rows: int = 256,
+    local_repair_seed: int = 0,
+    # Item-addressed PKM slots (pkm_params.item_slots > 0): which items' private
+    # slot blocks may move (all | forget | afihf, top pkm_item_top_t by AF-IHF
+    # over item occurrences in forget vs retain inputs) and their lr multiplier.
+    pkm_item_rows: str = "all",
+    pkm_item_top_t: int = 1000,
+    pkm_item_lr_scale: float = 1.0,
+    # User-keyed exemplar memory (model.user_memory): lr multiplier on the user
+    # tokens, which tokens may move (all | forget = the users in the forget
+    # batches), a warm start towards the neighbour average for those users
+    # (1.0 = off), and zero_shot = apply only the reset, no optimizer steps.
+    user_memory_lr_scale: float = 1.0,
+    user_memory_rows: str = "all",
+    user_memory_reset_alpha: float = 1.0,
+    zero_shot: bool = False,
+    # MUNKEY key deletion (model.munkey_memory): applied before any step, so with
+    # zero_shot it is MUNKEY's whole unlearning procedure.
+    munkey_delete: bool = False,
+    munkey_forget_user_ids: Optional[torch.Tensor] = None,
+    # Ported from the main branch (2026-10-21), unchanged: called with the 1-based
+    # epoch number after every full pass (every optim_steps_per_pass optimizer
+    # steps); returning True ends the loop early. Used by validation-based epoch
+    # selection (val_selection.EpochSelector), which also restores the best
+    # epoch's weights afterwards.
+    epoch_end_callback: Optional[Callable[[int], bool]] = None,
+    # Ported from main (2026-10-22), unchanged: gradient checkpointing of the
+    # neighbourhood slots / generative separation negatives. Memory only; the
+    # loss and gradients are unchanged (RNG state is preserved on recompute).
+    coherence_checkpoint: bool = False,
+    sep_checkpoint: bool = False,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     """Optimize unified objective.
@@ -272,6 +733,7 @@ def unified_unlearn(
                 lam=float(slot_lambda),
                 mu=float(slot_mu),
                 dot_abs=bool(slot_dot_abs),
+                protect_frac=float(slot_protect_frac),
             )
             name_to_mod = dict(model.named_modules())
             n_masked = 0
@@ -426,6 +888,75 @@ def unified_unlearn(
             m *= float(stable_code_lr_scale)
         multiplier[id(p)] = m
 
+    # anti-nuking anchor: the entries BEFORE the first request of this model's sequence
+    drift_anchor = None
+    if item_memory_max_drift:
+        if getattr(model, "item_memory", None) is None:
+            raise ValueError("item_memory_max_drift needs model.item_memory")
+        if float(item_memory_max_drift) <= 0:
+            raise ValueError("item_memory_max_drift must be > 0 (or null for off)")
+        if getattr(model, "_item_memory_anchor", None) is None:
+            model._item_memory_anchor = model.item_memory.values.weight.detach().clone()
+        drift_anchor = model._item_memory_anchor
+    item_mem_info = _apply_item_memory_policy(
+        model, params, multiplier, grad_masks, forget_batches, retain_batches,
+        lr_scale=float(item_memory_lr_scale), backbone_scale=float(backbone_lr_scale),
+        rows=str(item_memory_rows), top_t=int(item_memory_top_t),
+        reset_alpha=float(item_memory_reset_alpha),
+    )
+    item_mem_info.update(_apply_pkm_item_policy(
+        model, params, multiplier, grad_masks, forget_batches, retain_batches,
+        rows=str(pkm_item_rows), top_t=int(pkm_item_top_t), lr_scale=float(pkm_item_lr_scale),
+    ))
+    item_mem_info.update(_apply_user_memory_policy(
+        model, params, multiplier, grad_masks, forget_batches,
+        lr_scale=float(user_memory_lr_scale), rows=str(user_memory_rows),
+        reset_alpha=float(user_memory_reset_alpha),
+    ))
+    if munkey_delete:
+        item_mem_info.update(_apply_munkey_delete(model, forget_batches, munkey_forget_user_ids))
+    if zero_shot:
+        # only the parameter-free edits above (resets, key deletion) are applied
+        log.info("[unified] zero_shot=True: skipping all %d optimizer steps", steps)
+        steps = 0
+    # Local repair rows (additional term; see lambda_local).
+    local_masks: List[Optional[torch.Tensor]] = [None] * len(retain_batches)
+    local_batches: List[Any] = []
+    if float(lambda_local) > 0:
+        lri = str(local_repair_items).strip().lower()
+        if lri == "targets":
+            n_items = int(model.codebooks.size(0))
+            aff = torch.zeros(n_items, dtype=torch.bool)
+            for i in (forget_item_ids or []):
+                if 0 <= int(i) < n_items:
+                    aff[int(i)] = True
+        elif lri == "rows":
+            aff = _selected_rows.get(id(model))
+            if aff is None:
+                raise ValueError("local_repair_items=rows needs item_memory_rows != all")
+            aff = aff.bool()
+        else:
+            raise ValueError(f"local_repair_items must be targets|rows, got {lri!r}")
+        if local_retain_pool is not None:
+            local_batches, n_pool_hits = _local_batches_from_pool(
+                model, local_retain_pool, aff, local_repair_max_rows, local_repair_seed)
+            n_rows = sum(int(b[0].transformed_sequences["sequence_data"].size(0))
+                         for b in local_batches)
+            log.info("[unified] local repair (full retain pool): lambda_local=%s items=%s "
+                     "-> %d affected items, %d affected rows in %d pool batches, %d used",
+                     lambda_local, lri, int(aff.sum()), n_pool_hits,
+                     len(local_retain_pool), n_rows)
+            item_mem_info["local_repair_pool_hits"] = n_pool_hits
+        else:
+            local_masks = _local_row_masks(model, retain_batches, aff)
+            n_rows = sum(int(m.sum()) for m in local_masks if m is not None)
+            log.info("[unified] local repair: lambda_local=%s items=%s -> %d affected items, "
+                     "%d local retain rows over %d batches", lambda_local, lri,
+                     int(aff.sum()), n_rows, len(retain_batches))
+        item_mem_info["local_repair_rows"] = n_rows
+    # tensors with multiplier 0 (frozen backbone) leave the optimizer entirely
+    params = [p for p in params if multiplier[id(p)] != 0.0]
+
     by_mult: Dict[float, List[nn.Parameter]] = {}
     for p in params:
         by_mult.setdefault(multiplier[id(p)], []).append(p)
@@ -445,6 +976,50 @@ def unified_unlearn(
     # adaptive decoder heads get. Scaling .grad would be a no-op under Adam.
     row_lr_scale: Dict[int, torch.Tensor] = {}
     row_scaled_params: Dict[int, nn.Parameter] = {}
+    if item_mem_info.get("_row_scale") is not None:
+        _vw = model.item_memory.values.weight
+        row_lr_scale[id(_vw)] = item_mem_info.pop("_row_scale").to(_vw.device).unsqueeze(1).expand_as(_vw).clone()
+        row_scaled_params[id(_vw)] = _vw
+    slot_boost_info: Optional[Dict[str, Any]] = None
+    pkm_anchors: Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    if float(slot_boost) != 1.0 or slot_boost_max_drift:
+        if str(slot_selection).strip().lower() not in ("none", "", "off"):
+            raise ValueError("slot_boost and slot_selection are alternatives (boost modifies "
+                             "dominated slots inside a full update; selection restricts it)")
+        if float(slot_boost) < 0:
+            raise ValueError("slot_boost must be >= 0")
+        masks, sel_info = select_top_t_slots(
+            model, forget_batches, retain_batches,
+            criterion=str(slot_boost_criterion), top_t=int(slot_boost_top_t))
+        name_to_mod = dict(model.named_modules())
+        in_update = {id(p) for p in params}
+        for mem_name, mask in masks.items():
+            w = name_to_mod[mem_name].values.weight
+            if id(w) not in in_update:
+                raise ValueError("slot_boost needs the PKM values in the update set (update_scope=all)")
+            mult = (1.0 + (float(slot_boost) - 1.0)
+                    * mask.to(device=w.device, dtype=w.dtype).reshape(-1, 1)).expand_as(w).clone()
+            if id(w) in row_lr_scale:
+                row_lr_scale[id(w)] = row_lr_scale[id(w)] * mult
+            else:
+                row_lr_scale[id(w)] = mult
+                row_scaled_params[id(w)] = w
+            if slot_boost_max_drift:
+                # anchor = the values BEFORE the first request of this model's sequence; the
+                # cap covers only the boosted rows (union over requests so far), so the
+                # non-boosted rows update exactly as in the plain full update
+                store = model.__dict__.setdefault("_pkm_value_anchors", {})
+                if mem_name not in store:
+                    store[mem_name] = (w.detach().clone(),
+                                       torch.zeros(w.shape[0], dtype=torch.bool, device=w.device))
+                anc, boosted = store[mem_name]
+                boosted |= mask.reshape(-1).bool().to(boosted.device)
+                pkm_anchors[mem_name] = (w, anc, boosted)
+        slot_boost_info = {"slot_boost": float(slot_boost), "criterion": str(slot_boost_criterion),
+                           "top_t": int(slot_boost_top_t), "max_drift": slot_boost_max_drift,
+                           "selection": sel_info}
+        log.info("[unified] slot boost x%s on top-%d %s slots of %d memories (max_drift=%s)",
+                 slot_boost, int(slot_boost_top_t), slot_boost_criterion, len(masks), slot_boost_max_drift)
     if adaptive_row_masks:
         by_id = {id(p): p for p in params}
         for pid, mask in adaptive_row_masks.items():
@@ -583,6 +1158,7 @@ def unified_unlearn(
         log.info("[unified] SID-level weights: w_forget=%s w_retain=%s",
                  w_f, w_r)
 
+    steps_run = 0
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
 
@@ -624,6 +1200,7 @@ def unified_unlearn(
                         neighbor_mask,
                         loss_type=coherence_loss_type,
                         mass_cap=coherence_mass_cap,
+                        checkpoint=coherence_checkpoint,
                     )
                     if l_coh.requires_grad:
                         coh_term = (float(lambda_neighborhood) * l_coh) / float(q_forget)
@@ -633,6 +1210,7 @@ def unified_unlearn(
         # --- Retain side: q_retain mini-batches, each scaled by 1/q_retain ---
         l_retain_avg = 0.0
         l_sep_avg = 0.0
+        l_local_avg = 0.0
         last_retain_batch = None
         for j in range(q_retain):
             idx = (step * q_retain + j) % n_retain
@@ -674,6 +1252,7 @@ def unified_unlearn(
                     positives=sep_positives,
                     loss_type=sep_loss_type,
                     gen_temperature=float(sep_gen_temperature),
+                    checkpoint=sep_checkpoint,
                 )
             # lambda_retain weights the retain (repair) term. It exists so the
             # ascent/descent baselines are EXACT special cases of this objective
@@ -705,10 +1284,24 @@ def unified_unlearn(
             # (lambda_r=0, lambda_f>0), which is a case we deliberately run --
             # so guard rather than let it crash. Same guard the coherence term
             # already uses.
+            lm = local_masks[idx] if float(lambda_local) > 0 else None
+            if lm is not None and bool(lm.any()):
+                lp = model._per_row_log_prob(*retain_batch)
+                l_local = -lp[lm.to(lp.device)].mean()
+                retain_side = retain_side + float(lambda_local) * l_local
+                l_local_avg += float(l_local.detach().cpu()) / float(q_retain)
             if retain_side.requires_grad:
                 (retain_side / float(q_retain)).backward()
             l_retain_avg += float(l_retain.detach().cpu()) / float(q_retain)
             l_sep_avg += float(l_sep.detach().cpu()) / float(q_retain)
+
+        # Local repair from the full-retain pool: an ADDITIONAL term next to the
+        # uniform retain term, the same retain CE on the affected users' rows.
+        if local_batches:
+            lb = batch_to_device(local_batches[step % len(local_batches)], device)
+            l_local = model._batch_loss_from_model_step(lb)
+            (float(lambda_local) * l_local).backward()
+            l_local_avg = float(l_local.detach().cpu())
 
         # Mask stable-code rows out of the embedding gradient before stepping.
         if grad_masks:
@@ -738,6 +1331,11 @@ def unified_unlearn(
                     p.data.copy_(old.add_(delta))
             prev_rows.clear()
 
+        if drift_anchor is not None:
+            _project_item_drift(model.item_memory.values.weight, drift_anchor, float(item_memory_max_drift))
+        for _w, _anc, _rows in pkm_anchors.values():
+            _project_item_drift(_w, _anc, float(slot_boost_max_drift), rows=_rows)
+
         total_avg = (
             l_retain_avg
             + float(lambda_forget) * l_forget_avg
@@ -753,7 +1351,7 @@ def unified_unlearn(
         if step % max(1, steps // 10) == 0:
             log.info(
                 "[unified] step=%d/%d total=%.4f retain=%.4f forget=%.4f "
-                "sep=%.4f neighborhood=%.4f",
+                "sep=%.4f neighborhood=%.4f local=%.4f",
                 step,
                 steps,
                 total_avg,
@@ -761,9 +1359,19 @@ def unified_unlearn(
                 l_forget_avg,
                 l_sep_avg,
                 l_coh_avg,
+                l_local_avg,
             )
 
         del last_retain_batch  # free reference
+
+        steps_run = step + 1
+        if (epoch_end_callback is not None
+                and steps_run % optim_steps_per_pass == 0
+                and epoch_end_callback(steps_run // optim_steps_per_pass)):
+            log.info("[unified] stopped by epoch_end_callback after epoch %d "
+                     "(%d/%d steps)", steps_run // optim_steps_per_pass,
+                     steps_run, steps)
+            break
 
     def _mean(xs: List[float]) -> Optional[float]:
         return float(sum(xs) / max(1, len(xs))) if xs else None
@@ -771,6 +1379,7 @@ def unified_unlearn(
     return {
         "algorithm": "unified",
         "steps": steps,
+        "steps_run": steps_run,
         "n_epochs": n_epochs,
         "optim_steps_per_pass": optim_steps_per_pass,
         "q_forget": q_forget,
@@ -791,6 +1400,14 @@ def unified_unlearn(
         ],
         "restrict_adaptive_codes": bool(restrict_adaptive_codes),
         "slot_selection": slot_select_info,
+        "item_memory": item_mem_info,
+        "slot_boost": slot_boost_info,
+        "slot_boost_drift": ({n: {**_item_drift_stats(w, a, float(slot_boost_max_drift), rows=r),
+                                  "rows_capped_set": int(r.sum())}
+                              for n, (w, a, r) in pkm_anchors.items()} if pkm_anchors else None),
+        "item_memory_drift": (_item_drift_stats(model.item_memory.values.weight, drift_anchor,
+                                                float(item_memory_max_drift))
+                              if drift_anchor is not None else None),
         "update_positions": list(update_positions) if update_positions else None,
         "update_positions_backbone": (
             bool(update_positions_backbone) if update_positions else None

@@ -43,7 +43,8 @@ if [ "$STAGE" = retrain ]; then
     ovr=("model.pkm_explore={p:0.0,util_window:100}" "spam_forget_manifest=$MAN")
     [ $m = bnsw10 ] && ovr+=("${BAL_OVR[@]}" "${BN_OVR[@]}")
     echo "[$(date -Is)] retrain $m"
-    run env PKM_MODE=replace PKM_ENCODER=1 PKM_DECODER=none DETERMINISTIC=1 N_TARGET_ITEMS=1 \
+    bal=on; [ $m = p0 ] && bal=off  # p0 = the unbalanced control (default changed 2026-10-20)
+    run env PKM_MODE=replace PKM_ENCODER=1 PKM_DECODER=none PKM_BALANCE=$bal DETERMINISTIC=1 N_TARGET_ITEMS=1 \
       TIGER_DATA_DIR="$RETRAIN" RUN_LABEL_SUFFIX="_BALANCE_E1_${m}_RETRAIN_hairloss" \
       sbatch --partition=pgpu --gres=gpu:nvidia_a100-sxm4-80gb:2 --time=16:00:00 \
       run_tiger_train.sh beauty clean "$SID" 0.01 1 trainer.max_steps=4000 "${ovr[@]}"

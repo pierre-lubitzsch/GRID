@@ -5,8 +5,10 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
+import torch.utils.checkpoint
 import transformers
 from torch import nn
+from torch.nn import functional as F
 from torchmetrics.aggregation import BaseAggregator
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.modeling_outputs import Seq2SeqModelOutput
@@ -18,6 +20,8 @@ from src.data.loading.components.interfaces import (
 )
 from src.models.components.interfaces import OneKeyPerPredictionOutput
 from src.models.components.network_blocks.mlp import MLP
+from src.models.components.network_blocks.item_memory import build_item_memory, build_user_memory
+from src.models.components.network_blocks.munkey_memory import build_munkey_user_memory
 from src.models.components.network_blocks.product_key_memory import (
     HashingMemory,
     PKMExploreController,
@@ -565,6 +569,10 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         pkm_param_group: Optional[Dict[str, Any]] = None,
         pkm_explore: Optional[Dict[str, Any]] = None,
         pkm_balance: Optional[Dict[str, Any]] = None,
+        item_memory: Optional[Dict[str, Any]] = None,
+        user_memory: Optional[Dict[str, Any]] = None,
+        munkey_memory: Optional[Dict[str, Any]] = None,
+        group_memory: Optional[Dict[str, Any]] = None,
         should_check_prefix: bool = False,
         should_add_sep_token: bool = True,
         item_token_aggregation: Optional[Union[str, Dict[str, Any]]] = None,
@@ -645,7 +653,13 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self._pkm_param_group = dict(pkm_param_group) if pkm_param_group else None
 
         if pkm_layers is not None:
-            self._install_pkm_layers(pkm_layers, dict(pkm_params or {}), pkm_mode)
+            _pp = dict(pkm_params or {})
+            if int(_pp.get("item_slots", 0) or 0) > 0:
+                # item-addressed slots need the catalogue size and the
+                # SID -> item map (set per forward via set_item_context)
+                _pp["num_items"] = int(self.codebooks.size(0))
+                self._ensure_item_id_map()
+            self._install_pkm_layers(pkm_layers, _pp, pkm_mode)
 
         # Explore / exploit training of the PKM layers: with probability p per
         # optimizer step every memory reads (and updates) ALL slots, otherwise the
@@ -665,6 +679,19 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         if pkm_balance is not None and pkm_layers is not None:
             pkm_balance = dict(pkm_balance)
             self._pkm_balance_coef = float(pkm_balance.get("coef", 0.0))
+            # mean (old behaviour, the default when the key is absent): the coefficient
+            # is shared by all memories, so each of n memories gets coef / n; sum: the
+            # coefficient is PER MEMORY (= coef * n under mean), so adding memories
+            # keeps every layer's balancing pressure (ALL needed 0.8 under mean).
+            self._pkm_balance_reduction = str(pkm_balance.get("reduction", "mean")).strip().lower()
+            if self._pkm_balance_reduction not in ("mean", "sum"):
+                raise ValueError(f"pkm_balance.reduction must be mean|sum, got {self._pkm_balance_reduction!r}")
+            # optional linear anneal of the coefficient to 0: from optimizer step
+            # anneal_start over anneal_steps steps (0 = constant coefficient).
+            # Tests whether the balance loss is needed throughout or only to get
+            # the router out of the early collapse.
+            self._pkm_balance_anneal_start = int(pkm_balance.get("anneal_start", 0))
+            self._pkm_balance_anneal_steps = int(pkm_balance.get("anneal_steps", 0))
             if self._pkm_balance_coef > 0:
                 for module in self.modules():
                     if isinstance(module, HashingMemory):
@@ -674,7 +701,177 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                                 pkm_balance.get("token_entropy_weight", 1.0)
                             ),
                             kind=str(pkm_balance.get("kind", "mi")),
+                            standardize=bool(pkm_balance.get("standardize", True)),
                         )
+
+        # User-keyed exemplar memory (MUNKEY-style, users as instances): one
+        # learnable token per training user, PREPENDED to the encoder input,
+        # trained with pathway dropout + neighbour-user substitution. Test users
+        # are the training users, so each uses its own token. None => off.
+        self.user_memory = None
+        if user_memory is not None:
+            um = dict(user_memory)
+            if num_user_bins is not None:
+                raise ValueError("user_memory replaces the hashed user embedding; set num_user_bins=null")
+            # MUNKEY's categorical pathway mask over (history, user token):
+            # w.p. p_hist the whole history is replaced by a learned null token
+            # (the model must predict from the user token alone), w.p. p_drop
+            # the user token is nulled, never both. p_hist > 0 is what pushes
+            # instance information into the tokens rather than the backbone.
+            self._user_p_hist = float(um.get("p_hist", 0.0))
+            self._user_p_drop = float(um.get("p_drop", 0.1))
+            if self._user_p_hist + self._user_p_drop >= 1.0:
+                raise ValueError("user_memory: need p_hist + p_drop < 1")
+            if self._user_p_hist > 0:
+                self.user_hist_null = nn.Parameter(torch.zeros(int(self.embedding_dim)))
+            # pathway-sensitivity evaluation: None | "no_hist" | "no_token"
+            # (set from config user_memory.eval_pathway for eval-only runs)
+            _ep = um.get("eval_pathway", None)
+            _ep = None if _ep in (None, "", "none", "both") else str(_ep)
+            if _ep not in (None, "no_hist", "no_token"):
+                raise ValueError(f"user_memory.eval_pathway must be none|no_hist|no_token, got {_ep!r}")
+            self._pathway_eval: Optional[str] = _ep
+            self.user_memory = build_user_memory(
+                neighbor_file=str(um["neighbor_file"]),
+                dim=int(self.embedding_dim),
+                p_drop=float(um.get("p_drop", 0.1)),
+                p_nbr=float(um.get("p_nbr", 0.2)),
+                tau=float(um.get("tau", 0.1)),
+                init_scale=float(um.get("init_scale", 0.02)),
+            )
+
+        # MUNKEY baseline, ported from the authors' code (munkey_memory.py): one
+        # token per training USER (the instance), keyed by the frozen text-
+        # embedding mean of the history; prepended to the encoder input. Eval
+        # always retrieves (the query's own instance excluded by default, as
+        # MUNKEY's test queries are never instances); unlearning deletes keys.
+        self.munkey_memory = None
+        if munkey_memory is not None:
+            mk = dict(munkey_memory)
+            if num_user_bins is not None or user_memory is not None:
+                raise ValueError("munkey_memory replaces the user token: set num_user_bins=null, user_memory=null")
+            # pathway dropout, once per batch (MUL.training_step): w.p.
+            # p_token_drop the token is the null token, w.p. p_hist_drop the
+            # history is masked by a learned mask token (their image dropout)
+            self._munkey_p_token_drop = float(mk.get("p_token_drop", 0.0))
+            self._munkey_p_hist_drop = float(mk.get("p_hist_drop", 0.0))
+            if self._munkey_p_token_drop + self._munkey_p_hist_drop >= 1.0:
+                raise ValueError("munkey_memory: need p_token_drop + p_hist_drop < 1")
+            self._munkey_exclude_self = bool(mk.get("eval_exclude_self", True))
+            _ep = mk.get("eval_pathway", None)
+            _ep = None if _ep in (None, "", "none", "both") else str(_ep)
+            if _ep not in (None, "no_hist", "no_token"):
+                raise ValueError(f"munkey_memory.eval_pathway must be none|no_hist|no_token, got {_ep!r}")
+            self._munkey_eval_pathway: Optional[str] = _ep
+            self.munkey_memory = build_munkey_user_memory(
+                key_file=str(mk["key_file"]),
+                model_dim=int(self.embedding_dim),
+                token_dim=int(mk.get("token_dim", 128)),
+                topk=int(mk.get("topk", 4)),
+                tau=float(mk.get("tau", 0.07)),
+                p_retrieval=float(mk.get("p_retrieval", 0.0)),
+                var_k=bool(mk.get("var_k", True)),
+                freeze_memory=bool(mk.get("freeze_memory", True)),
+            )
+            self.munkey_hist_mask = nn.Parameter(torch.zeros(int(self.embedding_dim)))
+            nn.init.trunc_normal_(self.munkey_hist_mask, std=0.02)
+            # frozen item text embeddings: the key encoder for eval queries
+            emb = torch.load(str(mk["item_embedding_path"]), map_location="cpu", weights_only=False)
+            self.register_buffer("munkey_item_keys", F.normalize(emb.float(), dim=-1),
+                                 persistent=False)
+            if getattr(self, "codebooks", None) is None:
+                raise ValueError("munkey_memory requires codebooks (item -> SID map)")
+
+        # Item-keyed exemplar memory (MUNKEY-style, see item_memory.py): one
+        # learnable entry per item, added to that item's input token embeddings,
+        # trained with pathway dropout + neighbour substitution. None => off.
+        # Category memory keyed by the first SID level (see GroupMemory). None => off.
+        self.group_memory = None
+        if group_memory is not None:
+            from src.models.components.network_blocks.item_memory import GroupMemory
+            gm = dict(group_memory)
+            self.group_memory = GroupMemory(
+                num_groups=int(self.num_embeddings_per_hierarchy),
+                dim=int(self.embedding_dim),
+                slots=int(gm.get("slots", 32)),
+                knn=int(gm.get("knn", 4)),
+                key_dim=int(gm.get("key_dim", 64)),
+                p_drop=float(gm.get("p_drop", 0.0)),
+            )
+        self.item_memory = None
+        if item_memory is not None:
+            im = dict(item_memory)
+            if getattr(self, "codebooks", None) is None:
+                raise ValueError("item_memory requires codebooks (item -> SID map)")
+            self._ensure_item_id_map()
+            self.item_memory = build_item_memory(
+                num_items=int(self.codebooks.size(0)),
+                dim=int(self.embedding_dim),
+                embedding_path=str(im["embedding_path"]),
+                max_neighbors=int(im.get("max_neighbors", 4)),
+                p_drop=float(im.get("p_drop", 0.1)),
+                p_nbr=float(im.get("p_nbr", 0.2)),
+                tau=float(im.get("tau", 0.1)),
+                init_scale=float(im.get("init_scale", 0.02)),
+                recipe=str(im.get("recipe", "ours")),
+                # memory-size study (2026-11-25): row size, head-only rows, eval quantization
+                row_dim=(int(im["row_dim"]) if im.get("row_dim") else None),
+                head_frac=float(im.get("head_frac", 1.0)),
+                counts_path=(str(im["counts_path"]) if im.get("counts_path") else None),
+                eval_quant=str(im.get("eval_quant", "none")),
+            )
+            # Output-side item score (see ItemExemplarMemory.item_score):
+            # trained with a sampled-softmax loss on the target item, used at
+            # inference to rerank the beam: log p_beam + score_weight * s_i.
+            self._item_score_weight = float(im.get("score_weight", 0.0))
+            self._item_score_loss_weight = float(im.get("score_loss_weight", 0.0))
+            self._item_score_negatives = int(im.get("score_negatives", 255))
+            self._item_score_tau = float(im.get("score_tau", 1.0))
+            # Consistency distillation: KL(stopgrad(p_own) || p_nbr), where p_nbr
+            # is the prediction with every entry swapped for its neighbour average
+            # (neighbour values detached, so the gradient trains the BACKBONE to
+            # make "entry replaced by neighbours" a good prediction). 0 = off.
+            self._item_consistency_weight = float(im.get("consistency_weight", 0.0))
+            # input_term=false: the memory feeds ONLY the output-side item score, nothing is
+            # added to the encoder input ("plain + score": isolates the reranking head from
+            # the input memory). Default true = unchanged behavior.
+            self._item_input_term = bool(im.get("input_term", True))
+            # Inference-time pathway ablation (eval-only runs): none (default) | null (every
+            # entry -> the learned null token, as under training-time pathway dropout) |
+            # skip (nothing added to the encoder input). The score pathway is switched off
+            # separately with score_weight=0 (no reranking).
+            # "nulltoken" is the canonical name: an unquoted `eval_pathway:null` reaches us as
+            # Python None (YAML null) and used to fall through to "none", silently leaving the
+            # memory ON in every memory-off eval before 2026-10-29. Refuse it instead.
+            if "eval_pathway" in im and im["eval_pathway"] is None:
+                raise ValueError("item_memory.eval_pathway is YAML null; use eval_pathway:nulltoken "
+                                 "(memory off) or omit the key (memory on)")
+            _ep = str(im.get("eval_pathway", "none")).lower()
+            if _ep == "nulltoken":
+                _ep = "null"
+            if _ep not in ("none", "null", "skip"):
+                raise ValueError(f"item_memory.eval_pathway must be none|nulltoken|skip, got {_ep!r}")
+            self._item_eval_pathway = _ep
+            if not self._item_input_term and self._item_consistency_weight > 0:
+                raise ValueError("consistency_weight acts through the input term; "
+                                 "it cannot be used with input_term=false")
+            if not self._item_input_term:
+                # the input path (adapter, null token) is unused: freeze it, or DDP fails
+                # on parameters that never receive a gradient
+                for name in ("null_value", "adapter"):
+                    mod = getattr(self.item_memory, name, None)
+                    if isinstance(mod, torch.nn.Parameter):
+                        mod.requires_grad_(False)
+                    elif isinstance(mod, torch.nn.Module):
+                        for prm in mod.parameters():
+                            prm.requires_grad_(False)
+            elif float(im.get("p_drop", 0.1)) == 0 and str(im.get("recipe", "ours")) == "ours":
+                # p_drop=0 (capacity control: plain item vectors, no pathway dropout): the
+                # null token is never used in training; freeze it for DDP (stays zero, so
+                # eval_pathway=null then adds adapter(0) = the adapter bias only; "skip" adds nothing)
+                self.item_memory.null_value.requires_grad_(False)
+            if self._item_score_weight > 0 or self._item_score_loss_weight > 0:
+                self.item_memory.enable_item_score()
 
         if mlp_layers is not None:
             # bloating the mlp layers in both encoder and decoder
@@ -1076,7 +1273,21 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         self.adaptive_item_offset = nn.Parameter(
             torch.zeros(num_items, num_adaptive, self.embedding_dim, device=device)
         )
+        self._ensure_item_id_map()
 
+    def _ensure_item_id_map(self) -> None:
+        """Build the vectorised (SID code tuple -> item id) inverse map once.
+
+        Used by _codes_to_item_ids for the adaptive offsets and the item memory.
+        """
+        if getattr(self, "_adaptive_sorted_keys", None) is not None:
+            return
+        num_hierarchies = int(self.num_hierarchies)
+        codebook_size = int(self.num_embeddings_per_hierarchy)
+        # May run inside __init__ (item memory / item slots), before the SID
+        # embedding table exists; the buffers follow later .to(device) calls.
+        _tbl = getattr(self, "item_sid_embedding_table_encoder", None)
+        device = _tbl.weight.device if _tbl is not None else self.codebooks.device
         # Inverse map: encode each item's code tuple as a unique integer key and
         # keep them sorted for vectorised lookup via searchsorted.
         powers = codebook_size ** torch.arange(num_hierarchies, dtype=torch.long)
@@ -1344,6 +1555,55 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             match, self._adaptive_sorted_item_ids[pos], torch.full_like(keys, -1)
         )
 
+    def _inject_group_memory(
+        self, embeds: torch.Tensor, raw_codes: torch.Tensor
+    ) -> torch.Tensor:
+        """Add each history item's category-memory read (group = its level-0 code) to all
+        of its SID tokens. No-op unless group_memory is on and the input is item-aligned."""
+        if getattr(self, "group_memory", None) is None:
+            return embeds
+        H = int(self.num_hierarchies)
+        if raw_codes.dim() != 2 or raw_codes.size(1) == 0 or raw_codes.size(1) % H != 0:
+            return embeds
+        B, L = raw_codes.shape
+        codes = raw_codes.view(B, L // H, H)
+        emb = embeds.view(B, L // H, H, embeds.size(-1))
+        self._ensure_item_id_map()
+        real = self._codes_to_item_ids(codes.long()) >= 0          # padding / unknown -> no read
+        groups = torch.where(real, codes[..., 0].long(), torch.full_like(codes[..., 0], -1).long())
+        out = self.group_memory(groups, emb.mean(2))              # (B, n, d)
+        return (emb + out.unsqueeze(2).to(embeds.dtype)).view(B, L, embeds.size(-1))
+
+    def _inject_item_memory(
+        self, embeds: torch.Tensor, raw_codes: torch.Tensor
+    ) -> torch.Tensor:
+        """Add each history item's exemplar-memory term to all of its SID tokens.
+
+        No-op unless item_memory is enabled and ``raw_codes`` is aligned to full
+        item blocks (same guard as the adaptive offsets).
+        """
+        if self.item_memory is None or not getattr(self, "_item_input_term", True):
+            return embeds
+        num_hierarchies = int(self.num_hierarchies)
+        if (
+            raw_codes.dim() != 2
+            or raw_codes.size(1) == 0
+            or raw_codes.size(1) % num_hierarchies != 0
+        ):
+            return embeds
+        batch, seq_len = raw_codes.shape
+        n_items = seq_len // num_hierarchies
+        item_ids = self._codes_to_item_ids(raw_codes.view(batch, n_items, num_hierarchies))
+        _ep = getattr(self, "_item_eval_pathway", "none")
+        if _ep == "skip":
+            return embeds
+        if _ep == "null":
+            mem = self.item_memory(item_ids, drop_mask=torch.ones_like(item_ids, dtype=torch.bool))
+        else:
+            mem = self.item_memory(item_ids)  # (batch, n_items, d)
+        emb_items = embeds.view(batch, n_items, num_hierarchies, embeds.size(-1))
+        return (emb_items + mem.unsqueeze(2).to(embeds.dtype)).view(batch, seq_len, embeds.size(-1))
+
     def _inject_adaptive_offsets(
         self, embeds: torch.Tensor, raw_codes: torch.Tensor
     ) -> torch.Tensor:
@@ -1387,6 +1647,14 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         label_data: SequentialModuleLabelData,
     ) -> torch.Tensor:
         """Approximate ``log p(s_i | h_u)`` as sum of hierarchy log-probs."""
+        return self._per_row_log_prob(model_input, label_data).mean()
+
+    def _per_row_log_prob(
+        self,
+        model_input: SequentialModelInputData,
+        label_data: SequentialModuleLabelData,
+    ) -> torch.Tensor:
+        """Per-row ``log p(s_i | h_u)`` (sum of hierarchy log-probs), shape (B,)."""
         fut_ids = None
         for label in label_data.labels:
             fut_ids = label_data.labels[label].reshape(model_input.mask.size(0), -1)
@@ -1405,7 +1673,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             log_p = torch.nn.functional.log_softmax(logits, dim=-1)
             target = fut_ids[:, hierarchy].long()
             log_probs.append(log_p.gather(1, target.unsqueeze(1)).squeeze(1))
-        return torch.stack(log_probs, dim=1).sum(dim=1).mean()
+        return torch.stack(log_probs, dim=1).sum(dim=1)
 
     def _teacher_forced_log_prob(
         self,
@@ -1448,6 +1716,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         neighbor_mask: torch.Tensor,
         loss_type: str = "nll",
         mass_cap: float = 0.999,
+        checkpoint: bool = False,
     ) -> torch.Tensor:
         """Coherence loss ``L_n``, prefix-neighbour variant. Two forms.
 
@@ -1533,7 +1802,16 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
             slot_mask = neighbor_mask[:, c]
             if float(slot_mask.sum()) == 0.0:
                 continue
-            lp = self._teacher_forced_log_prob(model_input, neighbor_sids[:, c])
+            if checkpoint:
+                # Keep only this slot's log-prob and recompute its forward pass in
+                # backward (same RNG state), so memory no longer grows with the
+                # number of neighbour slots. Gradients are unchanged.
+                lp = torch.utils.checkpoint.checkpoint(
+                    self._teacher_forced_log_prob, model_input, neighbor_sids[:, c],
+                    use_reentrant=False,
+                )
+            else:
+                lp = self._teacher_forced_log_prob(model_input, neighbor_sids[:, c])
             log_probs = log_probs.clone()
             log_probs[:, c] = torch.where(
                 slot_mask > 0, lp, torch.full_like(lp, float("-inf"))
@@ -1694,6 +1972,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         *,
         neg_ids: List[int],
         temperature: float = 1.0,
+        checkpoint: bool = False,
     ) -> torch.Tensor:
         """``L_sep`` with sequence log-probabilities as the InfoNCE logits.
 
@@ -1704,6 +1983,11 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         Positive = the batch label; negatives = ``neg_ids`` scored against the
         SAME retain histories. See :meth:`compute_sep_loss` for why the negative
         set must stay small. Costs ``1 + len(neg_ids)`` teacher-forced passes.
+
+        ``checkpoint=True`` recomputes each negative's pass in the backward pass
+        instead of keeping its activations, so peak memory no longer grows with
+        the number of negatives (a takedown of 95 items or ten spam targets ran
+        out of memory on 80 GB without it). Loss and gradients are unchanged.
         """
         model_input, label_data = retain_batch
         device = next(self.parameters()).device
@@ -1724,12 +2008,22 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
 
         # log p(s_i_f | h_u) for each negative, same histories.
         neg_sids = self.codebooks[torch.tensor(neg_ids)].to(device).long()  # [N, H]
-        neg_lps = [
-            self._teacher_forced_log_prob(
-                model_input, neg_sids[j].unsqueeze(0).expand(bsz, n_hier)
-            )
-            for j in range(neg_sids.size(0))
-        ]  # each [B]
+        if checkpoint:
+            neg_lps = [
+                torch.utils.checkpoint.checkpoint(
+                    self._teacher_forced_log_prob, model_input,
+                    neg_sids[j].unsqueeze(0).expand(bsz, n_hier),
+                    use_reentrant=False,
+                )
+                for j in range(neg_sids.size(0))
+            ]  # each [B]
+        else:
+            neg_lps = [
+                self._teacher_forced_log_prob(
+                    model_input, neg_sids[j].unsqueeze(0).expand(bsz, n_hier)
+                )
+                for j in range(neg_sids.size(0))
+            ]  # each [B]
 
         tau = float(temperature)
         if tau <= 0:
@@ -1747,6 +2041,7 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         positives: str = "history",
         loss_type: str = "cosine",
         gen_temperature: float = 1.0,
+        checkpoint: bool = False,
     ) -> torch.Tensor:
         """Separation loss ``L_sep'`` (per-user, all-positives form).
 
@@ -1843,7 +2138,8 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
 
         if loss_type == "generative":
             return self._sep_loss_generative(
-                retain_batch, neg_ids=neg_ids, temperature=float(gen_temperature)
+                retain_batch, neg_ids=neg_ids, temperature=float(gen_temperature),
+                checkpoint=checkpoint,
             )
 
         # --- history item SID rows: [B, n_items, H] (raw codes) ---
@@ -2088,6 +2384,12 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         inputs_embeds_for_encoder = self._inject_soft_sid_embeddings(
             inputs_embeds_for_encoder, input_ids
         )
+        inputs_embeds_for_encoder = self._inject_item_memory(
+            inputs_embeds_for_encoder, input_ids
+        )
+        inputs_embeds_for_encoder = self._inject_group_memory(
+            inputs_embeds_for_encoder, input_ids
+        )
 
         if self.item_token_merger is not None:
             # Input-side aggregation: collapse each item's num_hierarchies token
@@ -2112,8 +2414,50 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 num_hierarchies=self.num_hierarchies,
             )
 
+        if getattr(self, "munkey_memory", None) is not None:
+            inputs_embeds_for_encoder, attention_mask_for_encoder = self._munkey_prepend(
+                inputs_embeds_for_encoder, attention_mask, input_ids, user_id
+            )
+        # user-keyed exemplar memory: prepend the user's token (same layout as
+        # the hashed user embedding below, which it replaces)
+        elif user_id is not None and getattr(self, "user_memory", None) is not None:
+            uid = user_id[:, 0].long()
+            lut = self.user_memory.uid_to_row
+            rows = torch.where(
+                (uid >= 0) & (uid < lut.numel()), lut[uid.clamp(0, lut.numel() - 1)],
+                torch.full_like(uid, -1),
+            )
+            B = rows.size(0)
+            hist_drop = torch.zeros(B, dtype=torch.bool, device=rows.device)
+            tok_drop = torch.zeros(B, dtype=torch.bool, device=rows.device)
+            if self.training:
+                u = torch.rand(B, device=rows.device)
+                hist_drop = u < self._user_p_hist
+                tok_drop = (u >= self._user_p_hist) & (u < self._user_p_hist + self._user_p_drop)
+            elif self._pathway_eval == "no_hist":
+                hist_drop[:] = True
+            elif self._pathway_eval == "no_token":
+                tok_drop[:] = True
+            if hist_drop.any():
+                null_h = getattr(self, "user_hist_null", None)
+                if null_h is None:  # eval of a model trained without p_hist
+                    null_h = torch.zeros(inputs_embeds_for_encoder.size(-1),
+                                         device=inputs_embeds_for_encoder.device)
+                inputs_embeds_for_encoder = torch.where(
+                    hist_drop.view(B, 1, 1),
+                    null_h.to(inputs_embeds_for_encoder.dtype).expand_as(inputs_embeds_for_encoder),
+                    inputs_embeds_for_encoder,
+                )
+            user_tok = self.user_memory(rows, drop_mask=tok_drop).to(inputs_embeds_for_encoder.dtype)  # (B, d)
+            inputs_embeds_for_encoder = torch.cat(
+                [user_tok.unsqueeze(1), inputs_embeds_for_encoder], dim=1
+            )
+            attention_mask_for_encoder = torch.cat(
+                [torch.ones(attention_mask.size(0), 1, device=attention_mask.device,
+                            dtype=attention_mask.dtype), attention_mask], dim=1
+            )
         # we enter this loop if we want to use user_id
-        if user_id is not None and self.user_embedding is not None:
+        elif user_id is not None and self.user_embedding is not None:
             # preprocessing function pad user_id with zeros
             # so we only need to take the first column
             user_id = user_id[:, 0]
@@ -2145,11 +2489,123 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
         else:
             attention_mask_for_encoder = attention_mask
 
-        encoder_output = self.encoder(
-            sequence_embedding=inputs_embeds_for_encoder,
-            attention_mask=attention_mask_for_encoder,
-        )
+        item_mems = self._item_slot_memories()
+        if item_mems:
+            tok_items = self._encoder_token_item_ids(
+                input_ids, inputs_embeds_for_encoder.size(1)
+            )
+            for m in item_mems:
+                m.set_item_context(tok_items)
+        try:
+            encoder_output = self.encoder(
+                sequence_embedding=inputs_embeds_for_encoder,
+                attention_mask=attention_mask_for_encoder,
+            )
+        finally:
+            for m in item_mems:
+                m.set_item_context(None)
         return encoder_output, attention_mask_for_encoder
+
+    def _item_slot_memories(self) -> List[HashingMemory]:
+        if not hasattr(self, "_item_slot_mem_cache"):
+            self._item_slot_mem_cache = [
+                m for m in self.modules()
+                if isinstance(m, HashingMemory) and getattr(m, "item_slots", 0) > 0
+            ]
+        return self._item_slot_mem_cache
+
+    def _munkey_query_keys(self, raw_codes: torch.Tensor) -> torch.Tensor:
+        """Frozen key of each input history: mean of the L2-normalised item text
+        embeddings over its DISTINCT items (as build_user_neighbors.user_keys)."""
+        H = int(self.num_hierarchies)
+        B = raw_codes.size(0)
+        keys = self.munkey_item_keys
+        if raw_codes.dim() != 2 or raw_codes.size(1) % H != 0:
+            raise ValueError("munkey_memory needs item-aligned encoder input codes")
+        self._ensure_item_id_map()
+        items = self._codes_to_item_ids(raw_codes.view(B, -1, H).long())  # (B, n)
+        ok = (items >= 0) & (items < keys.size(0))
+        present = torch.zeros(B, keys.size(0), device=keys.device, dtype=keys.dtype)
+        present.scatter_add_(1, items.clamp(min=0).to(keys.device), ok.to(keys.dtype).to(keys.device))
+        present = present.clamp(max=1)
+        return (present @ keys) / present.sum(1, keepdim=True).clamp(min=1)
+
+    def _munkey_prepend(
+        self,
+        embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        raw_codes: torch.Tensor,
+        user_id: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """MUNKEY token for each row (see munkey_memory.py), prepended to the
+        encoder input, with MUNKEY's per-batch pathway dropout."""
+        mm = self.munkey_memory
+        B = embeds.size(0)
+        rows = torch.full((B,), -1, dtype=torch.long, device=embeds.device)
+        if user_id is not None:
+            uid = user_id.reshape(B, -1)[:, 0].long().to(embeds.device)
+            lut = mm.uid_to_row.to(embeds.device)
+            known = (uid >= 0) & (uid < lut.numel())
+            rows = torch.where(known, lut[uid.clamp(0, lut.numel() - 1)], rows)
+        null = mm.null_tokens(B)
+        if self.training:
+            known = rows >= 0
+            # DDP needs every parameter in the graph on every step, so the own
+            # tokens, the null token and the history mask are always computed and
+            # SELECTED below (an inactive branch contributes exactly zero)
+            own = torch.where(known.unsqueeze(1), mm.tokens(rows.clamp(min=0)), null)
+            if torch.rand(()).item() < mm.p_retrieval:
+                # retrieval branch: cached instance keys as queries, the whole
+                # batch masked out of the candidates, neighbour tokens detached
+                q = mm.keys[rows.clamp(min=0)].float()
+                if not known.all():
+                    q[~known] = self._munkey_query_keys(raw_codes)[~known].float()
+                tok = mm.retrieve(q, k=mm.sample_k() if mm.var_k else None,
+                                  exclude=rows[known].unique()) + 0.0 * own
+            else:
+                tok = own
+            u = torch.rand(()).item()
+            drop_token = u < self._munkey_p_token_drop
+            drop_hist = (not drop_token) and u < self._munkey_p_token_drop + self._munkey_p_hist_drop
+        else:
+            tok = mm.retrieve(self._munkey_query_keys(raw_codes),
+                              exclude_self=rows if self._munkey_exclude_self else None)
+            drop_token = self._munkey_eval_pathway == "no_token"
+            drop_hist = self._munkey_eval_pathway == "no_hist"
+        dev = embeds.device
+        tok = torch.where(torch.tensor(drop_token, device=dev), null, tok)
+        embeds = torch.where(torch.tensor(drop_hist, device=dev),
+                             self.munkey_hist_mask.to(embeds.dtype).expand_as(embeds), embeds)
+        embeds = torch.cat([tok.to(embeds.dtype).unsqueeze(1), embeds], dim=1)
+        mask = torch.cat([torch.ones(B, 1, device=attention_mask.device, dtype=attention_mask.dtype),
+                          attention_mask], dim=1)
+        return embeds, mask
+
+    def _encoder_token_item_ids(self, raw_codes: torch.Tensor, final_len: int) -> Optional[torch.Tensor]:
+        """Item id of every token in the FINAL encoder input layout (-1 = none).
+
+        Mirrors encoder_forward_pass: H code tokens per item, then (if used) a
+        separator token that is attributed to the same item, or one merged token
+        per item; a prepended user token gets -1. Returns None if the layout
+        cannot be reconstructed (the item read is then skipped).
+        """
+        H = int(self.num_hierarchies)
+        if raw_codes.dim() != 2 or raw_codes.size(1) == 0 or raw_codes.size(1) % H != 0:
+            return None
+        B = raw_codes.size(0)
+        items = self._codes_to_item_ids(raw_codes.view(B, -1, H).long())  # (B, n)
+        if self.item_token_merger is not None:
+            per = 1
+        elif self.sep_token is not None:
+            per = H + 1
+        else:
+            per = H
+        tok = items.repeat_interleave(per, dim=1)
+        if tok.size(1) == final_len - 1:  # prepended user token
+            tok = torch.cat([torch.full_like(tok[:, :1], -1), tok], dim=1)
+        if tok.size(1) != final_len:
+            return None
+        return tok
 
     def decoder_forward_pass(
         self,
@@ -2306,6 +2762,8 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
 
             # decoder_output[:, -1, :] is the embedding for the next token
             latest_output_representation = decoder_output[:, -1, :]
+            if hierarchy == 0:
+                h0 = latest_output_representation  # user state after BOS
 
             # # calculating the logits for the next token
             candidate_logits = self.decoder.decoder_mlp[hierarchy](
@@ -2326,7 +2784,28 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 user_id=user_id,
             )
 
+        if getattr(self, "_item_score_weight", 0.0) > 0:
+            generated_ids, marginal_log_prob = self._rerank_by_item_score(
+                h0, generated_ids, marginal_log_prob
+            )
         return generated_ids, marginal_log_prob
+
+    def _rerank_by_item_score(self, h0, generated_ids, marginal_prob):
+        """Reorder the final beams by log p_beam + score_weight * s_i(h0).
+
+        generated_ids (B, k, H), marginal_prob (B, k) are beam probabilities.
+        Only reorders the k beams (it cannot add items beam search dropped);
+        the returned second value stays a probability-like score, now
+        exp(log p + w * s), so downstream code that sorts by it is consistent.
+        """
+        item_ids = self._codes_to_item_ids(generated_ids.long())  # (B, k)
+        s = self.item_memory.item_score(h0, item_ids)
+        score = torch.log(marginal_prob.clamp_min(1e-30)) + self._item_score_weight * s
+        order = score.argsort(dim=-1, descending=True)
+        generated_ids = torch.gather(
+            generated_ids, 1, order.unsqueeze(-1).expand_as(generated_ids)
+        )
+        return generated_ids, torch.gather(score, 1, order).exp()
 
     def forward(
         self,
@@ -2453,8 +2932,67 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 target=fut_ids[:, hierarchy].long(),
             )
         if self._pkm_balance_coef > 0 and self.training:
-            loss = loss + self._pkm_balance_coef * self._pkm_balance_loss()
+            coef = self._pkm_balance_coef
+            n = getattr(self, "_pkm_balance_anneal_steps", 0)
+            if n > 0:
+                done = (int(self.global_step) - self._pkm_balance_anneal_start) / n
+                coef = coef * min(1.0, max(0.0, 1.0 - done))
+                self.log("pkm/balance_coef", coef, on_step=True, on_epoch=False)
+            if coef > 0:
+                loss = loss + coef * self._pkm_balance_loss()
+        if self.training and getattr(self, "_item_consistency_weight", 0.0) > 0:
+            loss = loss + self._item_consistency_weight * self._item_consistency_loss(
+                model_input, fut_ids, model_output
+            )
+        if getattr(self, "_item_score_loss_weight", 0.0) > 0:
+            # model_output[:, 0] is the decoder state after BOS, i.e. the user
+            # state before any code of the next item is chosen.
+            loss = loss + self._item_score_loss_weight * self._item_score_loss(
+                model_output[:, 0], fut_ids
+            )
         return model_output, loss
+
+    def _item_consistency_loss(self, model_input, fut_ids, own_output) -> torch.Tensor:
+        """KL(stopgrad(p_own) || p_nbr), summed over hierarchies, batch mean."""
+        im = self.item_memory
+        im.force_mode = "neighbor"
+        try:
+            nbr_output = self.forward(
+                attention_mask_encoder=model_input.mask,
+                future_ids=fut_ids,
+                **{
+                    self.feature_to_model_input_map.get(k, k): v
+                    for k, v in model_input.transformed_sequences.items()
+                },
+            )[:, :-1]
+        finally:
+            im.force_mode = None
+        kl = 0.0
+        for h in range(self.num_hierarchies):
+            head = self.decoder.decoder_mlp[h]
+            p_own = F.log_softmax(head(own_output[:, h]).float(), dim=-1).detach()
+            p_nbr = F.log_softmax(head(nbr_output[:, h]).float(), dim=-1)
+            kl = kl + F.kl_div(p_nbr, p_own, log_target=True, reduction="batchmean")
+        return kl
+
+    def _item_score_loss(self, h0: torch.Tensor, fut_ids: torch.Tensor) -> torch.Tensor:
+        """Sampled-softmax CE of the target item against random negatives.
+
+        Part of model_step, so unified's forget (ascent) and retain (descent)
+        terms act on it too: ascent on a forget row lowers the TARGET item's own
+        entry, the local lever for "recommend this item less".
+        """
+        im = self.item_memory
+        tgt = self._codes_to_item_ids(fut_ids[:, : int(self.num_hierarchies)].long())
+        ok = tgt >= 0
+        if not ok.any():
+            return torch.zeros((), device=h0.device)
+        h0, tgt = h0[ok], tgt[ok]
+        neg = torch.randint(0, im.num_items, (h0.size(0), self._item_score_negatives), device=h0.device)
+        cand = torch.cat([tgt.unsqueeze(1), neg], dim=1)  # positive at column 0
+        logits = im.item_score(h0, cand) / self._item_score_tau
+        logits[:, 1:] = logits[:, 1:].masked_fill(neg == tgt.unsqueeze(1), -float("inf"))
+        return F.cross_entropy(logits.float(), torch.zeros(h0.size(0), dtype=torch.long, device=h0.device))
 
     def _pkm_balance_loss(self) -> torch.Tensor:
         """Mean routing balance loss over the PKM layers read in this forward."""
@@ -2467,7 +3005,8 @@ class SemanticIDEncoderDecoder(SemanticIDGenerativeRecommender):
                 stats[f"pkm/{k}/{name}"] = v
         if not terms:
             return torch.zeros((), device=self.device)
-        bal = torch.stack(terms).mean()
+        stacked = torch.stack(terms)
+        bal = stacked.sum() if getattr(self, "_pkm_balance_reduction", "mean") == "sum" else stacked.mean()
         self.log("pkm/balance_loss", bal.detach(), on_step=True, on_epoch=False)
         for k, v in stats.items():
             self.log(k, v, on_step=True, on_epoch=False)
@@ -2674,6 +3213,9 @@ class T5LayerPKM(nn.Module):
 
     def __init__(self, config: T5Config, pkm_params: Dict[str, Any]) -> None:
         super().__init__()
+        pkm_params = dict(pkm_params)
+        if float(pkm_params.pop("ffn_dropout", 0.0) or 0.0) > 0:
+            raise ValueError("pkm_params.ffn_dropout needs pkm_mode=add (replace has no FFN)")
         self.memory = HashingMemory(
             input_dim=config.d_model,
             output_dim=config.d_model,
@@ -2707,6 +3249,14 @@ class T5LayerFFWithPKM(nn.Module):
     ) -> None:
         super().__init__()
         self.ffn = ffn
+        pkm_params = dict(pkm_params)
+        # FFN pathway dropout (MUNKEY-style, the reverse of memory dropout): in training,
+        # w.p. ffn_dropout per SEQUENCE the FFN branch is skipped (only the residual
+        # passes), so the memory must carry that layer's job and instance-specific
+        # information is pushed into the memory rather than the FFN weights.
+        self.ffn_dropout = float(pkm_params.pop("ffn_dropout", 0.0) or 0.0)
+        if not 0.0 <= self.ffn_dropout < 1.0:
+            raise ValueError(f"ffn_dropout must be in [0, 1), got {self.ffn_dropout}")
         self.memory = HashingMemory(
             input_dim=config.d_model,
             output_dim=config.d_model,
@@ -2716,7 +3266,11 @@ class T5LayerFFWithPKM(nn.Module):
         self.dropout = nn.Dropout(config.dropout_rate)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        ffn_out = self.ffn(hidden_states)
+        ffn_out = self.ffn(hidden_states)  # includes the residual: h + FFN(ln(h))
+        if self.training and self.ffn_dropout > 0 and hidden_states.dim() == 3:
+            # the FFN still runs for every row, so DDP sees all its parameters used
+            drop = torch.rand(hidden_states.size(0), 1, 1, device=hidden_states.device) < self.ffn_dropout
+            ffn_out = torch.where(drop, hidden_states, ffn_out)
         memory_out = self.memory(self.layer_norm(hidden_states))
         return ffn_out + self.dropout(memory_out)
 

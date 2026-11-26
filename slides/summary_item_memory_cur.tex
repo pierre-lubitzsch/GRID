@@ -1,0 +1,296 @@
+\documentclass{beamer}
+
+\usetheme{metropolis}
+
+% Item memory on clean data: current state (GRID/item_memory_cur.md), 2026-10-28.
+% Plain tabular + \hline, as in summary_pkm_itemmem.tex.
+\usepackage{xcolor}
+\usepackage{array}
+
+\hypersetup{colorlinks=true, urlcolor=blue}
+
+% shrink a table to the line width only when it is wider
+\newcommand{\fit}[1]{\resizebox{\ifdim\width>\linewidth\linewidth\else\width\fi}{!}{#1}}
+
+\title{Item Memory vs.\ Plain TIGER on Clean Data}
+\subtitle{Methods, training settings and results so far}
+\date{October 28, 2026}
+
+\begin{document}
+
+\maketitle
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Question}
+\begin{itemize}
+  \item On poisoned Beauty, \texttt{imsc} beat plain TIGER in all 15 cells
+        (+8 to +34\% N@10), but those runs stopped at 4000 steps and
+        had more parameters.
+  \item \textbf{Now:} on \textbf{clean} data, does the item memory beat plain
+        TIGER on test N@10 across seeds, datasets, tokenizers and training
+        recipes, or was it luck, training length or capacity?
+  \item Data: clean Beauty, Sports, Toys; training seeds 2, 3, 5.
+  \item Metric: test N@10 on the checkpoint with the best validation score.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{The four methods}
+Shared backbone: TIGER (T5, 4 + 4 layers, 6 heads $\times$ 64,
+$d_{\text{model}}=128$, MLP 1024, ReLU), 4 SID tokens per item, beam search.
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|l|l|}
+\hline
+method & adds & extra loss \\
+\hline
+\texttt{plain}  & nothing (TIGER) & none \\
+\texttt{im}     & item memory, null token + neighbor mixing & none \\
+\texttt{imc}    & as \texttt{im} & consistency KL, weight 0.1 \\
+\texttt{imfree} & same per-item vectors, no null token, no mixing & none \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item Extra parameters (\texttt{im}, \texttt{imc}, \texttt{imfree}): one
+        128-d vector per item ($\approx$1.5M on Beauty) + a 128$\times$128 adapter.
+  \item No output-side reranking in these four arms.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Item memory: how it is read}
+One learnable vector $v_i$ per catalog item, initialized $\mathcal{N}(0, 0.02)$.
+For each history item, $\text{adapter}(v)$ is \textbf{added to all 4 of its SID
+token embeddings} before the encoder. During training, per item occurrence:
+\[
+v = \begin{cases}
+  \text{null token (learned)} & \text{w.p. } 0.1 \ \ (p_{drop}) \\
+  \sum_j w_j\, \mathrm{sg}(v_j),\ j \in N_{K'}(i) & \text{w.p. } 0.2 \ \ (p_{nbr}) \\
+  v_i & \text{otherwise}
+\end{cases}
+\]
+\begin{itemize}
+  \item $N_{K'}(i)$: the $K' \sim U\{1..4\}$ nearest items by cosine similarity
+        of frozen flan-T5-XL text embeddings; $w = \mathrm{softmax}(\mathrm{sim}/0.1)$.
+  \item At evaluation always $v = v_i$.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Item memory: the adapter}
+$\text{adapter}(v) = W v + b$: \textbf{one} linear layer (128 $\times$ 128 + bias,
+16.5k parameters, default PyTorch init), \textbf{shared by all items} (MUNKEY's
+$h_\psi$).
+\begin{itemize}
+  \item Maps the memory vectors into the SID-token embedding space; the table
+        $v$ stores per-item content, $W$ decides how it enters the encoder.
+  \item Applied to whatever $v$ was drawn (own entry, null token, neighbor mix),
+        so it gets a gradient on \emph{every} occurrence, also when the
+        neighbor mix itself is detached.
+  \item Start: entries $\sim \mathcal{N}(0, 0.02)$ and a zero null token, so
+        the memory's first contribution is small.
+  \item The bias $b$ is added to every history item, with or without memory:
+        memory off (\texttt{eval\_pathway=null}) feeds the null token through
+        the adapter (the training-time ``dropped'' input); for \texttt{imfree}
+        (null frozen at 0) that is $b$ alone.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Item memory: one training step (\texttt{im})}
+\begin{enumerate}
+  \item Sample a batch of user histories; for every history item draw its
+        $v$ (own entry / null token / neighbor mix, as above).
+  \item Add $\text{adapter}(v)$ to the item's 4 SID token embeddings; run the
+        unchanged encoder and decoder.
+  \item Loss: the \textbf{plain TIGER loss only}, cross-entropy on the next
+        item's 4 SID tokens. No extra term for \texttt{im}.
+  \item One Adam step on everything jointly, from scratch: backbone, $v$
+        table, adapter, null token (same lr and schedule as plain).
+\end{enumerate}
+\begin{itemize}
+  \item Gradient reaches $v_i$ only when the own entry was drawn ($\approx$70\%);
+        a neighbor mix is detached, so it trains the backbone and adapter
+        but not the neighbors' entries.
+  \item Only the input side: the target item is never looked up.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Item memory: why the two substitutions}
+\begin{itemize}
+  \item \textbf{Null token (10\%):} the backbone must still predict well
+        without the entry, so $v_i$ is a \emph{refinement} on top of the SID
+        tokens, not something the model cannot work without.
+  \item \textbf{Neighbor mix (20\%):} the backbone sees the average of
+        similar items' entries in $v_i$'s place and must predict from it too,
+        so $v_i$ stays close to what similar items carry and holds the
+        item-specific \emph{residual}.
+  \item Together: entries are smooth over the item neighborhood and the
+        backbone degrades gracefully when one is missing or replaced.
+  \item Without both (\texttt{imfree}): $v_i$ becomes a free per-item
+        parameter, overfits early (best val at 3000 to 4000 steps) and gives
+        no gain.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Consistency loss and the capacity control}
+\textbf{Consistency (\texttt{imc}).} A second forward pass replaces every entry
+by its full 4-neighbor average (detached):
+\[
+  \mathcal{L}_{c} = \sum_{h=1}^{4} \mathrm{KL}\big(\mathrm{sg}(p_{\text{own}}^{(h)})
+  \,\big\|\, p_{\text{nbr}}^{(h)}\big), \quad \text{weight } 0.1
+\]
+\begin{itemize}
+  \item Trains the backbone so an entry can later be changed or replaced without
+        breaking predictions; costs a second forward pass per step.
+\end{itemize}
+\medskip
+\textbf{Capacity control (\texttt{imfree}).} $p_{drop} = p_{nbr} = 0$: same
+vectors, always $v_i$.
+\begin{itemize}
+  \item \texttt{imfree} $\approx$ \texttt{im} $\Rightarrow$ the gain is extra parameters.
+  \item \texttt{im} $>$ \texttt{imfree} $\Rightarrow$ the gain is the memory's
+        training design.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Training settings (1/2): recipes}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|l|c|c|l|}
+\hline
+label & recipe & optimizer, lr & batch & length / selection \\
+\hline
+\texttt{\_es} & repo config $=$ NAU's & Adam 1e-3, wd 1e-4 & 1024 & early stop, val R@5 \\
+\texttt{\_gprk} & GRID paper & Adam 5e-4, wd 1e-6 & 256 & early stop, val N@10 \\
+\texttt{\_tigr}, \texttt{\_tigrtok} & TIGER paper & 0.01 for 10k, then $1/\sqrt{t}$ & 256 & 200k steps (Toys 100k) \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item Early stopping: 10 validations $\times$ 100 optimizer steps without improvement.
+  \item TIGER recipe also: dropout 0.1 (others 0.15), 2000 hashed user tokens
+        (others none); best-val and final checkpoints. The paper names no
+        optimizer: Adam.
+  \item Our ``GRID recipe'' is the repo config, \textbf{not} the GRID paper's;
+        \texttt{\_gprk} is the paper's.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Training settings (2/2): tokenizers}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|l|l|}
+\hline
+label & tokenizer & status \\
+\hline
+\texttt{\_es}      & our RQ-VAE on flan-T5-XL (4 learned levels, latent 64) & Beauty, Sports done \\
+\texttt{\_gprk}    & GRID RK-Means on flan-T5-XL (3 $\times$ 256 + dedup); NAU's SIDs & Beauty training \\
+\texttt{\_tigr}    & our RQ-VAE (TIGER recipe, Adam) & pilot (Beauty s2) training \\
+\texttt{\_tigraf}  & our RQ-VAE (TIGER recipe, Adafactor) & pilot (Beauty s2) queued \\
+\texttt{\_tigrtok} & TIGER's: Sentence-T5 $\rightarrow$ RQ-VAE 3 $\times$ 256 + collision & parked \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item Cut (Oct 28): \texttt{\_esrk} (NAU recipe on RK-Means) and \texttt{imfree}
+        in \texttt{\_gprk} / \texttt{\_tigr}.
+  \item TIGER tokenizer parked: with Adagrad lr 0.4 the RQ-VAE collapses its first
+        level to one code or diverges.
+  \item Item-memory neighbors always come from the flan-T5-XL embeddings.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Results: Beauty, \texttt{\_es}}
+Test N@10, best-validation checkpoint; ``off'' = memory replaced by the null
+token at test time:
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|c|c|c|c|c|c|}
+\hline
+method & s2 & s3 & s5 & mean & vs.\ plain (paired) & off (mean) \\
+\hline
+\texttt{plain}  & .0322 & .0328 & .0333 & .0327 & & \\
+\texttt{im}     & .0366 & .0376 & .0372 & .0371 & \textbf{+13.5\%} (+13.9 / +14.7 / +11.8) & .0272 \\
+\texttt{imc}    & .0384 & .0390 & .0366 & .0380 & \textbf{+16.1\%} (+19.4 / +18.8 / +9.9) & .0292 \\
+\texttt{imfree} & .0330 & .0314 & .0315 & .0320 & $-$2.4\% (+2.7 / $-$4.3 / $-$5.5) & .0086 \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item Every seed positive for \texttt{im} and \texttt{imc}; plain's seed
+        spread is 3\%.
+  \item References: TIGER paper .0384, GRID paper .0347.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Results: Sports, \texttt{\_es}}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|c|c|c|c|c|c|}
+\hline
+method & s2 & s3 & s5 & mean & vs.\ plain (paired) & off (mean) \\
+\hline
+\texttt{plain}  & .0149 & .0176 & .0167 & .0164 & & \\
+\texttt{im}     & .0185 & .0166 & .0185 & .0179 & +9.4\% (+23.8 / $-$6.1 / +10.6) & .0118 \\
+\texttt{imc}    & .0178 & .0174 & .0185 & .0179 & +9.6\% (+19.3 / $-$1.4 / +10.8) & .0122$^*$ \\
+\texttt{imfree} & .0135 & .0129 & .0130 & .0131 & $-$19.5\% ($-$9.5 / $-$27.0 / $-$22.1) & .0049 / .0041 / .0057 \\
+\hline
+\end{tabular}}
+\end{center}
+{\footnotesize $^*$ seeds 2, 3.}
+\begin{itemize}
+  \item The gain holds, smaller and noisier: seed 3 is slightly below plain.
+  \item \texttt{imfree} loses clearly on Sports too.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Reading of the results}
+\begin{itemize}
+  \item \textbf{Item memory helps on both datasets:} +13.5 / +16.1\% (Beauty),
+        about +9.5\% (Sports) for \texttt{im} / \texttt{imc}.
+  \item \textbf{Training design, not capacity:} \texttt{imfree} loses on both
+        ($-$2.4\%, $-$19.5\%).
+  \item \textbf{The models rely on the memory:} switched off, \texttt{im} and
+        \texttt{imc} fall 23 to 35\%, below plain. \texttt{imc} loses less
+        (consistency makes a missing entry less harmful, as intended);
+        \texttt{imfree} collapses without its entries.
+  \item \texttt{imc} vs.\ \texttt{im}: ahead on Beauty, equal on Sports.
+  \item Earlier memory-off numbers were invalid (the memory stayed on:
+        \texttt{null} parsed as YAML null); fixed and rerun.
+\end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------------------
+\begin{frame}{Running and queued}
+\begin{center}
+\small
+\fit{\begin{tabular}{|l|l|l|l|}
+\hline
+setting & Beauty & Sports & Toys \\
+\hline
+\texttt{\_es}      & done & done & resubmitted (data was missing) \\
+\texttt{\_gprk}    & training & queued & queued \\
+\texttt{\_tigr}    & pilot s2 training (slow) & held & held \\
+\texttt{\_tigraf}  & pilot s2 queued & & \\
+\hline
+\end{tabular}}
+\end{center}
+\begin{itemize}
+  \item TIGER recipe with Adam at lr 0.01 learns slowly (plain val R@5 .025 at
+        30k steps vs.\ .05 at 3k with the GRID recipe). Its lr and schedule are the
+        T5X default, which pairs with Adafactor: both pilots run.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Open decisions}
+\begin{enumerate}
+  \item Adam or Adafactor for the TIGER recipe, once both pilots have run;
+        then release the 24 held chains.
+  \item Seeds 7, 11 once the settings agree?
+  \item Later: \texttt{imc} and score-only on poisoned data (is the lower spam
+        pickup just the rerank?).
+\end{enumerate}
+\end{frame}
+
+\end{document}

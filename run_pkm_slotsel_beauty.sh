@@ -24,6 +24,7 @@
 # Selection masks only values.weight rows, so the selection arms freeze keys and
 # query; 'vals' is their no-selection reference.
 #
+# EXTRA="<hydra overrides>" is appended to every arm (use with TAG_SUFFIX).
 # Usage:  ./run_pkm_slotsel_beauty.sh      DRY=1 ./run_pkm_slotsel_beauty.sh
 #         ARMS="pkm afihf_1000" ./run_pkm_slotsel_beauty.sh
 set -euo pipefail
@@ -84,6 +85,6 @@ for a in $ARMS; do
        N_TARGET_ITEMS=1
        sbatch --partition="$PARTITION" --gres="$GRES" --time="$TIME"
        run_tiger_unlearn_sequential.sh "$ckpt" "$DATA" unified "$SID" false 1 0.0
-       "${recipe[@]}" "${ovr[@]}" $model_ovr)
+       "${recipe[@]}" "${ovr[@]}" ${EXTRA:-} $model_ovr)
   if [ "${DRY:-0}" = "1" ]; then printf '  %q ' "${cmd[@]}"; echo; else "${cmd[@]}"; fi
 done
