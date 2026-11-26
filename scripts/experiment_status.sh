@@ -12,10 +12,14 @@ TMP=$(mktemp)
   echo
   echo "| Job group | Partition | State | Jobs |"
   echo "|---|---|---|---|"
-  squeue -u "$USER" -h -o '%j|%P|%T' | grep -v '^bash|' \
+  # NAU rebuttal job names only; other projects' jobs (item memory, BONSAI, ...) are counted below, not listed
+  NAU_RE='^(vsb_|otk_|miarm_|miaotk_|rmgrid|rank_|nau0|sens_scrub|archive_ckpts|bench_sep|sepfast|valsens|rmsplit)'
+  squeue -u "$USER" -h -o '%j|%P|%T' | grep -v '^bash|' | grep -E "${NAU_RE}" \
     | awk -F'|' '{g=$1; sub(/_(big|any)_[0-9]+$/,"",g); print g"|"$2"|"$3}' | sort | uniq -c \
-    | awk '{n=$1; $1=""; sub(/^ /,""); split($0,a,"|"); printf "| %s | %s | %s | %d |\n", a[1], a[2], a[3], n}'
-  [ -z "$(squeue -u "$USER" -h -o '%j' | grep -v '^bash$')" ] && echo "| (none) | | | 0 |"
+    | awk '{n=$1; $1=""; sub(/^ /,""); split($0,a,"|"); printf "| %s | %s | %s | %d |\n", a[1], a[2], a[3], n}' || true
+  [ -z "$(squeue -u "$USER" -h -o '%j' | grep -E "${NAU_RE}")" ] && echo "| (no NAU jobs queued or running) | | | 0 |"
+  echo
+  echo "Jobs of other projects in the queue (not tracked here): $(squeue -u "$USER" -h -o '%j' | grep -v '^bash$' | grep -v -c -E "${NAU_RE}")"
   echo
   echo "Other-tokenizer results on disk (runs with cleaned test / cleaned validation evals):"
   echo
